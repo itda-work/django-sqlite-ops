@@ -18,7 +18,7 @@
 - **이슈 먼저.** 구현 전에 GitHub 이슈가 있어야 한다. 진행 상황(착수, 리뷰 결과, 반영·기각 사유, 막힘, 완료)은 그 이슈의 코멘트로 남긴다. 브랜치는 `issue-<N>-<slug>`, PR 본문에 `Closes #N` 을 쓴다.
 - **메인 Claude 세션은 오케스트레이터다.** 이슈·브리프 작성, 위임, 결과 검증(테스트·CI 직접 실행), 이슈 기록, 병합을 맡는다. 구현 코드를 직접 쓰지 않는다.
 - **구현**: herdr pane 의 Claude Code — `herdr agent start impl --kind claude --pane <id> -- --model claude-opus-5-5 --effort medium`
-- **리뷰**: herdr pane 의 Codex — `herdr agent start review --kind codex --pane <id> -- -m gpt-6-astra -c model_reasoning_effort=medium --sandbox read-only`. 지적은 구현자에게 돌려 고친다. 리뷰가 통과하고 CI 가 초록일 때만 병합한다.
+- **리뷰**: herdr pane 의 Codex — `herdr agent start review --kind codex --pane <id> -- -m gpt-6-astra -c model_reasoning_effort=medium --sandbox workspace-write`(결과 파일을 써야 하므로. 쓰기는 `.work/` 아래만 허용한다고 브리프에 적는다). 지적은 구현자에게 돌려 고친다. 리뷰가 통과하고 CI 가 초록일 때만 병합한다.
 - 브리프와 리뷰 결과는 `.work/issue-<N>/`(git 무시)의 파일로 주고받는다. 긴 지시를 프롬프트에 넣지 않는다.
 
 ## 규약
