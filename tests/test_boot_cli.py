@@ -249,10 +249,12 @@ def test_usage_errors_exit_64(argv, capsys):
     assert "usage:" in capsys.readouterr().err
 
 
-def test_parse_args_defaults_and_command():
-    args, command = cli.parse_args(["--db", "/d/app.db", "--config", "c.yml", "--", "a", "--", "b"])
+def test_parse_args_defaults_and_command(lab):
+    db = str(lab / "app.db")
+    args, command = cli.parse_args(["--db", db, "--config", "c.yml", "--", "a", "--", "b"])
     assert command == ["a", "--", "b"]
-    assert args.meta_path == Path("/d/.app.db-litestream")
+    assert args.db == lab / "app.db"
+    assert args.meta_path == lab / ".app.db-litestream"
     assert args.on_unknown == "refuse"
     assert args.ltx_timeout == ls.DEFAULT_LTX_TIMEOUT
     assert args.restore_timeout == ls.DEFAULT_RESTORE_TIMEOUT
@@ -674,9 +676,9 @@ def test_role_absent_from_the_start_is_allowed(lab, monkeypatch):
     assert sorted(os.listdir(final)) == ["app.db", "manifest.json"]
 
 
-# --- 라운드 2: 경로 정규화 -----------------------------------------------------------------------
-# 부모 디렉터리만 realpath 로 해석하고 마지막 구성요소는 그대로 붙인다. abspath 처럼 'alias/..'
-# 를 문자열로 접으면 링크 뒤의 실제 위치와 다른 파일을 가리킨다(리뷰 run-12).
+# --- 라운드 3: 실제 경로만 받는다 (D-15) ----------------------------------------------------------
+# --db·--meta-path 는 부모 경로에 링크·'..'·없는 구성요소가 없어야 한다. 아니면 사용법 오류(64).
+# 같은 경로를 Litestream 호출에도 쓰므로 설정의 dbs[].path 도 같은 실제 경로여야 한다.
 
 
 def parent_alias(lab: Path) -> Path:
@@ -686,95 +688,168 @@ def parent_alias(lab: Path) -> Path:
     return lab / "storage"
 
 
+def test_real_path_accepts_real_paths(lab):
+    (lab / "sub").mkdir()
+    assert cli.real_path(str(lab / "app.db")) == lab / "app.db"
+    assert cli.real_path(f"{lab}/./sub//app.db") == lab / "sub" / "app.db"
+    assert cli.real_path(str(lab / "missing.db")) == lab / "missing.db"  # 새 DB 는 없어도 된다
+
+
+def test_real_path_keeps_last_component_link(lab):
+    (lab / "link.db").symlink_to("other.db")
+    assert cli.real_path(str(lab / "link.db")) == lab / "link.db"
+
+
 @pytest.mark.parametrize(
-    ("raw", "expected"),
+    "raw",
     [
-        ("{lab}/alias/../app.db", "{lab}/storage/app.db"),
-        ("{lab}/alias/app.db", "{lab}/storage/deep/app.db"),
-        ("{lab}/./storage//app.db", "{lab}/storage/app.db"),
+        "{lab}/alias/app.db",  # 부모가 링크
+        "{lab}/alias/../app.db",  # '..'
+        "{lab}/storage/../app.db",  # 링크가 없어도 '..' 는 받지 않는다
+        "{lab}/missing/../app.db",  # 리뷰 run-17 invalid-parent
+        "{lab}/missing/app.db",  # 없는 부모
+        "{lab}/file.txt/app.db",  # 부모가 디렉터리가 아님
     ],
 )
-def test_canonical_path_resolves_parent_only(lab, raw, expected):
+def test_real_path_rejects(lab, raw):
     parent_alias(lab)
-    got = cli.canonical_path(raw.format(lab=lab))
-    assert got == Path(expected.format(lab=lab))
+    (lab / "file.txt").write_text("x")
+    with pytest.raises(ValueError):
+        cli.real_path(raw.format(lab=lab))
 
 
-def test_canonical_path_keeps_last_component_link(lab):
-    parent_alias(lab)
-    (lab / "link.db").symlink_to("storage/app.db")
-    assert cli.canonical_path(str(lab / "link.db")) == lab / "link.db"
+def test_real_path_hint_names_the_real_path_and_litestream_config(lab):
+    storage = parent_alias(lab)
+    with pytest.raises(ValueError) as exc:
+        cli.real_path(str(lab / "alias" / "app.db"))
+    assert str(storage / "deep") in str(exc.value)
+    assert "dbs[].path" in str(exc.value)
 
 
-@pytest.mark.parametrize("raw", ["", ".", "..", "/d/.", "/d/..", "/d/", "a/b/.."])
-def test_bad_last_component_is_usage_error(raw):
+@pytest.mark.parametrize("raw", ["", ".", "..", "{lab}/.", "{lab}/..", "{lab}/", "a/b/.."])
+def test_bad_last_component_is_usage_error(lab, raw):
+    raw = raw.format(lab=lab)
     with pytest.raises(SystemExit) as exc:
         cli.parse_args(["--db", raw, "--config", "c.yml", "--", "true"])
     assert exc.value.code == cli.EXIT_USAGE
     with pytest.raises(SystemExit) as exc:
-        cli.parse_args(["--db", "/d/app.db", "--meta-path", raw, "--config", "c", "--", "x"])
+        cli.parse_args(
+            ["--db", str(lab / "app.db"), "--meta-path", raw, "--config", "c", "--", "x"]
+        )
     assert exc.value.code == cli.EXIT_USAGE
 
 
-def test_parse_args_canonicalizes_db_and_meta(lab):
+@pytest.mark.parametrize("flag", ["--db", "--meta-path"])
+@pytest.mark.parametrize("raw", ["{lab}/alias/app.db", "{lab}/alias/../x", "{lab}/missing/../x"])
+def test_unreal_paths_are_usage_errors_and_touch_nothing(lab, fake, no_exec, capsys, flag, raw):
+    # 리뷰 run-12/run-17: '..'·링크·없는 부모를 접으면 다른 파일을 가리켰다.
     storage = parent_alias(lab)
-    args, _ = cli.parse_args(["--db", f"{lab}/alias/../app.db", "--config", "c", "--", "true"])
-    assert args.db == storage / "app.db"
-    assert args.meta_path == storage / ".app.db-litestream"
-
-
-def test_parent_symlink_dotdot_db_moves_only_the_intended_db(lab, fake, no_exec):
-    # 리뷰 run-12 재현: 별개의 lab/app.db 가 격리로 끌려갔다.
-    storage = parent_alias(lab)
-    make_db(storage / "app.db", 2)
-    write_meta(storage / "app.db")
-    make_db(lab / "app.db", 3)
-    write_meta(lab / "app.db")
-    unrelated = snapshot(lab, skip=("storage", "alias", "fake"))
+    for where in (lab, storage, storage / "deep"):
+        make_db(where / "app.db", 2)
+        make_db(where / "x", 1)
+        write_meta(where / "app.db")
+    before = snapshot(lab, skip=("fake",))
     fake.remote_txid(0x20)
     args = boot_args(lab, fake, "--on-unknown", "restore")
-    args[args.index(str(lab / "app.db"))] = f"{lab}/alias/../app.db"
-    assert main_inproc(args, no_exec) == "exec"
-    assert snapshot(lab, skip=("storage", "alias", "fake")) == unrelated
-    assert count_rows(storage / "app.db") == 7  # 복원본
-    (final,) = [p for p in storage.iterdir() if ".stale-" in p.name]
-    assert count_rows(final / "app.db") == 2
-    assert (final / ".app.db-litestream").is_dir()
+    value = raw.format(lab=lab)
+    if flag == "--db":
+        args[args.index(str(lab / "app.db"))] = value
+    else:
+        args[args.index("--on-unknown") : args.index("--on-unknown")] = ["--meta-path", value]
+    with pytest.raises(SystemExit) as exc:
+        main_inproc(args, no_exec)
+    assert exc.value.code == cli.EXIT_USAGE
+    assert "D-15" in capsys.readouterr().err
+    assert snapshot(lab, skip=("fake",)) == before
+    assert fake.calls() == []
 
 
-def test_parent_symlink_dotdot_meta_moves_only_the_intended_meta(lab, fake, no_exec):
-    storage = parent_alias(lab)
+def test_step_functions_also_refuse_unreal_paths(lab):
+    # 리뷰 run-17 invalid-parent: quarantine() 를 직접 불러도 기존 DB 를 옮기지 않는다.
     db = lab / "app.db"
-    make_db(db, 2)
-    for where in (storage, lab):
-        (where / "custom-meta" / "ltx" / "0").mkdir(parents=True)
-        shutil.copy(LATEST_LTX, where / "custom-meta" / "ltx" / "0" / LATEST_LTX.name)
-    (lab / "custom-meta" / "keep").write_text("unrelated")
-    fake.remote_txid(0x20)
-    args = boot_args(
-        lab, fake, "--on-unknown", "restore", "--meta-path", f"{lab}/alias/../custom-meta"
-    )
-    assert main_inproc(args, no_exec) == "exec"
-    assert (lab / "custom-meta" / "keep").read_text() == "unrelated"
-    assert not (storage / "custom-meta").exists()
-    (final,) = stale_dirs(lab)
-    assert sorted(os.listdir(final)) == ["app.db", "custom-meta", "manifest.json"]
+    db.write_bytes(b"original")
+    raw = Path(f"{lab}/missing/../app.db")
+    for call in (
+        lambda: cli.quarantine(raw, lab / "meta"),
+        lambda: cli.check_quarantinable(raw, lab / "meta"),
+        lambda: cli.resume_quarantine(raw, lab / "meta"),
+    ):
+        with pytest.raises(cli._Exit) as exc:
+            call()
+        assert exc.value.code == cli.EXIT_USAGE
+    assert db.read_bytes() == b"original"
+    assert sorted(p.name for p in lab.iterdir()) == ["app.db"]
 
 
-def test_stable_parent_symlink_still_works(lab, fake, no_exec):
-    storage = parent_alias(lab)
-    db = lab / "alias" / "app.db"
-    make_db(db, 2)
-    write_meta(db)
+def test_real_litestream_parent_alias_is_refused_with_hint(litestream_binary, tmp_path):
+    # 리뷰 run-17 config-alias: 설정과 --db 가 같은 alias 경로여도, 실제 경로로 바꿔 조회하면
+    # Litestream 이 설정의 DB 를 찾지 못했다. 이제 시작 전에 64 로 거부하고 실제 경로를 안내한다.
+    root = tmp_path.resolve()
+    (root / "storage").mkdir()
+    (root / "alias").symlink_to("storage")
+    db = root / "alias" / "app.db"
+    config = write_config(root, db, f"      type: file\n      path: {root / 'replica'}\n")
+    result = run_boot(real_args(db, config, "--init-new", cmd=["true"]))
+    assert result.returncode == 64, result.stderr
+    assert str(root / "storage") in result.stderr and "dbs[].path" in result.stderr
+    # 설정과 --db 를 같은 실제 경로로 쓰면 첫 배포가 통과한다.
+    real = root / "storage" / "app.db"
+    config = write_config(root, real, f"      type: file\n      path: {root / 'replica'}\n")
+    data = root / "storage"
+    result = run_boot(real_args(real, config, "--init-new", cmd=marker_command(data, real)))
+    assert result.returncode == 0, result.stderr
+    assert read_marker(data) is not None
+
+
+# --- 라운드 3: 대상 간 상하위 관계 --------------------------------------------------------------
+
+
+def test_meta_that_is_an_ancestor_of_the_db_refuses(lab, fake, no_exec):
+    # 리뷰 run-17 ancestor: 메타 = DB 의 부모. DB 를 옮긴 뒤 메타를 자기 안으로 옮기려다 실패했다.
+    db = lab / "app.db"
+    db.write_bytes(b"original")
+    (lab / "unrelated.db").write_bytes(b"unrelated")
+    with pytest.raises(cli._Exit) as exc:
+        cli.check_quarantinable(db, lab)
+    assert exc.value.code == cli.EXIT_REFUSE
+    with pytest.raises(cli._Exit):
+        cli.quarantine(db, lab)
+    assert db.read_bytes() == b"original"
+    assert not [p for p in lab.iterdir() if ".stale-" in p.name]
+
+
+def test_ancestor_meta_refuses_in_cli_before_restore(lab, fake, no_exec):
+    sub = lab / "sub"
+    sub.mkdir()
+    db = sub / "app.db"
+    make_db(db, 1)
     fake.remote_txid(0x20)
-    args = boot_args(lab, fake, "--on-unknown", "restore")
+    before = snapshot(lab, skip=("fake",))
+    args = boot_args(lab, fake, "--on-unknown", "restore", "--meta-path", str(lab))
     args[args.index(str(lab / "app.db"))] = str(db)
-    assert main_inproc(args, no_exec) == "exec"
-    deep = storage / "deep"
-    assert count_rows(deep / "app.db") == 7
-    (final,) = [p for p in deep.iterdir() if ".stale-" in p.name]
-    assert count_rows(final / "app.db") == 2
-    assert (deep / "app.db.boot-state.json").exists()
+    assert main_inproc(args, no_exec) == cli.EXIT_REFUSE
+    after = snapshot(lab, skip=("fake", "sub/app.db.boot.lock"))
+    assert after == before
+    assert "restore" not in fake.calls()
+
+
+@pytest.mark.parametrize("meta_rel", ["app.db", "app.db-wal"])
+def test_meta_equal_to_another_target_refuses(lab, meta_rel):
+    db = lab / "app.db"
+    make_db(db, 1)
+    with pytest.raises(cli._Exit) as exc:
+        cli.check_quarantinable(db, lab / meta_rel)
+    assert exc.value.code == cli.EXIT_REFUSE
+
+
+def test_resume_refuses_ancestor_meta(lab):
+    db = lab / "app.db"
+    make_db(db, 1)
+    forged(lab, good_manifest(lab, entry("db", db)))
+    with pytest.raises(cli._Exit) as exc:
+        cli.resume_quarantine(db, lab)
+    assert exc.value.code == cli.EXIT_REFUSE
+    assert db.exists()
 
 
 # --- 라운드 1: 격리 대상의 심볼릭 링크와 예약 이름 -----------------------------------------------

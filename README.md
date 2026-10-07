@@ -176,6 +176,8 @@ DATABASES = {
 
 필요한 것: POSIX(Linux·macOS), PATH 의 `litestream` 0.5.17(검증한 버전만 받는다), DB 마다 복제본이 적힌 Litestream 설정 파일. 설치는 [공식 문서](https://litestream.io/install/)를 따른다.
 
+**경로 규칙**: `--db`·`--meta-path` 는 **실제 경로**로 준다. 부모 경로에 심볼릭 링크·`..`·없는 디렉터리가 있으면 exit 64 이고, 쓸 실제 경로를 안내한다. Litestream 설정의 `dbs[].path` 에도 **같은 실제 경로**를 쓴다. boot 가 이 경로로 Litestream 을 조회·복원하기 때문이다([D-15](docs/DECISIONS.md)).
+
 #### Docker entrypoint
 
 ```bash
@@ -234,7 +236,7 @@ stderr 의 `[boot] ...` 줄만 보면 무슨 일이 있었는지 알 수 있다.
 | `3` | 무결성 실패(`quick_check` 가 `ok` 아님) | DB 파일을 조사한다. 판정은 `match` 라 `--on-unknown restore` 만으로는 복원되지 않는다. 복제본이 정본이면 DB 파일(과 `-wal`·`-shm`)을 다른 곳으로 옮기고 `--on-unknown restore` 로 다시 부팅한다. 남은 메타가 `stale_meta` 로 격리되고 복원된다 |
 | `4` | 복원 실패 | 로그의 `restore failed:` 사유를 본다. 임시 복원이 실패했으면 로컬은 그대로이고, 남은 `<db>.restore-…/` 는 조사 뒤 지운다. 격리·설치 중 I/O 실패도 4 다. 격리 도중이면 `<db>.stale-…partial/` 이 남고 다음 부팅이 이어서 끝낸다. 격리를 마친 뒤(설치 중) 실패했으면 다음 부팅이 남은 상태에 따라 다시 복원하거나(로컬이 비었을 때) `no_local_meta` 로 거부한다(아래 '복원 직후 크래시 복구') |
 | `5` | 잠금 실패 | 같은 볼륨에서 이미 돌고 있는 컨테이너·프로세스를 멈춘다 |
-| `64` | 사용법 오류 | 인자를 고친다. `--` 뒤 명령이 꼭 있어야 한다 |
+| `64` | 사용법 오류 | 인자를 고친다. `--` 뒤 명령이 꼭 있어야 한다. 경로가 실제 경로가 아니면 메시지의 실제 경로로 바꾸고 Litestream 설정도 같은 경로로 맞춘다 |
 | `127` | `--` 뒤 명령을 실행할 수 없음 | 명령 이름·PATH·실행 권한을 확인한다 |
 
 #### 생애 첫 배포: `--init-new` 를 한 번 쓰고 끈다
@@ -280,7 +282,8 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 #### 함정
 
 - DB 경로는 Litestream 설정의 `path` 와 같은 값을 준다. 설정에 없는 DB 면 `remote_error` 로 거부된다.
-- boot 는 `--db`·`--meta-path` 의 부모 디렉터리를 실제 경로로 해석해 쓴다(`alias/../app.db` 는 링크 뒤의 실제 부모 기준). 경로는 파일 이름으로 끝나야 한다(`.`·`..`·`/` 로 끝나면 exit 64).
+- `/data -> /mnt/volume` 처럼 부모가 링크인 경로(`--db /data/app.sqlite3`)는 받지 않는다. 링크를 따라간 실제 경로(`/mnt/volume/app.sqlite3`)를 boot 인자와 Litestream 설정 양쪽에 쓴다. 경로는 파일 이름으로 끝나야 한다.
+- `--meta-path` 를 DB 디렉터리 자체나 그 조상으로 두지 않는다. 메타가 DB 를 포함하면 격리가 필요할 때 거부된다(exit 2).
 - 메타 디렉터리는 DB 와 같은 파일시스템에 둔다. 격리는 rename 으로 하므로 다른 볼륨에 있으면 거부한다.
 - **격리가 필요할 때(`restore` 조치) DB·`-wal`·`-shm`·`-journal`·메타 디렉터리 경로가 심볼릭 링크면 거부한다(exit 2).** 링크를 옮기면 실체가 밖에 남기 때문이다(v0.1 제약). 판정만 하고 진행하는 부팅(`match` 등)에서는 메타 디렉터리 링크를 따라가므로 평소에는 드러나지 않는다. 볼륨 안에 실제 파일·디렉터리로 둔다.
 - DB 나 `--meta-path` 의 이름을 `manifest.json` 으로 하지 않는다. 격리 디렉터리의 예약 이름이라 격리가 필요할 때 거부된다.

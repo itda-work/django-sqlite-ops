@@ -82,19 +82,71 @@ def log(message: str) -> None:
 # --- 경로 --------------------------------------------------------------------------------
 
 
-def canonical_path(raw: str | os.PathLike[str]) -> Path:
-    """``--db``·``--meta-path`` 를 한 번 정한다. 부모 디렉터리만 ``realpath`` 로 해석한다.
+def real_path(raw: str | os.PathLike[str]) -> Path:
+    """``--db``·``--meta-path`` 를 검증해 한 번 정한다. 실제 경로만 받는다(D-15).
 
-    ``os.path.abspath`` 처럼 ``..`` 를 문자열로 접지 않는다. ``alias/..`` 는 링크 뒤의 실제
-    부모이므로, 접으면 다른 파일을 가리킨다. 마지막 구성요소는 그대로 붙인다: 그것이 링크면
-    따라가지 않고 기존 정책대로 따로 검사한다. 마지막 구성요소가 ``.``·``..``·빈 문자열이면
-    ``ValueError``. 이미 정한 경로에 다시 불러도 같다.
+    이름이 ``real_path`` 인 이유: 경로를 고쳐 주지 않고, 이미 실제 경로인지 확인만 한다.
+    앞선 라운드처럼 ``abspath`` 로 ``..`` 를 접거나 부모 링크를 ``realpath`` 로 바꾸면, 다른
+    파일을 가리키거나 Litestream 설정의 ``dbs[].path`` 와 어긋났다. 그래서
+    - 원문에 ``..`` 구성요소가 있으면 거부한다.
+    - ``normpath(abspath(raw))`` 의 마지막 구성요소가 ``.``·``..``·빈 문자열이면 거부한다.
+    - 부모는 존재하는 디렉터리이고 ``realpath(parent, strict=True)`` 와 같아야 한다(부모 경로
+      어디에도 링크·없는 구성요소가 없음).
+    마지막 구성요소는 없어도 되고(새 DB), 그것이 링크인지는 따로 검사한다(DB 는 정규 파일만,
+    격리 대상은 링크 거부). 이 경로를 잠금·격리·상태 파일과 Litestream 호출에 모두 쓴다.
+    어긋나면 ``ValueError``(CLI 에서는 exit 64).
     """
     text = os.fspath(raw)
-    name = os.path.basename(text)
-    if name in ("", ".", ".."):
+    hint = "use the real path; the litestream config dbs[].path must be the same real path (D-15)"
+    if ".." in text.split(os.sep):
+        raise ValueError(f"path must not contain '..': {text!r}; {hint}")
+    if os.path.basename(text) in ("", ".", ".."):
         raise ValueError(f"path must end with a file name: {text!r}")
-    return Path(os.path.realpath(os.path.dirname(text) or ".")) / name
+    path = os.path.normpath(os.path.abspath(text))
+    if os.path.basename(path) in ("", ".", ".."):
+        raise ValueError(f"path must end with a file name: {text!r}")
+    parent = os.path.dirname(path)
+    if not os.path.isdir(parent):
+        raise ValueError(f"parent directory {parent} does not exist or is not a directory; {hint}")
+    try:
+        real = os.path.realpath(parent, strict=True)
+    except OSError as exc:
+        raise ValueError(f"cannot resolve {parent}: {exc}; {hint}") from None
+    if real != parent:
+        raise ValueError(
+            f"parent directory {parent} is not a real path (it resolves to {real}); "
+            f"pass {os.path.join(real, os.path.basename(path))} instead; {hint}"
+        )
+    return Path(path)
+
+
+def _real_pair(db: Path, meta: Path) -> tuple[Path, Path]:
+    """단계 함수를 직접 부를 때도 같은 계약을 지킨다. 어긋나면 exit 64."""
+    try:
+        return real_path(db), real_path(meta)
+    except ValueError as exc:
+        raise _Exit(EXIT_USAGE, str(exc)) from None
+
+
+def _overlaps(a: Path, b: Path) -> bool:
+    return a == b or a in b.parents or b in a.parents
+
+
+def check_no_overlap(db: Path, meta: Path) -> None:
+    """격리 대상끼리, 그리고 대상과 격리 목적지(DB 디렉터리 안의 .partial·final·임시 복원)가
+    같은 경로이거나 한쪽이 다른 쪽의 조상이면 거부한다(exit 2). 예: 메타가 DB 의 부모면 DB 를
+    옮긴 뒤 메타를 자기 안으로 옮기려다 실패하고, 재개도 같은 오류를 반복한다.
+    """
+    targets = quarantine_targets(db, meta)
+    for i, a in enumerate(targets):
+        for b in targets[i + 1 :]:
+            if _overlaps(a, b):
+                raise _Exit(EXIT_REFUSE, f"cannot quarantine: {a} and {b} overlap")
+        if a == db.parent or a in db.parent.parents:
+            raise _Exit(
+                EXIT_REFUSE,
+                f"cannot quarantine: {a} contains the quarantine destination {db.parent}",
+            )
 
 
 def lock_path(db: Path) -> Path:
@@ -248,7 +300,8 @@ def check_quarantinable(db: Path, meta: Path) -> None:
     - 대상 이름이 서로 겹치거나 격리 디렉터리의 예약 이름(manifest)과 겹치면 거부한다.
     - rename 은 같은 파일시스템 안에서만 원자적이다. 다른 파일시스템이면 거부한다.
     """
-    db, meta = canonical_path(db), canonical_path(meta)
+    db, meta = _real_pair(db, meta)
+    check_no_overlap(db, meta)
     names = [p.name for _, p in quarantine_roles(db, meta)]
     if len(set(names)) != len(names):
         raise _Exit(EXIT_REFUSE, f"cannot quarantine: duplicate target names {names}")
@@ -301,7 +354,7 @@ def quarantine(db: Path, meta: Path) -> Path | None:
     먼저 ``.partial`` 디렉터리와 manifest(대상 DB, 항목마다 역할·원래 경로·이름, 순서)를
     내구화한 뒤 옮긴다.
     """
-    db, meta = canonical_path(db), canonical_path(meta)
+    db, meta = _real_pair(db, meta)
     check_quarantinable(db, meta)
     present = [(role, p) for role, p in quarantine_roles(db, meta) if os.path.lexists(p)]
     if not present:
@@ -385,7 +438,7 @@ def resume_quarantine(db: Path, meta: Path) -> None:
 
     전체를 먼저 검증하고, 하나라도 어긋나면 아무것도 옮기지 않고 exit 2 다. 둘 이상이면 거부.
     """
-    db, meta = canonical_path(db), canonical_path(meta)
+    db, meta = _real_pair(db, meta)
     pattern = _partial_re(db)
     try:
         found = sorted(n for n in os.listdir(db.parent) if pattern.fullmatch(n))
@@ -401,6 +454,7 @@ def resume_quarantine(db: Path, meta: Path) -> None:
         )
     partial = db.parent / found[0]
     final = db.with_name(found[0].removesuffix(".partial"))
+    check_no_overlap(db, meta)
     if not stat.S_ISDIR(os.lstat(partial).st_mode):
         raise _refuse_resume(partial, "it is not a directory (or is a symlink)")
     contents = set(os.listdir(partial))
@@ -610,11 +664,11 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     args = parser.parse_args(own)
     if not command:
         parser.error("missing command after '--'")
-    # 잠금·사이드카·임시 복원·격리·설치·상태 파일이 모두 이 한 번 정한 경로를 쓴다.
+    # 잠금·사이드카·임시 복원·격리·설치·상태 파일과 Litestream 호출이 모두 이 경로를 쓴다.
     try:
-        args.db = canonical_path(args.db)
+        args.db = real_path(args.db)
         meta = ls.default_meta_path(args.db) if args.meta_path is None else args.meta_path
-        args.meta_path = canonical_path(meta)
+        args.meta_path = real_path(meta)
     except ValueError as exc:
         parser.error(str(exc))
     return args, command
