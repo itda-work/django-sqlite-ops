@@ -1,0 +1,1 @@
+Error: cannot restore, output path already exists and is not empty: $LAB/restored.db. Use -force to overwrite
