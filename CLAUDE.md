@@ -14,6 +14,13 @@
 - 구현 전이다. `docs/DESIGN.md` §3-1 의 v0.1 범위부터 만든다.
 - 저장소는 public 이다(D-9). **PyPI 배포와 외부 홍보는 보류한다**(D-4). 공개 저장소이므로 비밀값·내부 자격증명을 커밋하지 않는다.
 
+## 작업 방식
+- **이슈 먼저.** 구현 전에 GitHub 이슈가 있어야 한다. 진행 상황(착수, 리뷰 결과, 반영·기각 사유, 막힘, 완료)은 그 이슈의 코멘트로 남긴다. 브랜치는 `issue-<N>-<slug>`, PR 본문에 `Closes #N` 을 쓴다.
+- **메인 Claude 세션은 오케스트레이터다.** 이슈·브리프 작성, 위임, 결과 검증(테스트·CI 직접 실행), 이슈 기록, 병합을 맡는다. 구현 코드를 직접 쓰지 않는다.
+- **구현**: herdr pane 의 Claude Code — `herdr agent start impl --kind claude --pane <id> -- --model claude-opus-5-5 --effort medium`
+- **리뷰**: herdr pane 의 Codex — `herdr agent start review --kind codex --pane <id> -- -m gpt-6-astra -c model_reasoning_effort=medium --sandbox read-only`. 지적은 구현자에게 돌려 고친다. 리뷰가 통과하고 CI 가 초록일 때만 병합한다.
+- 브리프와 리뷰 결과는 `.work/issue-<N>/`(git 무시)의 파일로 주고받는다. 긴 지시를 프롬프트에 넣지 않는다.
+
 ## 규약
 - 문서는 한국어, 커밋 메시지는 영어 Conventional Commits 로 쓴다.
 - `django_sqlite_ops/boot/` 는 **Django 를 import 하지 않는다.** 복원 전에 DB 파일이 생기는 것을 막기 위해서다(DESIGN §4-1). 이 규칙은 테스트로 지킨다: `import django` 를 막은 상태에서 boot 를 import 해 본다.
