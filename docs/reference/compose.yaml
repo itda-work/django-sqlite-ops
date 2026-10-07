@@ -1,0 +1,31 @@
+name: djlab-ls
+# Litestream × Django Docker 랩 (아이스버그 스파이크, 끝나면 `docker compose -p djlab-ls down -v`)
+services:
+  s3:
+    image: chrislusf/seaweedfs:latest
+    command: server -dir=/data -s3 -s3.port=8333 -master.volumeSizeLimitMB=64 -volume.max=200
+    labels: [djlab=litestream]
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:8333/ >/dev/null 2>&1 || exit 1"]
+      interval: 2s
+      retries: 30
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    labels: [djlab=litestream]
+    ports: ["127.0.0.1:18474:8474"]
+  app:
+    build: .
+    image: djlab-ls-app:latest
+    labels: [djlab=litestream]
+    environment:
+      REPLICA_URL: "s3://djlab/db?endpoint=http://toxiproxy:18333&forcePathStyle=true&region=us-east-1"
+      LITESTREAM_ACCESS_KEY_ID: any
+      LITESTREAM_SECRET_ACCESS_KEY: any
+      AWS_ACCESS_KEY_ID: any
+      AWS_SECRET_ACCESS_KEY: any
+    ports: ["127.0.0.1:18000:8000"]
+    volumes: ["appdata:/data"]
+    depends_on: [s3, toxiproxy]
+    stop_grace_period: 20s
+volumes:
+  appdata:
