@@ -40,7 +40,8 @@ C = ReasonCode
 
 # 손으로 쓴 기대값 표.
 # (로컬 DB, 로컬 TXID, 원격) → (state, reason_code, refuse·restore·keep-local 각각의 action)
-# 판정 로직을 다시 계산하지 않는다. 표를 바꿀 때는 DESIGN §4-3 의 규칙표와 함께 바꾼다.
+# adopt_existing=False 일 때의 표다. 판정 로직을 다시 계산하지 않는다.
+# 표를 바꿀 때는 DESIGN §4-3 의 규칙표와 함께 바꾼다.
 TABLE = {
     # 로컬 DB 없음, 메타 없음
     (False, None, "err"): (U, C.REMOTE_ERROR, NO, NO, NO),
@@ -55,13 +56,13 @@ TABLE = {
     (False, 5, "5"): (U, C.STALE_META, NO, QR, NO),
     (False, 5, "7"): (U, C.STALE_META, NO, QR, NO),
     # 로컬 DB 있음, 메타 없음
-    (True, None, "err"): (U, C.REMOTE_ERROR, NO, NO, KEEP),
+    (True, None, "err"): (U, C.REMOTE_ERROR, NO, NO, NO),  # D-12
     (True, None, "empty"): (U, C.NO_LOCAL_META, NO, NO, KEEP),
     (True, None, "3"): (U, C.NO_LOCAL_META, NO, QR, KEEP),
     (True, None, "5"): (U, C.NO_LOCAL_META, NO, QR, KEEP),
     (True, None, "7"): (U, C.NO_LOCAL_META, NO, QR, KEEP),
     # 로컬 DB 있음, 로컬 TXID 5
-    (True, 5, "err"): (U, C.REMOTE_ERROR, NO, NO, KEEP),
+    (True, 5, "err"): (U, C.REMOTE_ERROR, NO, NO, NO),  # D-12
     (True, 5, "empty"): (U, C.REMOTE_EMPTY, NO, NO, KEEP),
     (True, 5, "3"): (M, C.LOCAL_CURRENT, GO, GO, GO),
     (True, 5, "5"): (M, C.LOCAL_CURRENT, GO, GO, GO),
@@ -76,8 +77,15 @@ CASES = [
 ALL_INPUTS = list(itertools.product((False, True), (None, 5), REMOTES, POLICIES))
 
 
-def _decide(local, txid, remote, policy):
-    return decide(local_exists=local, local_txid=txid, remote=REMOTES[remote], on_unknown=policy)
+# adopt_existing=True 가 효과를 내는 유일한 행(D-11). 나머지는 위 표와 같다.
+ADOPT_ROW = (True, None, "empty")
+ADOPT_EXPECTED = ("adopt", "adopt_existing", GO, GO, GO)
+
+
+def _decide(local, txid, remote, policy, **kw):
+    return decide(
+        local_exists=local, local_txid=txid, remote=REMOTES[remote], on_unknown=policy, **kw
+    )
 
 
 def test_table_covers_every_combination():
@@ -104,14 +112,12 @@ def test_invariant_existing_local_is_never_overwritten_without_quarantine(
         assert _decide(local, txid, remote, policy).action is not Action.RESTORE
 
 
+@pytest.mark.parametrize("adopt", [False, True])
 @pytest.mark.parametrize(("local", "txid", "remote", "policy"), ALL_INPUTS)
-def test_invariant_remote_error_never_proceeds_or_restores(local, txid, remote, policy):
+def test_invariant_remote_error_always_refuses(local, txid, remote, policy, adopt):
+    # D-12: 원격 실패면 정책(keep-local 포함)과 무관하게 거부한다.
     if remote == "err":
-        assert _decide(local, txid, remote, policy).action not in {
-            Action.PROCEED,
-            Action.RESTORE,
-            Action.QUARANTINE_AND_RESTORE,
-        }
+        assert _decide(local, txid, remote, policy, adopt_existing=adopt).action is Action.REFUSE
 
 
 @pytest.mark.parametrize(("local", "txid", "remote", "policy"), ALL_INPUTS)
@@ -119,6 +125,49 @@ def test_invariant_refuse_policy_refuses_every_unknown(local, txid, remote, poli
     got = _decide(local, txid, remote, "refuse")
     if got.state is State.UNKNOWN:
         assert got.action is Action.REFUSE
+
+
+# --- adopt_existing (D-11) ---
+
+
+@pytest.mark.parametrize("policy", POLICIES)
+def test_adopt_existing_row(policy):
+    state, code, *actions = ADOPT_EXPECTED
+    got = _decide(*ADOPT_ROW, policy, adopt_existing=True)
+    assert (got.state, got.reason_code, got.action) == (
+        state,
+        code,
+        actions[POLICIES.index(policy)],
+    )
+
+
+@pytest.mark.parametrize(("local", "txid", "remote", "policy"), ALL_INPUTS)
+def test_adopt_existing_has_no_effect_elsewhere(local, txid, remote, policy):
+    if (local, txid, remote) == ADOPT_ROW:
+        return
+    on = _decide(local, txid, remote, policy, adopt_existing=True)
+    off = _decide(local, txid, remote, policy, adopt_existing=False)
+    assert on == off
+
+
+def test_adopt_existing_default_is_off():
+    got = _decide(*ADOPT_ROW, "refuse")
+    assert (got.state, got.reason_code, got.action) == (U, C.NO_LOCAL_META, NO)
+
+
+@pytest.mark.parametrize("adopt", [False, True])
+@pytest.mark.parametrize(("local", "txid", "remote", "policy"), ALL_INPUTS)
+def test_invariant_adopt_only_without_replica_meta_or_error(local, txid, remote, policy, adopt):
+    got = _decide(local, txid, remote, policy, adopt_existing=adopt)
+    if remote not in {"empty"} or txid is not None or not local:
+        assert got.state != "adopt"
+        assert got.reason_code != "adopt_existing"
+
+
+@pytest.mark.parametrize("adopt", [None, 0, 1, "yes"])
+def test_invalid_adopt_existing(adopt):
+    with pytest.raises(ValueError, match="adopt_existing"):
+        _decide(*ADOPT_ROW, "refuse", adopt_existing=adopt)
 
 
 # --- §4-4 스파이크 결함 회귀 ---
@@ -167,6 +216,69 @@ def test_invalid_local_txid(txid):
 def test_invalid_remote_txid(txid):
     with pytest.raises(ValueError, match="remote txid"):
         RemoteTxid(txid)
+
+
+class _NeverNegative(int):
+    def __lt__(self, other):
+        return False
+
+
+class _AlwaysAhead(int):
+    def __ge__(self, other):
+        return True
+
+
+class _AmbiguousError(RemoteError):
+    # isinstance(x, RemoteTxid) 도 참이 되는 실패 객체 (리뷰 1-2)
+    @property
+    def __class__(self):
+        return RemoteTxid
+
+    @property
+    def txid(self):
+        return 7
+
+
+def test_txid_int_subclass_cannot_bypass_negative_check():
+    with pytest.raises(ValueError, match="remote txid"):
+        RemoteTxid(_NeverNegative(-1))
+
+
+def test_txid_int_subclass_cannot_override_comparison():
+    with pytest.raises(ValueError, match="local txid"):
+        decide(local_exists=True, local_txid=_AlwaysAhead(1), remote=RemoteTxid(7))
+
+
+def test_remote_txid_int_subclass_rejected_in_decide():
+    remote = RemoteTxid(3)
+    object.__setattr__(remote, "txid", _NeverNegative(-1))
+    with pytest.raises(ValueError, match="remote txid"):
+        decide(local_exists=True, local_txid=5, remote=remote)
+
+
+def test_ambiguous_remote_cannot_authorize_restore():
+    remote = _AmbiguousError("timeout")
+    assert isinstance(remote, RemoteError) and isinstance(remote, RemoteTxid)
+    with pytest.raises(ValueError, match="remote"):
+        decide(local_exists=True, local_txid=5, remote=remote, on_unknown="restore")
+
+
+@pytest.mark.parametrize("cls", [RemoteError, RemoteEmpty, RemoteTxid])
+def test_remote_subclass_rejected(cls):
+    sub = type("Sub", (cls,), {})
+    remote = sub("x") if cls is RemoteError else sub(3) if cls is RemoteTxid else sub()
+    with pytest.raises(ValueError, match="remote"):
+        decide(local_exists=True, local_txid=5, remote=remote)
+
+
+class _Str(str):
+    pass
+
+
+@pytest.mark.parametrize("message", [None, 403, b"x", _Str("x")])
+def test_invalid_remote_error_message(message):
+    with pytest.raises(ValueError, match="message"):
+        RemoteError(message)
 
 
 def test_remote_txid_mutated_after_creation_is_rejected():
@@ -220,6 +332,7 @@ def test_reason_codes_are_stable_strings():
         "new_db",
         "restore_from_remote",
         "local_current",
+        "adopt_existing",
         "remote_error",
         "stale_meta",
         "no_local_meta",
@@ -252,6 +365,17 @@ def test_reason_contains_numbers(local, txid, remote, numbers):
     assert "\n" not in reason
     for n in numbers:
         assert n in reason
+
+
+@pytest.mark.parametrize("local", [True, False])
+@pytest.mark.parametrize("txid", [None, 5])
+@pytest.mark.parametrize(
+    "message", ["HTTP 403\nrequest failed\rretry", "a\r\nb", "a\x0bb\x0cc\x1cd\u2028e\x85f"]
+)
+def test_reason_is_single_line_for_multiline_error(local, txid, message):
+    # 리뷰 1-3: remote_error 와 stale_meta 경로 모두 한 줄이어야 한다.
+    reason = decide(local_exists=local, local_txid=txid, remote=RemoteError(message)).reason
+    assert len(reason.splitlines()) == 1, reason
 
 
 # --- Django 비의존 (DESIGN §4-1) ---
