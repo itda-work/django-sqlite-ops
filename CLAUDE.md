@@ -26,6 +26,7 @@
 - 문서는 한국어, 커밋 메시지는 영어 Conventional Commits 로 쓴다.
 - `django_sqlite_ops/boot/` 는 **Django 를 import 하지 않는다.** 복원 전에 DB 파일이 생기는 것을 막기 위해서다(DESIGN §4-1). 이 규칙은 테스트로 지킨다: `import django` 를 막은 상태에서 boot 를 import 해 본다.
 - `apps.py` 의 `ready()` 와 시스템 체크는 DB 를 열지 않는다. 실제 연결은 `sqlite_doctor` 에서만 한다.
+- **외부 도구의 설치법·명령·옵션은 공식 문서나 설치된 바이너리의 `-h` 로 확인한 뒤 쓴다.** 기억으로 안내하지 않는다. 예: Litestream 의 macOS 설치는 `brew install benbjohnson/litestream/litestream` 이다(https://litestream.io/install/mac/).
 - 판정할 수 없으면 거부한다. 데이터를 지우거나 덮는 경로는 명시적 옵션 뒤에만 둔다.
 - **결함은 재현한 뒤에 말한다.** "재현함 / 코드상 확인 / 미검증"을 구분해서 쓴다. 수정은 "수정 전에 실패하는 테스트"로 증명한다.
 - **남의 저장소에는 아무것도 쓰지 않는다.** channels-lite, dj-lite, Litestream 을 비롯한 외부 저장소에 이슈·PR·코멘트를 만들지 않는다(D-5). 외부 결함은 `compat/` 의 버전 게이트 몽키패치로 다룬다.
