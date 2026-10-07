@@ -317,6 +317,131 @@ def test_txid_zero_is_valid():
     assert got.state is M
 
 
+# --- 위장 객체: 공개 입력은 정확한 타입만 받는다 (리뷰 2) ---
+
+# 위장 객체가 판정에 끼어드는 통로가 되는 dunder. 하나라도 불리면 AssertionError 로 드러난다.
+_DUNDERS = (
+    "__eq__",
+    "__ne__",
+    "__hash__",
+    "__bool__",
+    "__lt__",
+    "__le__",
+    "__gt__",
+    "__ge__",
+    "__int__",
+    "__index__",
+    "__str__",
+    "__repr__",
+    "__format__",
+    "__len__",
+    "__iter__",
+)
+
+
+def _tripwire(name):
+    def method(self, *args, **kwargs):
+        raise AssertionError(f"user {name} was called")
+
+    return method
+
+
+def _subclass(base, *args):
+    """``base`` 를 상속하고 dunder 를 모두 덫으로 바꾼 객체."""
+    cls = type(f"Disguised{base.__name__}", (base,), {n: _tripwire(n) for n in _DUNDERS})
+    return cls(*args)
+
+
+def _spoof(target):
+    """``__class__`` 로 ``target`` 인 척하는 객체."""
+    ns = {n: _tripwire(n) for n in _DUNDERS}
+    ns["__class__"] = property(lambda self: target)
+    return type(f"Spoof{target.__name__}", (), ns)()
+
+
+def _lookalike():
+    """아무 타입도 아니지만 dunder 로 비교·해시를 흉내 내려는 객체."""
+    return type("Lookalike", (), {n: _tripwire(n) for n in _DUNDERS})()
+
+
+# 입력 → (위장 종류 → 위장 객체를 만드는 함수).
+# bool 과 OnUnknown 은 상속할 수 없어 가까운 타입(int, str)으로 대신한다.
+_DISGUISES = {
+    "local_exists": {"subclass": lambda: _subclass(int, 1), "spoof": lambda: _spoof(bool)},
+    "local_txid": {"subclass": lambda: _subclass(int, 5), "spoof": lambda: _spoof(int)},
+    "remote": {"subclass": lambda: _subclass(RemoteTxid, 7), "spoof": lambda: _spoof(RemoteTxid)},
+    "remote.txid": {"subclass": lambda: _subclass(int, 7), "spoof": lambda: _spoof(int)},
+    "remote.message": {"subclass": lambda: _subclass(str, "a\nb"), "spoof": lambda: _spoof(str)},
+    "on_unknown": {"subclass": lambda: _subclass(str, "refuse"), "spoof": lambda: _spoof(str)},
+    "adopt_existing": {"subclass": lambda: _subclass(int, 1), "spoof": lambda: _spoof(bool)},
+    "RemoteTxid(txid)": {"subclass": lambda: _subclass(int, 7), "spoof": lambda: _spoof(int)},
+    "RemoteError(message)": {"subclass": lambda: _subclass(str, "x"), "spoof": lambda: _spoof(str)},
+}
+for _kinds in _DISGUISES.values():
+    _kinds["lookalike"] = _lookalike
+
+
+def _call_with(field, value):
+    if field == "RemoteTxid(txid)":
+        return RemoteTxid(value)
+    if field == "RemoteError(message)":
+        return RemoteError(value)
+    kw = {
+        "local_exists": True,
+        "local_txid": 5,
+        "remote": RemoteTxid(7),
+        "on_unknown": "refuse",
+        "adopt_existing": False,
+    }
+    if field == "remote.txid":
+        object.__setattr__(kw["remote"], "txid", value)
+    elif field == "remote.message":
+        kw["remote"] = RemoteError("timeout")
+        object.__setattr__(kw["remote"], "message", value)
+    else:
+        kw[field] = value
+    return decide(**kw)
+
+
+@pytest.mark.parametrize(
+    ("field", "kind"),
+    [(field, kind) for field, kinds in _DISGUISES.items() for kind in kinds],
+)
+def test_disguised_input_is_rejected_without_calling_its_dunders(field, kind):
+    value = _DISGUISES[field][kind]()
+    with pytest.raises(ValueError, match="invalid"):
+        _call_with(field, value)
+
+
+class _PolicyString(str):
+    # 내용은 'refuse' 지만 해시·비교로 'restore' 인 척한다 (리뷰 2 재현).
+    def __hash__(self):
+        return hash("restore")
+
+    def __eq__(self, other):
+        return other == "restore"
+
+
+class _PolicyObject:
+    def __hash__(self):
+        return hash("restore")
+
+    def __eq__(self, other):
+        return other == "restore"
+
+
+@pytest.mark.parametrize("policy", [_PolicyString("refuse"), _PolicyObject()], ids=["str", "obj"])
+def test_policy_cannot_impersonate_restore(policy):
+    with pytest.raises(ValueError, match="on_unknown"):
+        decide(local_exists=True, local_txid=5, remote=RemoteTxid(7), on_unknown=policy)
+
+
+@pytest.mark.parametrize("policy", [*POLICIES, *OnUnknown])
+def test_on_unknown_accepts_exact_str_and_members(policy):
+    got = decide(local_exists=True, local_txid=5, remote=RemoteTxid(7), on_unknown=policy)
+    assert got.action is {"refuse": NO, "restore": QR, "keep-local": KEEP}[str(policy)]
+
+
 # --- 출력 ---
 
 
