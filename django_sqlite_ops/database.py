@@ -83,7 +83,12 @@ def sqlite_database(
     """권장값을 담은 ``DATABASES`` 항목을 돌려준다.
 
     ``pragmas`` 는 PRAGMA 를 덮거나 더한다. 값이 ``None`` 이면 그 PRAGMA 를 뺀다.
+    PRAGMA 이름은 SQLite 처럼 대소문자를 가리지 않고 소문자로 맞춘다.
     ``options`` 는 ``OPTIONS`` 키를 더하거나 덮는다. ``init_command`` 는 ``pragmas`` 로만 정한다.
+
+    ``options={"timeout": N}``(초)만 주면 대기 시간이 바뀌지 않는다. ``init_command`` 의
+    ``busy_timeout``(밀리초, 기본 5000)이 연결 뒤에 실행되어 우선하기 때문이다. ``timeout`` 을
+    쓰려면 ``pragmas={"busy_timeout": None}`` 을 함께 주고, 아니면 ``busy_timeout`` 을 덮는다.
     """
     rec = recommended(profile)
     if options and "init_command" in options:
@@ -93,8 +98,13 @@ def sqlite_database(
         )
 
     merged = rec["pragmas"]
+    seen: set[str] = set()
     for key, value in (pragmas or {}).items():
         _check_pragma_name(key)
+        key = key.lower()
+        if key in seen:
+            raise ValueError(f"PRAGMA {key} given more than once in pragmas (names ignore case)")
+        seen.add(key)
         if value is None:
             merged.pop(key, None)
         else:

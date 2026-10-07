@@ -1,3 +1,4 @@
+import json
 import re
 import subprocess
 import sys
@@ -80,6 +81,26 @@ def test_removing_unknown_pragma_is_noop():
     assert sqlite_database("x.sqlite3", pragmas={"temp_store": None}) == sqlite_database(
         "x.sqlite3"
     )
+
+
+@pytest.mark.parametrize("name", ["BUSY_TIMEOUT", "Busy_Timeout"])
+def test_removing_pragma_is_case_insensitive(name):
+    # SQLite 의 PRAGMA 이름은 대소문자를 가리지 않는다. 제거도 같은 규칙을 따라야 한다
+    db = sqlite_database("x.sqlite3", pragmas={name: None})
+    assert db["OPTIONS"]["init_command"] == "PRAGMA journal_mode=WAL;PRAGMA synchronous=NORMAL"
+
+
+def test_overriding_pragma_is_case_insensitive():
+    db = sqlite_database("x.sqlite3", pragmas={"SYNCHRONOUS": "FULL", "Temp_Store": "MEMORY"})
+    assert db["OPTIONS"]["init_command"] == (
+        "PRAGMA journal_mode=WAL;PRAGMA synchronous=FULL;PRAGMA busy_timeout=5000;"
+        "PRAGMA temp_store=MEMORY"
+    )
+
+
+def test_same_pragma_in_two_cases_rejected():
+    with pytest.raises(ValueError, match="more than once"):
+        sqlite_database("x.sqlite3", pragmas={"busy_timeout": 100, "BUSY_TIMEOUT": None})
 
 
 def test_options_merge_and_override():
@@ -249,3 +270,63 @@ def test_without_transaction_mode_atomic_is_deferred(tmp_path):
     )
     assert result.returncode == 0, result.stderr
     assert "other_in_atomic acquired" in result.stdout.splitlines()
+
+
+BUSY_TIMEOUT_SCRIPT = """
+import json
+import sys
+
+import django
+from django.conf import settings
+
+from django_sqlite_ops.database import sqlite_database
+
+path, kwargs = sys.argv[1], json.loads(sys.argv[2])
+settings.configure(DATABASES={"default": sqlite_database(path, **kwargs)}, USE_TZ=True)
+django.setup()
+
+from django.db import connection
+
+with connection.cursor() as cursor:
+    cursor.execute("PRAGMA busy_timeout")
+    print(cursor.fetchone()[0])
+"""
+
+
+@pytest.mark.parametrize(
+    ("kwargs", "expected"),
+    [
+        # init_command 의 busy_timeout 이 connect(timeout=) 뒤에 실행되므로 기본 5000ms 가 이긴다
+        ({"options": {"timeout": 20}}, 5000),
+        # timeout(초)을 쓰려면 busy_timeout(밀리초)을 함께 뺀다
+        ({"options": {"timeout": 20}, "pragmas": {"busy_timeout": None}}, 20000),
+        ({"options": {"timeout": 2}, "pragmas": {"BUSY_TIMEOUT": None}}, 2000),
+        ({"pragmas": {"BUSY_TIMEOUT": 1234}}, 1234),
+    ],
+)
+def test_real_busy_timeout(tmp_path, kwargs, expected):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            BUSY_TIMEOUT_SCRIPT,
+            str(tmp_path / "app.sqlite3"),
+            json.dumps(kwargs),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert result.stdout.strip() == str(expected)
+
+
+def test_timeout_precedence_documented():
+    # options={"timeout": ...} 만으로는 busy_timeout 이 바뀌지 않는다는 점을 사용자에게 알려야 한다
+    doc = sqlite_database.__doc__ or ""
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    for text in (doc, readme):
+        assert "timeout" in text.replace("busy_timeout", "")
+        assert "busy_timeout" in text
+        assert "밀리초" in text and "초" in text
