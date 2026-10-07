@@ -75,7 +75,11 @@ python -m django_sqlite_ops.boot \
 - `--on-unknown restore` : 로컬을 `<db>.stale-<ts>/` 디렉터리 하나로 **원자적으로** 옮긴 뒤 복원한다. 옮기기는 디렉터리 rename 한 번으로 한다. 파일을 하나씩 옮기면 중간에 죽었을 때 반쯤 옮겨진 상태가 남는다.
 - `--on-unknown keep-local` : 로컬을 그대로 두고 진행하되, stderr 와 헬스 상태에 `unknown_at_boot` 를 남긴다. **원격 조회가 성공했을 때만** 통한다. 원격 조회 실패면 정책과 무관하게 거부한다(D-12, S3 장애 중 옛 볼륨 재부팅 방지).
 - `--adopt-existing` : 기존 DB 를 처음 Litestream 에 올릴 때 쓴다. 정확히 (로컬 DB 있음, 로컬 메타 없음, 원격 조회 성공·빈 목록) 일 때만 `adopt` 로 진행하고, 그 밖의 모든 조합에서는 결과가 바뀌지 않는다. 그래서 켜 둔 채로 두어도 다른 사고를 통과시키지 않는다. `keep-local` 을 최초 도입 절차로 쓰지 않는다(D-11).
-- **원격 TXID 조회**는 `litestream ltx -level all <url>` 로 모든 레벨을 본다. 기본은 L0 만 나열한다(0.5.17 `ltx -h` 로 확인).
+- **원격 TXID 조회**는 `litestream ltx -config <설정> -level all -json <db 경로>` 로 설정 파일의 복제본을 모든 레벨에 걸쳐 보고, 항목들의 `max_txid`(16자리 16진수) 최대값을 쓴다. 기본(`-level` 생략)은 L0 만 나열해 L0 가 사라진 복제본을 빈 목록으로 오판한다(0.5.17 `ltx -h` 와 실측). 구현은 `boot/litestream.py` 의 `remote_max_txid()`.
+  - rc 0 + `[]` → `RemoteEmpty`. 0.5.17 은 복제본 경로가 없을 때와 비어 있을 때 모두 이 출력이라 둘을 구분할 수 없다(경로 오타도 빈 목록이다). 그래서 로컬 DB 가 있는데 빈 목록이면 `remote_empty` 로 거부한다.
+  - rc ≠ 0(설정에 없는 DB·설정 파일 없음·YAML 오류·접근 불가 모두 rc 1, stderr `Error: ...`), 타임아웃(기본 30초), JSON·스키마 이상, 검증하지 않은 Litestream 버전(`litestream version` 이 `VERIFIED_VERSIONS`, 현재 0.5.17 밖) → `RemoteError`.
+- **로컬 TXID 조회**는 로컬 메타 디렉터리(기본 `<db 디렉터리>/.<db 이름>-litestream/`, 설정의 `meta-path` 로 바뀜)의 `ltx/0/` 에서 파일 이름 `<min>-<max>.ltx`(16자리 소문자 16진수) 중 최대 `max` 를 쓴다. Litestream 0.5.17 이 자기 복제 위치를 정하는 `DB.MaxLTX()` 와 같은 방법이다. L0 보존 정리는 가장 새 L0 파일을 지우지 않으므로 업로드·압축·종료 뒤에도 최신 TXID 가 남는다(소스 `EnforceL0RetentionByTime` 과 실측). 디렉터리가 없거나 읽을 수 없거나 맞는 이름이 없으면 `None`(로컬 메타 없음). `litestream ltx <db 경로>` 는 로컬이 아니라 복제본을 나열하므로 쓰지 않는다. 구현은 `local_max_txid()`.
+- **복원 호출**은 `litestream restore -config <설정> -json -integrity-check quick -o <새 경로> <db 경로>` 다. 출력 경로는 아직 없어야 하고(`-force` 를 쓰지 않는다) `-if-db-not-exists` 는 쓰지 않는다. rc 0, `-json` 요약의 `txid`, 출력 파일이 비어 있지 않음을 모두 확인해야 성공이다. 기본 타임아웃 600초. 파일 교체·격리는 호출자(#4)가 한다. 구현은 `restore()`.
 - 판정에 쓰는 정보와 비교 규칙은 `boot/decide.py` 의 순수 함수 `decide()` 하나에 모은다. 입력은 (로컬 존재 여부, 로컬 메타 TXID|None, 원격 조회 결과, `on_unknown`, `adopt_existing`)이고, 원격 조회 결과는 실패(`RemoteError`)·빈 목록(`RemoteEmpty`)·최대 TXID(`RemoteTxid`) 세 타입으로 구분한다. 원격 결과는 정확한 타입으로 한 번 검증해 내부 태그로 정규화하고, TXID 는 내장 `int` 만 받는다(서브클래스는 비교를 바꿔 판정을 우회할 수 있다). 출력은 (상태, 조치, 사유 코드, 사람용 사유 한 줄)이다. 표 기반 단위 테스트(`tests/test_boot_decide.py`)로 모든 조합을 고정한다.
 
 상태 규칙 (위에서부터 처음 맞는 줄. `*` 는 무관):

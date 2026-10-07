@@ -40,8 +40,12 @@
 - act 는 Linux 컨테이너만 돌린다. macOS·Windows 잡은 로컬에서 재현되지 않는다.
 
 ## 함정 (실측에서 나온 것)
-- Litestream endpoint 에 `http://` 가 빠지면 HTTPS 로 접속해 restore 가 무한 대기한다.
+- Litestream endpoint 에 `http://` 가 빠지면 HTTPS 로 접속해 restore·`ltx` 가 무한 대기한다(`ltx` 는 평범한 HTTP 서버로 재현함). 모든 Litestream 호출에 타임아웃을 둔다.
 - `litestream ltx` 는 기본으로 L0 만 나열한다. 최대 TXID 를 볼 때는 `-level all` 을 쓴다.
+- `litestream ltx` 는 복제본 경로가 없어도, 비어 있어도 rc 0 과 `[]` 다(0.5.17). 경로 오타와 빈 복제본을 출력으로 구분할 수 없다. `ltx DB_PATH` 도 로컬 메타가 아니라 복제본을 나열한다.
+- `litestream restore -integrity-check` 는 로그 한 줄을 stdout 의 `-json` 요약 앞에 쓴다. stdout 전체를 JSON 으로 읽으면 실패한다.
+- `restore -if-db-not-exists` 는 0바이트 DB 파일이 있으면 rc 0 으로 복원을 건너뛴다(재현함, DESIGN §4-1). `restore -o` 는 0바이트 파일은 덮고 내용 있는 파일은 거부한다.
+- restore 로 만든 DB 옆에는 로컬 메타(`.<db>-litestream/`)가 없다. replicate 가 시작돼야 생긴다.
 - S3 가 끊겨도 Litestream 은 로그·`status`·메트릭에 아무것도 남기지 않는다(D3). 그래서 헬스는 TXID 를 직접 비교해 계산한다.
 - Linux 에서 litestream-vfs 확장을 로드하면 그 뒤의 일반 connect 가 실패한다. 우회책 `sqlite3_reset_auto_extension()` 은 **모든** 자동 확장을 해제하므로 옵션으로만 둔다.
 - SeaweedFS 는 버킷마다 볼륨을 잡는다. 랩에서는 버킷 하나를 두고 prefix 로 나누며, `-volume.max` 를 올린다.
