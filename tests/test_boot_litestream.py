@@ -8,7 +8,6 @@
 
 import os
 import shutil
-import socket
 import sqlite3
 import stat
 import subprocess
@@ -17,26 +16,13 @@ import time
 from pathlib import Path
 
 import pytest
+from _litestream import LITESTREAM, SilentServer, needs_litestream, write_config
 from _nodjango import assert_runs_without_django
 
 from django_sqlite_ops.boot import litestream as ls
 from django_sqlite_ops.boot.decide import RemoteEmpty, RemoteError, RemoteTxid
 
 FIXTURES = Path(__file__).parent / "fixtures" / "litestream-0.5.17"
-LITESTREAM = shutil.which("litestream")
-REQUIRE_LITESTREAM = os.environ.get("REQUIRE_LITESTREAM") == "1"
-
-
-@pytest.fixture
-def litestream_binary() -> str:
-    if LITESTREAM is None:
-        if REQUIRE_LITESTREAM:
-            pytest.fail("litestream binary not on PATH (REQUIRE_LITESTREAM=1)")
-        pytest.skip("litestream binary not on PATH")
-    return LITESTREAM
-
-
-needs_litestream = pytest.mark.usefixtures("litestream_binary")
 
 
 def fixture(name: str) -> tuple[str, str, int]:
@@ -572,20 +558,6 @@ def test_module_imports_without_django():
 # --- 실제 바이너리 --------------------------------------------------------------------------
 
 
-def write_config(lab: Path, db: Path, replica_block: str) -> Path:
-    config = lab / "litestream.yml"
-    config.write_text(
-        "l0-retention: 2s\n"
-        "l0-retention-check-interval: 1s\n"
-        "levels:\n"
-        "  - interval: 2s\n"
-        "dbs:\n"
-        f"  - path: {db}\n"
-        "    replica:\n" + replica_block
-    )
-    return config
-
-
 @needs_litestream
 def test_real_version_is_verified():
     assert ls.check_version(binary=LITESTREAM) is None
@@ -665,39 +637,6 @@ def test_real_restore_without_backups_fails(tmp_path):
     result = ls.restore(lab / "app.db", lab / "out.db", config=config, binary=LITESTREAM)
     assert result.ok is False
     assert "no matching backup files" in result.reason
-
-
-class SilentServer:
-    """연결은 받지만 아무 응답도 하지 않는 TCP 서버."""
-
-    def __init__(self) -> None:
-        self.sock = socket.create_server(("127.0.0.1", 0))
-        self.sock.settimeout(0.2)
-        self.port = self.sock.getsockname()[1]
-        self.conns: list[socket.socket] = []
-        self.stop = threading.Event()
-        self.thread = threading.Thread(target=self._serve, daemon=True)
-
-    def _serve(self) -> None:
-        while not self.stop.is_set():
-            try:
-                conn, _ = self.sock.accept()
-            except TimeoutError:
-                continue
-            except OSError:
-                return
-            self.conns.append(conn)
-
-    def __enter__(self) -> "SilentServer":
-        self.thread.start()
-        return self
-
-    def __exit__(self, *exc: object) -> None:
-        self.stop.set()
-        self.thread.join(timeout=5)
-        for c in self.conns:
-            c.close()
-        self.sock.close()
 
 
 @needs_litestream
