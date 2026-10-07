@@ -2,10 +2,10 @@ import json
 import re
 import subprocess
 import sys
-import textwrap
 from pathlib import Path
 
 import pytest
+from _nodjango import assert_runs_without_django
 
 from django_sqlite_ops.database import PROFILES, RECOMMENDED, recommended, sqlite_database
 
@@ -145,30 +145,13 @@ def test_invalid_pragma_value_rejected(value):
 
 def test_import_without_django():
     # settings.py 에서 부르는 모듈이라 Django 없이 import 되어야 한다 (DESIGN §6-0)
-    code = textwrap.dedent(
+    assert_runs_without_django(
         """
-        import sys
-
-        class BlockDjango:
-            def find_spec(self, name, path=None, target=None):
-                if name == "django" or name.startswith("django."):
-                    raise ImportError(f"blocked: {name}")
-                return None
-
-        sys.meta_path.insert(0, BlockDjango())
         from django_sqlite_ops.database import sqlite_database
 
         sqlite_database("app.sqlite3")
-        leaked = sorted(m for m in sys.modules if m == "django" or m.startswith("django."))
-        assert not leaked, leaked
-        print("ok")
         """
     )
-    result = subprocess.run(
-        [sys.executable, "-c", code], cwd=ROOT, capture_output=True, text=True, check=False
-    )
-    assert result.returncode == 0, result.stderr
-    assert result.stdout.strip() == "ok"
 
 
 def _design_default_on_rows():
