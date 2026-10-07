@@ -57,3 +57,38 @@ jobs:
           .venv/bin/pip install -q -e . "django~=5.2.0" pytest
       - name: Test
         run: .venv/bin/pytest -v
+
+  # 실제 litestream 바이너리로 boot/litestream 통합 테스트를 돈다. 다른 잡에는 바이너리가
+  # 없어 skip 되므로, 여기서는 REQUIRE_LITESTREAM=1 로 skip 을 실패로 바꾼다.
+  # 설치는 공식 방법(https://litestream.io/install/linux/)인 릴리스 .deb + dpkg 다. apt 는 쓰지 않는다.
+  litestream:
+    name: test (litestream 0.5.17, py3.14, django 6.1)
+    runs-on: ubuntu-latest
+    env:
+      LITESTREAM_VERSION: "0.5.17"  # 바꾸면 위 name 도 함께 고친다
+      REQUIRE_LITESTREAM: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install litestream
+        run: |
+          case "$(uname -m)" in
+            x86_64) arch=x86_64 ;;
+            aarch64) arch=arm64 ;;
+            *) echo "unsupported architecture: $(uname -m)" >&2; exit 1 ;;
+          esac
+          deb="litestream-${LITESTREAM_VERSION}-linux-${arch}.deb"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$deb" \
+            "https://github.com/benbjohnson/litestream/releases/download/v${LITESTREAM_VERSION}/$deb"
+          sudo dpkg -i "$RUNNER_TEMP/$deb"
+          got="$(litestream version)"
+          if [ "$got" != "$LITESTREAM_VERSION" ]; then
+            echo "litestream version mismatch: got '$got', want '$LITESTREAM_VERSION'" >&2
+            exit 1
+          fi
+      - name: Install
+        run: |
+          uv venv --python 3.14
+          uv pip install -e . "django~=6.1.0" --group dev
+      - name: Test
+        run: uv run --no-sync pytest -v -rs

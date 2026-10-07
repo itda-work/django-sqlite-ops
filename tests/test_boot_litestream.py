@@ -2,7 +2,8 @@
 
 - fixture 파싱: ``tests/fixtures/litestream-0.5.17/`` 의 실측 출력(만든 방법은 그 폴더 README).
 - 가짜 실행 파일: 테스트가 만든 셸 스크립트로 rc·stderr·타임아웃 처리를 본다.
-- 실제 바이너리: ``litestream`` 이 PATH 에 있을 때만 돈다(CI 에는 없어서 skip).
+- 실제 바이너리: ``litestream`` 이 PATH 에 있을 때만 돈다. 없으면 skip 하지만
+  ``REQUIRE_LITESTREAM=1`` 이면 실패한다(CI 의 litestream 잡).
 """
 
 import os
@@ -23,7 +24,19 @@ from django_sqlite_ops.boot.decide import RemoteEmpty, RemoteError, RemoteTxid
 
 FIXTURES = Path(__file__).parent / "fixtures" / "litestream-0.5.17"
 LITESTREAM = shutil.which("litestream")
-needs_litestream = pytest.mark.skipif(LITESTREAM is None, reason="litestream binary not on PATH")
+REQUIRE_LITESTREAM = os.environ.get("REQUIRE_LITESTREAM") == "1"
+
+
+@pytest.fixture
+def litestream_binary() -> str:
+    if LITESTREAM is None:
+        if REQUIRE_LITESTREAM:
+            pytest.fail("litestream binary not on PATH (REQUIRE_LITESTREAM=1)")
+        pytest.skip("litestream binary not on PATH")
+    return LITESTREAM
+
+
+needs_litestream = pytest.mark.usefixtures("litestream_binary")
 
 
 def fixture(name: str) -> tuple[str, str, int]:

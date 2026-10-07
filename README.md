@@ -210,4 +210,5 @@ uv run --no-sync pytest
 
 scripts/ci-local.sh                 # GitHub Actions CI 를 act 로 로컬 실행 (lint + 전체 매트릭스)
 scripts/ci-local.sh test 3.14 6.1   # 매트릭스 한 칸만
+scripts/ci-local.sh litestream      # 실제 litestream 바이너리로 통합 테스트 (skip 이면 실패)
 ```
