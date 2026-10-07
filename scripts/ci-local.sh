@@ -4,6 +4,7 @@
 #   scripts/ci-local.sh                      # lint + 전체 매트릭스
 #   scripts/ci-local.sh lint                 # lint 만
 #   scripts/ci-local.sh test 3.14 6.1        # 매트릭스 한 칸 (python, django)
+#   scripts/ci-local.sh litestream           # 실제 litestream 바이너리로 도는 잡
 #   CI_ARCH=amd64 scripts/ci-local.sh        # GitHub 러너와 같은 amd64 (에뮬레이션이라 느리다)
 #
 # 기본 이미지와 아키텍처는 저장소 루트의 .actrc 에 있다.
@@ -31,12 +32,13 @@ fi
 case "${1:-all}" in
   all) ;;
   lint) args+=(-j lint) ;;
+  litestream) args+=(-j litestream) ;;
   test)
     args+=(-j test)
     [[ -n "${2:-}" ]] && args+=(--matrix "python:$2")
     [[ -n "${3:-}" ]] && args+=(--matrix "django:$3")
     ;;
-  *) echo "사용법: $0 [all|lint|test [python] [django]]" >&2; exit 64 ;;
+  *) echo "사용법: $0 [all|lint|litestream|test [python] [django]]" >&2; exit 64 ;;
 esac
 
 exec act "${args[@]}"

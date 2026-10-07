@@ -35,8 +35,8 @@
 - 의존성은 Django 만 필수다. channels-nats(`[nats]`)와 channels-lite(`[channels-lite]`)는 extra 로 둔다.
 
 ## CI
-- GitHub Actions(`.github/workflows/ci.yml`)가 정본이다: lint(ruff) + Python 3.13/3.14 × Django 5.2/6.1 매트릭스 + `sqlite-floor`(Ubuntu 22.04 시스템 SQLite 3.37.2). uv 의 Python 은 최신 SQLite 를 품고 있어 하한은 `sqlite-floor` 에서만 검사된다.
-- 로컬에서는 `scripts/ci-local.sh` 로 같은 워크플로를 act 로 돌린다(`lint`, `test <py> <django>` 로 좁힐 수 있다). 지원 범위를 바꾸면 이 매트릭스와 DESIGN §5 를 함께 고친다.
+- GitHub Actions(`.github/workflows/ci.yml`)가 정본이다: lint(ruff) + Python 3.13/3.14 × Django 5.2/6.1 매트릭스 + `sqlite-floor`(Ubuntu 22.04 시스템 SQLite 3.37.2) + `litestream`(릴리스 .deb 로 설치한 실제 바이너리, `REQUIRE_LITESTREAM=1` 이라 바이너리가 없어 skip 되면 실패). uv 의 Python 은 최신 SQLite 를 품고 있어 하한은 `sqlite-floor` 에서만 검사된다.
+- 로컬에서는 `scripts/ci-local.sh` 로 같은 워크플로를 act 로 돌린다(`lint`, `litestream`, `test <py> <django>` 로 좁힐 수 있다). 지원 범위를 바꾸면 이 매트릭스와 DESIGN §5 를 함께 고친다.
 - act 는 Linux 컨테이너만 돌린다. macOS·Windows 잡은 로컬에서 재현되지 않는다.
 
 ## 함정 (실측에서 나온 것)
