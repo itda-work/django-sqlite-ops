@@ -2,7 +2,13 @@
 
 Django 에서 SQLite 를 운영 DB 로 안전하게 쓰기 위한 **운영 도구**다. 아직 구현 전이며, PyPI 배포 전이다.
 
-- 권장 설정: `sqlite_database()` 가 실측 근거가 있는 PRAGMA·`transaction_mode` 를 담은 표준 `DATABASES` 항목을 돌려준다.
+- 권장 설정: `sqlite_database(path, profile="single-server", pragmas=None, options=None)` 가 실측 근거가 있는 값(`transaction_mode=IMMEDIATE`, `journal_mode=WAL`, `synchronous=NORMAL`, `busy_timeout=5000`)을 담은 표준 `DATABASES` 항목을 돌려준다. `pragmas={...}` 로 PRAGMA 를 덮거나 더하고(`None` 이면 뺀다), `options={...}` 로 `OPTIONS` 키를 더한다.
+
+  ```python
+  from django_sqlite_ops.database import sqlite_database
+
+  DATABASES = {"default": sqlite_database(BASE_DIR / "app.sqlite3")}
+  ```
 - 부팅 판정·복원 CLI: Litestream 복제본과 로컬 DB 를 비교한다. 판정할 수 없으면 기동을 거부한다.
 - `sqlite_doctor`: 실제 PRAGMA, 마운트, Litestream 설정 대조, 채널 레이어 의미론을 진단한다.
 - 복제 헬스: `caught_up / backlog / unknown`

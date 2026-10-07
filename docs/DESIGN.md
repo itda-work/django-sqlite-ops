@@ -116,7 +116,8 @@ django_sqlite_ops/
   DATABASES = {
       "default": sqlite_database(BASE_DIR / "app.sqlite3", profile="single-server"),
   }
-  # pragmas={...} 로 개별 PRAGMA 를 덮고, options={...} 로 OPTIONS 키를 더한다
+  # pragmas={...} 로 개별 PRAGMA 를 덮거나 더하고(값이 None 이면 뺀다),
+  # options={...} 로 OPTIONS 키를 더하거나 덮는다. options 의 init_command 는 거부한다(pragmas 를 쓴다)
   ```
 - 권장값 표는 이 모듈 안의 상수 하나가 정본이다. 정적 체크(§6-1)와 `sqlite_doctor`(§6-2)는 같은 표를 읽어 비교한다. 표와 문서가 어긋나지 않게 문서 표는 테스트로 대조한다.
 - 값마다 근거 등급을 단다. **실측 근거가 있는 값만 기본으로 켠다.** 근거가 없는 값은 랩에서 재기 전까지 후보로만 문서에 둔다.
