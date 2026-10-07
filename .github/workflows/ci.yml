@@ -32,3 +32,28 @@ jobs:
           uv pip install -e . "django~=${{ matrix.django }}.0" --group dev
       - name: Test
         run: uv run --no-sync pytest -v
+
+  # 지원 하한(DESIGN §5: SQLite 3.37)을 실제로 돈다. uv 가 받는 Python 은 최신 SQLite 를
+  # 정적으로 품고 있어서 위 매트릭스로는 하한이 검사되지 않는다. Ubuntu 22.04 의 시스템
+  # libsqlite3(3.37.2)에 연결된 deadsnakes Python 을 쓴다.
+  sqlite-floor:
+    name: test (sqlite 3.37, py3.13, django 5.2)
+    runs-on: ubuntu-latest
+    container: ubuntu:22.04
+    env:
+      DEBIAN_FRONTEND: noninteractive
+      EXPECT_SQLITE: "3.37"
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Python 3.13 (system SQLite)
+        run: |
+          apt-get update -qq
+          apt-get install -y -qq software-properties-common
+          add-apt-repository -y ppa:deadsnakes/ppa
+          apt-get install -y -qq python3.13 python3.13-venv
+      - name: Install
+        run: |
+          python3.13 -m venv .venv
+          .venv/bin/pip install -q -e . "django~=5.2.0" pytest
+      - name: Test
+        run: .venv/bin/pytest -v
