@@ -1,8 +1,8 @@
-time=2026-10-07T23:17:15.506+09:00 level=INFO msg="post-restore integrity check passed" db=app.db replica=file
+time=2026-10-07T23:35:37.861+09:00 level=INFO msg="post-restore integrity check passed" db=app.db replica=file
 {
   "db_path": "$LAB/restored.db",
   "replica": "file",
   "txid": "0000000000000019",
-  "duration_ms": 21,
+  "duration_ms": 16,
   "integrity_check": "quick"
 }

@@ -56,6 +56,7 @@ python -m django_sqlite_ops.boot \
     --db /data/app.sqlite3 --config /etc/litestream.yml \
     [--on-unknown refuse|restore|keep-local]   # 기본 refuse
     [--adopt-existing]                         # 기존 DB 최초 도입 전용 (D-11)
+    [--init-new]                               # 생애 첫 배포 전용: 빈 복제본에서 새 DB (D-13)
     -- <다음 명령...>                          # 예: litestream replicate -exec "uvicorn ..."
 ```
 1. **잠금 획득**: `<db>.boot.lock` (OS 파일 잠금). 같은 볼륨에서 두 번 부팅하는 것을 막는다. 다른 머신 사이의 이중 replicate 는 막지 못한다. 이는 문서와 `sqlite_doctor` 경고로 다룬다.
@@ -67,20 +68,25 @@ python -m django_sqlite_ops.boot \
 ### 4-3. 판정 (상태 4가지)
 | 상태 | 조건 | 기본 동작 |
 |---|---|---|
-| `fresh` | 로컬 DB 파일과 로컬 메타가 모두 없고, 원격 조회 성공 | 원격에 복제본이 있으면 복원, 없으면 그대로 진행(새 DB) |
+| `fresh` | 로컬 DB 파일과 로컬 메타가 모두 없고, 원격 조회 성공. 원격이 빈 목록이면 `--init-new` 도 있어야 한다(D-13) | 원격에 복제본이 있으면 복원, 빈 목록(+`--init-new`)이면 그대로 진행(새 DB) |
 | `match` | 로컬 메타의 최대 TXID ≥ 원격 최대 TXID, 그리고 원격 조회 성공 | 그대로 진행 |
 | `adopt` | `--adopt-existing` 이 있고, 로컬 DB 있음 + 로컬 메타 없음 + 원격 조회 성공·빈 목록 (D-11) | 그대로 진행(기존 DB 를 처음 Litestream 에 올림) |
-| `unknown` | 그 밖의 모든 경우: 원격 조회 실패·타임아웃·파싱 실패, 로컬 메타 없음, DB 없이 메타만 남음, 로컬 DB 는 있는데 원격이 빈 목록, 원격이 앞섬 | **기동 거부(exit 2)**. 사유를 한 줄로 출력 |
+| `unknown` | 그 밖의 모든 경우: 원격 조회 실패·타임아웃·파싱 실패, 로컬 메타 없음, DB 없이 메타만 남음, 로컬 DB 는 있는데 원격이 빈 목록, 로컬 DB 도 원격도 없는데 `--init-new` 없음, 원격이 앞섬 | **기동 거부(exit 2)**. 사유를 한 줄로 출력 |
 
 - `--on-unknown restore` : 로컬을 `<db>.stale-<ts>/` 디렉터리 하나로 **원자적으로** 옮긴 뒤 복원한다. 옮기기는 디렉터리 rename 한 번으로 한다. 파일을 하나씩 옮기면 중간에 죽었을 때 반쯤 옮겨진 상태가 남는다.
 - `--on-unknown keep-local` : 로컬을 그대로 두고 진행하되, stderr 와 헬스 상태에 `unknown_at_boot` 를 남긴다. **원격 조회가 성공했을 때만** 통한다. 원격 조회 실패면 정책과 무관하게 거부한다(D-12, S3 장애 중 옛 볼륨 재부팅 방지).
 - `--adopt-existing` : 기존 DB 를 처음 Litestream 에 올릴 때 쓴다. 정확히 (로컬 DB 있음, 로컬 메타 없음, 원격 조회 성공·빈 목록) 일 때만 `adopt` 로 진행하고, 그 밖의 모든 조합에서는 결과가 바뀌지 않는다. 그래서 켜 둔 채로 두어도 다른 사고를 통과시키지 않는다. `keep-local` 을 최초 도입 절차로 쓰지 않는다(D-11).
+- `--init-new` : 생애 첫 배포에서 새 DB 로 시작할 때 쓴다. 정확히 (로컬 DB 없음, 로컬 메타 없음, 원격 조회 성공·빈 목록) 일 때만 `fresh/new_db` 로 진행하고, 없으면 같은 조합을 `unknown/no_replica_no_local` 로 거부한다. Litestream 은 복제본 경로·prefix 오타와 "복제본 없음"을 같은 빈 목록(rc 0, `[]`)으로 돌려주므로(#3 실측) 빈 목록만으로 새 DB 를 시작하면 오타 난 경로에 새 DB 를 복제해 기존 복제본을 버리게 된다. 첫 복제 뒤에는 원격이 비지 않으므로 켜 둔 채로 두어도 다른 조합의 결과는 바뀌지 않는다(D-13, D-11 과 같은 꼴).
 - **원격 TXID 조회**는 `litestream ltx -config <설정> -level all -json <db 경로>` 로 설정 파일의 복제본을 모든 레벨에 걸쳐 보고, 항목들의 `max_txid`(16자리 16진수) 최대값을 쓴다. 기본(`-level` 생략)은 L0 만 나열해 L0 가 사라진 복제본을 빈 목록으로 오판한다(0.5.17 `ltx -h` 와 실측). 구현은 `boot/litestream.py` 의 `remote_max_txid()`.
-  - rc 0 + `[]` → `RemoteEmpty`. 0.5.17 은 복제본 경로가 없을 때와 비어 있을 때 모두 이 출력이라 둘을 구분할 수 없다(경로 오타도 빈 목록이다). 그래서 로컬 DB 가 있는데 빈 목록이면 `remote_empty` 로 거부한다.
+  - rc 0 + `[]` → `RemoteEmpty`. 0.5.17 은 복제본 경로가 없을 때와 비어 있을 때 모두 이 출력이라 둘을 구분할 수 없다(경로 오타도 빈 목록이다). 조회 모듈은 사실(빈 목록)만 돌려주고, 이를 어떻게 다룰지는 판정 정책이 정한다: 로컬 DB 가 있으면 `remote_empty`, 없으면 `--init-new` 없이는 `no_replica_no_local` 로 거부한다(D-13).
   - rc ≠ 0(설정에 없는 DB·설정 파일 없음·YAML 오류·접근 불가 모두 rc 1, stderr `Error: ...`), 타임아웃(기본 30초), JSON·스키마 이상, 검증하지 않은 Litestream 버전(`litestream version` 이 `VERIFIED_VERSIONS`, 현재 0.5.17 밖) → `RemoteError`.
-- **로컬 TXID 조회**는 로컬 메타 디렉터리(기본 `<db 디렉터리>/.<db 이름>-litestream/`, 설정의 `meta-path` 로 바뀜)의 `ltx/0/` 에서 파일 이름 `<min>-<max>.ltx`(16자리 소문자 16진수) 중 최대 `max` 를 쓴다. Litestream 0.5.17 이 자기 복제 위치를 정하는 `DB.MaxLTX()` 와 같은 방법이다. L0 보존 정리는 가장 새 L0 파일을 지우지 않으므로 업로드·압축·종료 뒤에도 최신 TXID 가 남는다(소스 `EnforceL0RetentionByTime` 과 실측). 디렉터리가 없거나 읽을 수 없거나 맞는 이름이 없으면 `None`(로컬 메타 없음). `litestream ltx <db 경로>` 는 로컬이 아니라 복제본을 나열하므로 쓰지 않는다. 구현은 `local_max_txid()`.
+- **로컬 TXID 조회**는 로컬 메타 디렉터리(기본 `<db 디렉터리>/.<db 이름>-litestream/`, 설정의 `meta-path` 로 바뀜)의 `ltx/0/` 에서 고른 최신 LTX 파일 하나의 max TXID 를 쓴다. 구현은 `local_max_txid()`.
+  - 후보: 파일 이름 `<min>-<max>.ltx`(16자리 소문자 16진수) 중 `max` 가 가장 큰 것. Litestream 0.5.17 이 자기 복제 위치를 정하는 `DB.MaxLTX()` 와 같은 선택이다. L0 보존 정리는 가장 새 L0 파일을 지우지 않으므로 업로드·압축·종료 뒤에도 남는다(소스 `EnforceL0RetentionByTime` 과 실측).
+  - 검증: 그 후보 하나가 정규 파일(심볼릭 링크를 따라가지 않는다)이고 읽을 수 있으며, 이름이 1 ≤ min ≤ max 이고, LTX 헤더(superfly/ltx v0.5.2: 매직 `LTX1`, flags 는 `NoChecksum` 비트만, page size 512–65536 의 2의 거듭제곱, `[16:24]`·`[24:32]` 의 min/max)가 이름과 일치해야 한다. 어긋나면 낮은 후보로 내려가지 않고 `None`(로컬 메타 없음 → `unknown`)이다. 낮은 후보를 쓰면 실제보다 오래된 위치를 믿게 된다.
+  - 제한: 체크섬·페이지 전체 검증은 하지 않는다. Litestream 의 `DB.Pos()` 는 같은 파일을 `Decoder.Verify()` 로 끝까지 검증하므로, 헤더는 멀쩡하고 본문만 깨진 파일은 우리가 TXID 로 받아들이지만 Litestream 은 오류를 낸다. v0.1 범위 밖이다.
+  - `litestream ltx <db 경로>` 는 로컬이 아니라 복제본을 나열하므로 쓰지 않는다.
 - **복원 호출**은 `litestream restore -config <설정> -json -integrity-check quick -o <새 경로> <db 경로>` 다. 출력 경로는 아직 없어야 하고(`-force` 를 쓰지 않는다) `-if-db-not-exists` 는 쓰지 않는다. rc 0, `-json` 요약의 `txid`, 출력 파일이 비어 있지 않음을 모두 확인해야 성공이다. 기본 타임아웃 600초. 파일 교체·격리는 호출자(#4)가 한다. 구현은 `restore()`.
-- 판정에 쓰는 정보와 비교 규칙은 `boot/decide.py` 의 순수 함수 `decide()` 하나에 모은다. 입력은 (로컬 존재 여부, 로컬 메타 TXID|None, 원격 조회 결과, `on_unknown`, `adopt_existing`)이고, 원격 조회 결과는 실패(`RemoteError`)·빈 목록(`RemoteEmpty`)·최대 TXID(`RemoteTxid`) 세 타입으로 구분한다. 원격 결과는 정확한 타입으로 한 번 검증해 내부 태그로 정규화하고, TXID 는 내장 `int` 만 받는다(서브클래스는 비교를 바꿔 판정을 우회할 수 있다). 출력은 (상태, 조치, 사유 코드, 사람용 사유 한 줄)이다. 표 기반 단위 테스트(`tests/test_boot_decide.py`)로 모든 조합을 고정한다.
+- 판정에 쓰는 정보와 비교 규칙은 `boot/decide.py` 의 순수 함수 `decide()` 하나에 모은다. 입력은 (로컬 존재 여부, 로컬 메타 TXID|None, 원격 조회 결과, `on_unknown`, `adopt_existing`, `init_new`)이고, 원격 조회 결과는 실패(`RemoteError`)·빈 목록(`RemoteEmpty`)·최대 TXID(`RemoteTxid`) 세 타입으로 구분한다. 원격 결과는 정확한 타입으로 한 번 검증해 내부 태그로 정규화하고, TXID 는 내장 `int` 만 받는다(서브클래스는 비교를 바꿔 판정을 우회할 수 있다). 출력은 (상태, 조치, 사유 코드, 사람용 사유 한 줄)이다. 표 기반 단위 테스트(`tests/test_boot_decide.py`)로 모든 조합을 고정한다.
 
 상태 규칙 (위에서부터 처음 맞는 줄. `*` 는 무관):
 
@@ -88,7 +94,8 @@ python -m django_sqlite_ops.boot \
 |---|---|---|---|---|
 | 없음 | 값 있음 | * | `unknown` | `stale_meta` — DB 는 없는데 메타만 남음 |
 | * | * | 실패 | `unknown` | `remote_error` — DB 가 없어도 복제본 유무를 모르므로 새 DB 로 시작하면 원격을 덮을 수 있다 |
-| 없음 | 없음 | 빈 목록 | `fresh` | `new_db` |
+| 없음 | 없음 | 빈 목록, `init_new` | `fresh` | `new_db` — 생애 첫 배포(D-13) |
+| 없음 | 없음 | 빈 목록 | `unknown` | `no_replica_no_local` — 복제본 경로 오타와 구분되지 않는다(D-13) |
 | 없음 | 없음 | n | `fresh` | `restore_from_remote` |
 | 있음 | 없음 | 빈 목록, `adopt_existing` | `adopt` | `adopt_existing` — 기존 DB 최초 도입(D-11) |
 | 있음 | 없음 | 성공 | `unknown` | `no_local_meta` |
@@ -100,7 +107,7 @@ python -m django_sqlite_ops.boot \
 
 | 상태 | `refuse`(기본) | `restore` | `keep-local` |
 |---|---|---|---|
-| `fresh`, 빈 목록 | `PROCEED` | `PROCEED` | `PROCEED` |
+| `fresh`, 빈 목록(`init_new`) | `PROCEED` | `PROCEED` | `PROCEED` |
 | `fresh`, n | `RESTORE` | `RESTORE` | `RESTORE` |
 | `match` | `PROCEED` | `PROCEED` | `PROCEED` |
 | `adopt` | `PROCEED` | `PROCEED` | `PROCEED` |
@@ -109,7 +116,7 @@ python -m django_sqlite_ops.boot \
 | `unknown`, 원격 실패 | `REFUSE` | `REFUSE` | `REFUSE`(D-12) |
 
 - `QUARANTINE_AND_RESTORE` 는 로컬(DB·메타)을 `<db>.stale-<ts>/` 로 옮긴 뒤 복원한다. `stale_meta` 도 남은 메타를 옮겨야 하므로 같은 조치다. `KEEP_LOCAL` 은 진행하되 `unknown_at_boot` 를 남긴다(§7). `REFUSE` 는 exit 2 다.
-- 안전 불변식(테스트로 고정): 로컬 DB 가 있으면 `RESTORE` 는 나오지 않는다(덮어쓰기는 반드시 격리를 거친다). 원격 조회 실패면 `REFUSE` 만 나온다(D-12). `refuse` 면 `unknown` 은 모두 `REFUSE` 다. `adopt_existing` 이 켜져 있어도 원격에 복제본이 있거나, 원격 조회 실패거나, 로컬 메타가 있으면 `adopt` 는 나오지 않으며, 위 한 행 밖에서는 결과가 꺼졌을 때와 같다(D-11).
+- 안전 불변식(테스트로 고정): 로컬 DB 가 있으면 `RESTORE` 는 나오지 않는다(덮어쓰기는 반드시 격리를 거친다). 원격 조회 실패면 `REFUSE` 만 나온다(D-12). `refuse` 면 `unknown` 은 모두 `REFUSE` 다. `adopt_existing` 이 켜져 있어도 원격에 복제본이 있거나, 원격 조회 실패거나, 로컬 메타가 있으면 `adopt` 는 나오지 않으며, 위 한 행 밖에서는 결과가 꺼졌을 때와 같다(D-11). 로컬 DB 가 없을 때 `PROCEED` 는 `init_new` 가 켜져 있고 원격이 빈 목록일 때만 나오며, `init_new` 는 그 한 행 밖에서 결과를 바꾸지 않는다(D-13).
 
 ### 4-4. 스파이크 guard.py 와의 차이 (고친 결함)
 `docs/reference/guard_spike.py` 는 랩에서 D4(옛 볼륨 재부팅)를 막는 데 성공했다. 그러나 그대로 옮기면 안 된다. 교차 리뷰에서 지적됐고, 코드로 직접 확인한 결함이다.

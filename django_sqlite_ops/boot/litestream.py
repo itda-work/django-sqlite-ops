@@ -6,6 +6,10 @@
 ``RemoteTxid`` 중 하나를, 로컬 조회는 ``int | None`` 을, restore 는 ``RestoreResult`` 를
 돌려준다. 판정은 ``decide()`` 가 한다.
 
+빈 목록(rc 0, ``[]``)은 그대로 ``RemoteEmpty`` 다. 0.5.17 은 복제본 경로·prefix 오타와
+"복제본 없음"을 같은 출력으로 돌려주므로 이 모듈은 둘을 구분하지 못한다. 그 빈 목록을 새 DB 의
+근거로 쓸지는 판정 정책이 정한다(``decide()`` 의 ``init_new``, D-13).
+
 출력 형식·동작은 Litestream 0.5.17 에서 실측했다(``tests/fixtures/litestream-0.5.17/``).
 검증하지 않은 버전이면 원격 조회와 restore 를 하지 않고 실패로 돌려준다.
 """
@@ -14,6 +18,7 @@ import json
 import os
 import re
 import signal
+import stat
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
@@ -55,6 +60,14 @@ _MAX_REASON = 300
 # ltx.FormatFilename / TXID.String(): 16자리 소문자 16진수 (superfly/ltx v0.5.2).
 _TXID_RE = re.compile(r"[0-9a-f]{16}")
 _LTX_NAME_RE = re.compile(r"^([0-9a-f]{16})-([0-9a-f]{16})\.ltx$")
+
+# LTX 헤더(superfly/ltx v0.5.2 ltx.go — Magic:20, HeaderSize:28, HeaderFlagNoChecksum:175,
+# Header.MarshalBinary:283, IsValidPageSize:399, MaxPageSize:396). 모두 big-endian.
+#   [0:4] "LTX1"  [4:8] flags  [8:12] page size  [16:24] min TXID  [24:32] max TXID
+_LTX_MAGIC = b"LTX1"
+_LTX_HEADER_SIZE = 100
+_LTX_FLAG_MASK = 1 << 1  # HeaderFlagNoChecksum 만 정의돼 있다
+_LTX_PAGE_SIZES = frozenset(1 << n for n in range(9, 17))  # 512 … 65536
 # Litestream(slog) 로그 줄. `restore -integrity-check` 는 이 줄을 JSON 앞 stdout 에 쓴다(실측).
 _LOG_LINE_RE = re.compile(r"^time=\S+ level=[A-Z]+ ")
 _VERSION_RE = re.compile(r"^v?(\d+\.\d+\.\d+)$")
@@ -112,6 +125,9 @@ def _run(argv: list[str], timeout: float) -> _Run | str:
         )
     except OSError as exc:
         return _one_line(f"cannot run {argv[0]}: {exc}")
+    except ValueError as exc:
+        # 경로에 NUL 등 OS 에 넘길 수 없는 값이 있다. 인자를 그대로 쓰지 않는다(제어 문자).
+        return _one_line(f"invalid litestream argument: {exc}")
     try:
         out, err = proc.communicate(timeout=timeout)
     except subprocess.TimeoutExpired:
@@ -255,29 +271,76 @@ def default_meta_path(db_path: str | os.PathLike[str]) -> Path:
     return db.parent / f".{db.name}-litestream"
 
 
+def _read_ltx_range(path: Path) -> tuple[int, int] | None:
+    """LTX 파일 헤더의 (min TXID, max TXID). 정규 파일·헤더 형식이 아니면 ``None``.
+
+    심볼릭 링크는 따라가지 않는다. Litestream 은 메타에 링크를 만들지 않으므로 링크가 있다는 것
+    자체가 예상 밖 상태다. FIFO·장치 파일에서 멈추지 않도록 열기 전후로 정규 파일인지 본다.
+    """
+    try:
+        if not stat.S_ISREG(os.lstat(path).st_mode):
+            return None
+        flags = os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+        fd = os.open(path, flags)
+        try:
+            if not stat.S_ISREG(os.fstat(fd).st_mode):
+                return None
+            header = b""
+            while len(header) < _LTX_HEADER_SIZE:
+                chunk = os.read(fd, _LTX_HEADER_SIZE - len(header))
+                if not chunk:
+                    break
+                header += chunk
+        finally:
+            os.close(fd)
+    except (OSError, ValueError):
+        return None
+    if len(header) < _LTX_HEADER_SIZE or header[:4] != _LTX_MAGIC:
+        return None
+    if int.from_bytes(header[4:8], "big") & ~_LTX_FLAG_MASK:
+        return None
+    if int.from_bytes(header[8:12], "big") not in _LTX_PAGE_SIZES:
+        return None
+    return int.from_bytes(header[16:24], "big"), int.from_bytes(header[24:32], "big")
+
+
 def local_max_txid(
     db_path: str | os.PathLike[str], *, meta_path: str | os.PathLike[str] | None = None
 ) -> int | None:
-    """로컬 메타의 L0 디렉터리에서 최대 TXID 를 읽는다. 읽을 수 없으면 ``None``.
+    """로컬 메타의 L0 에서 최신 LTX 파일의 max TXID 를 읽는다. 믿을 수 없으면 ``None``.
 
-    Litestream 0.5.17 의 ``DB.MaxLTX()`` 와 같은 방법이다: ``<meta>/ltx/0/`` 의 파일 이름
-    ``<min>-<max>.ltx`` 중 최대 ``max``. L0 보존 정리는 가장 새 L0 파일을 지우지 않으므로
-    업로드·압축·종료 뒤에도 최신 TXID 가 남는다(소스 db.go ``EnforceL0RetentionByTime`` 과 실측).
-    파일 내용은 검증하지 않는다.
+    후보 고르기는 Litestream 0.5.17 ``DB.MaxLTX()`` 와 같다: ``<meta>/ltx/0/`` 의 파일 이름
+    ``<min>-<max>.ltx`` 중 ``max`` 가 가장 큰 것(같으면 이름순 첫 번째). L0 보존 정리는 가장 새
+    L0 파일을 지우지 않으므로 업로드·압축·종료 뒤에도 남는다(db.go ``EnforceL0RetentionByTime``,
+    실측).
+
+    고른 후보 **하나**를 검증한다. 정규 파일(링크 아님), 읽기 가능, 1 ≤ min ≤ max, LTX 헤더의
+    매직·flags·page size 가 유효하고 헤더의 min/max 가 이름과 같아야 한다. 하나라도 어긋나면
+    낮은 후보로 내려가지 않고 ``None`` 이다. 체크섬·페이지 전체 검증(Litestream ``DB.Pos()`` 의
+    ``Decoder.Verify()``)은 하지 않는다.
     """
     try:
         meta = Path(meta_path) if meta_path is not None else default_meta_path(db_path)
-        names = os.listdir(meta / "ltx" / "0")
+        l0 = meta / "ltx" / "0"
+        names = os.listdir(l0)
     except (OSError, ValueError):
         return None
-    best: int | None = None
-    for name in names:
+    best: tuple[int, int, str] | None = None
+    for name in sorted(names):
         m = _LTX_NAME_RE.match(name)
         if m is None:
             continue
-        hi = int(m.group(2), 16)
-        best = hi if best is None else max(best, hi)
-    return best
+        lo, hi = int(m.group(1), 16), int(m.group(2), 16)
+        if best is None or hi > best[1]:
+            best = (lo, hi, name)
+    if best is None:
+        return None
+    lo, hi, name = best
+    if not 1 <= lo <= hi:
+        return None
+    if _read_ltx_range(l0 / name) != (lo, hi):
+        return None
+    return hi
 
 
 # --- restore --------------------------------------------------------------------------

@@ -56,6 +56,8 @@ class ReasonCode(StrEnum):
     NO_LOCAL_META = "no_local_meta"
     REMOTE_EMPTY = "remote_empty"
     REMOTE_AHEAD = "remote_ahead"
+    # 로컬 DB·메타 없음 + 원격 빈 목록, init_new 없음(D-13). 복제본 경로 오타와 구분되지 않는다.
+    NO_REPLICA_NO_LOCAL = "no_replica_no_local"
 
 
 class OnUnknown(StrEnum):
@@ -192,10 +194,16 @@ class _Inputs:
     remote: _Remote
     policy: OnUnknown
     adopt_existing: bool
+    init_new: bool
 
 
 def _normalize(
-    local_exists: Any, local_txid: Any, remote: Any, on_unknown: Any, adopt_existing: Any
+    local_exists: Any,
+    local_txid: Any,
+    remote: Any,
+    on_unknown: Any,
+    adopt_existing: Any,
+    init_new: Any,
 ) -> _Inputs:
     """공개 입력을 검증하는 유일한 지점. 정확한 타입이 아니면 dunder 를 부르기 전에 거부한다."""
     return _Inputs(
@@ -204,6 +212,7 @@ def _normalize(
         remote=_normalize_remote(remote),
         policy=_check_policy(on_unknown),
         adopt_existing=_check_bool("adopt_existing", adopt_existing),
+        init_new=_check_bool("init_new", init_new),
     )
 
 
@@ -226,7 +235,15 @@ def _classify(inp: _Inputs) -> tuple[State, ReasonCode, str]:
         )
     if not local_exists:
         if remote.kind is _Kind.EMPTY:
-            return State.FRESH, ReasonCode.NEW_DB, "no local db and remote empty; start new db"
+            # D-13: 빈 목록은 '복제본 없음'과 경로·prefix 오타를 구분하지 못한다(#3 실측).
+            if inp.init_new:
+                return State.FRESH, ReasonCode.NEW_DB, "no local db and remote empty; start new db"
+            return (
+                State.UNKNOWN,
+                ReasonCode.NO_REPLICA_NO_LOCAL,
+                "no local db and remote empty (replica path may be wrong); "
+                "use --init-new for the first deploy",
+            )
         return (
             State.FRESH,
             ReasonCode.RESTORE_FROM_REMOTE,
@@ -272,9 +289,10 @@ def decide(
     remote: Remote,
     on_unknown: OnUnknown | str = OnUnknown.REFUSE,
     adopt_existing: bool = False,
+    init_new: bool = False,
 ) -> Decision:
     """부팅 상태(fresh/match/adopt/unknown)와 조치를 정한다. 규칙표는 DESIGN §4-3."""
-    inp = _normalize(local_exists, local_txid, remote, on_unknown, adopt_existing)
+    inp = _normalize(local_exists, local_txid, remote, on_unknown, adopt_existing, init_new)
     state, code, reason = _classify(inp)
 
     if state is State.FRESH:

@@ -33,7 +33,8 @@ tests/fixtures/litestream-0.5.17/make_fixtures.sh .work/issue-3/lab/run-fixtures
 | `ltx_all_levels` | replicate 로 쓰기 40회·정리 대기 뒤 `ltx -level all -json` | 0 | L0·L1·L2·L9, 최대 `0x19` |
 | `ltx_all_levels_text` | 같은 복제본, `-json` 없이 | 0 | 사람용 표(파싱하지 않는다. 참고용) |
 | `ltx_l0_default` | 같은 복제본, `-level` 생략 | 0 | L0 만. 정상 정리는 최신 L0 를 남긴다 |
-| `local_meta_after_replicate` | `find .app.db-litestream -type f` (replicate 종료 뒤) | – | `ltx/0/<max>-<max>.ltx` 하나가 남는다 |
+| `local_meta_after_replicate/meta` | `cp -R .app.db-litestream` (replicate 종료 뒤) | – | 실제 메타 사본. `ltx/0/<max>-<max>.ltx` 하나가 남는다 |
+| `ltx_sample` | 복제본 `ltx/1` 의 이름순 첫 파일 복사 | – | 낮은 TXID 의 실제 LTX(로컬 메타 검증 테스트용) |
 | `ltx_no_l0_default` | 복제본 사본에서 `ltx/0` 만 지운 뒤 `ltx -json file://...` | 0 | `[]` — L0 만 보면 빈 복제본으로 오판 |
 | `ltx_no_l0_all_levels` | 같은 사본, `-level all` | 0 | 최대 `0x19` |
 | `restore_ok_json` | `restore -config ls.yml -json -integrity-check quick -o $LAB/restored.db $LAB/app.db` | 0 | stdout 에 **로그 한 줄 + JSON** 이 섞인다 |

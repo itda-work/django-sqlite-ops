@@ -40,12 +40,13 @@ C = ReasonCode
 
 # 손으로 쓴 기대값 표.
 # (로컬 DB, 로컬 TXID, 원격) → (state, reason_code, refuse·restore·keep-local 각각의 action)
-# adopt_existing=False 일 때의 표다. 판정 로직을 다시 계산하지 않는다.
+# adopt_existing=False, init_new=False 일 때의 표다. 판정 로직을 다시 계산하지 않는다.
 # 표를 바꿀 때는 DESIGN §4-3 의 규칙표와 함께 바꾼다.
 TABLE = {
     # 로컬 DB 없음, 메타 없음
     (False, None, "err"): (U, C.REMOTE_ERROR, NO, NO, NO),
-    (False, None, "empty"): (F, C.NEW_DB, GO, GO, GO),
+    # 빈 목록은 경로 오타와 구분되지 않는다. 새 DB 는 init_new 일 때만(D-13).
+    (False, None, "empty"): (U, C.NO_REPLICA_NO_LOCAL, NO, NO, NO),
     (False, None, "3"): (F, C.RESTORE_FROM_REMOTE, RST, RST, RST),
     (False, None, "5"): (F, C.RESTORE_FROM_REMOTE, RST, RST, RST),
     (False, None, "7"): (F, C.RESTORE_FROM_REMOTE, RST, RST, RST),
@@ -81,6 +82,11 @@ ALL_INPUTS = list(itertools.product((False, True), (None, 5), REMOTES, POLICIES)
 ADOPT_ROW = (True, None, "empty")
 ADOPT_EXPECTED = ("adopt", "adopt_existing", GO, GO, GO)
 
+# init_new=True 가 효과를 내는 유일한 행(D-13). 나머지는 위 표와 같다.
+INIT_NEW_ROW = (False, None, "empty")
+INIT_NEW_EXPECTED = (F, C.NEW_DB, GO, GO, GO)
+FLAGS = list(itertools.product((False, True), (False, True)))  # (adopt_existing, init_new)
+
 
 def _decide(local, txid, remote, policy, **kw):
     return decide(
@@ -112,12 +118,24 @@ def test_invariant_existing_local_is_never_overwritten_without_quarantine(
         assert _decide(local, txid, remote, policy).action is not Action.RESTORE
 
 
-@pytest.mark.parametrize("adopt", [False, True])
+@pytest.mark.parametrize(("adopt", "init_new"), FLAGS)
 @pytest.mark.parametrize(("local", "txid", "remote", "policy"), ALL_INPUTS)
-def test_invariant_remote_error_always_refuses(local, txid, remote, policy, adopt):
+def test_invariant_remote_error_always_refuses(local, txid, remote, policy, adopt, init_new):
     # D-12: 원격 실패면 정책(keep-local 포함)과 무관하게 거부한다.
     if remote == "err":
-        assert _decide(local, txid, remote, policy, adopt_existing=adopt).action is Action.REFUSE
+        got = _decide(local, txid, remote, policy, adopt_existing=adopt, init_new=init_new)
+        assert got.action is Action.REFUSE
+
+
+@pytest.mark.parametrize(("adopt", "init_new"), FLAGS)
+@pytest.mark.parametrize(("local", "txid", "remote", "policy"), ALL_INPUTS)
+def test_invariant_no_local_db_proceeds_only_with_init_new_and_empty_remote(
+    local, txid, remote, policy, adopt, init_new
+):
+    # D-13: 로컬 DB 없이 진행(새 DB)하는 것은 init_new 이고 원격이 빈 목록일 때뿐이다.
+    got = _decide(local, txid, remote, policy, adopt_existing=adopt, init_new=init_new)
+    if not local and got.action is Action.PROCEED:
+        assert init_new and remote == "empty" and txid is None
 
 
 @pytest.mark.parametrize(("local", "txid", "remote", "policy"), ALL_INPUTS)
@@ -141,12 +159,13 @@ def test_adopt_existing_row(policy):
     )
 
 
+@pytest.mark.parametrize("init_new", [False, True])
 @pytest.mark.parametrize(("local", "txid", "remote", "policy"), ALL_INPUTS)
-def test_adopt_existing_has_no_effect_elsewhere(local, txid, remote, policy):
+def test_adopt_existing_has_no_effect_elsewhere(local, txid, remote, policy, init_new):
     if (local, txid, remote) == ADOPT_ROW:
         return
-    on = _decide(local, txid, remote, policy, adopt_existing=True)
-    off = _decide(local, txid, remote, policy, adopt_existing=False)
+    on = _decide(local, txid, remote, policy, adopt_existing=True, init_new=init_new)
+    off = _decide(local, txid, remote, policy, adopt_existing=False, init_new=init_new)
     assert on == off
 
 
@@ -168,6 +187,45 @@ def test_invariant_adopt_only_without_replica_meta_or_error(local, txid, remote,
 def test_invalid_adopt_existing(adopt):
     with pytest.raises(ValueError, match="adopt_existing"):
         _decide(*ADOPT_ROW, "refuse", adopt_existing=adopt)
+
+
+# --- init_new (D-13) ---
+
+
+@pytest.mark.parametrize("adopt", [False, True])
+@pytest.mark.parametrize("policy", POLICIES)
+def test_init_new_row(policy, adopt):
+    state, code, *actions = INIT_NEW_EXPECTED
+    got = _decide(*INIT_NEW_ROW, policy, adopt_existing=adopt, init_new=True)
+    assert (got.state, got.reason_code, got.action) == (
+        state,
+        code,
+        actions[POLICIES.index(policy)],
+    )
+
+
+@pytest.mark.parametrize("adopt", [False, True])
+@pytest.mark.parametrize(("local", "txid", "remote", "policy"), ALL_INPUTS)
+def test_init_new_has_no_effect_elsewhere(local, txid, remote, policy, adopt):
+    if (local, txid, remote) == INIT_NEW_ROW:
+        return
+    on = _decide(local, txid, remote, policy, adopt_existing=adopt, init_new=True)
+    off = _decide(local, txid, remote, policy, adopt_existing=adopt, init_new=False)
+    assert on == off
+
+
+@pytest.mark.parametrize("policy", POLICIES)
+def test_init_new_default_is_off(policy):
+    # 복제본 경로 오타와 '복제본 없음'은 같은 빈 목록이다(#3 실측). 기본은 거부한다.
+    got = _decide(*INIT_NEW_ROW, policy)
+    assert (got.state, got.reason_code, got.action) == (U, C.NO_REPLICA_NO_LOCAL, NO)
+    assert "--init-new" in got.reason
+
+
+@pytest.mark.parametrize("init_new", [None, 0, 1, "yes"])
+def test_invalid_init_new(init_new):
+    with pytest.raises(ValueError, match="init_new"):
+        _decide(*INIT_NEW_ROW, "refuse", init_new=init_new)
 
 
 # --- §4-4 스파이크 결함 회귀 ---
@@ -374,6 +432,7 @@ _DISGUISES = {
     "remote.message": {"subclass": lambda: _subclass(str, "a\nb"), "spoof": lambda: _spoof(str)},
     "on_unknown": {"subclass": lambda: _subclass(str, "refuse"), "spoof": lambda: _spoof(str)},
     "adopt_existing": {"subclass": lambda: _subclass(int, 1), "spoof": lambda: _spoof(bool)},
+    "init_new": {"subclass": lambda: _subclass(int, 1), "spoof": lambda: _spoof(bool)},
     "RemoteTxid(txid)": {"subclass": lambda: _subclass(int, 7), "spoof": lambda: _spoof(int)},
     "RemoteError(message)": {"subclass": lambda: _subclass(str, "x"), "spoof": lambda: _spoof(str)},
 }
@@ -392,6 +451,7 @@ def _call_with(field, value):
         "remote": RemoteTxid(7),
         "on_unknown": "refuse",
         "adopt_existing": False,
+        "init_new": False,
     }
     if field == "remote.txid":
         object.__setattr__(kw["remote"], "txid", value)
@@ -455,6 +515,7 @@ def test_decision_is_immutable():
 def test_reason_codes_are_stable_strings():
     assert {c.value for c in ReasonCode} == {
         "new_db",
+        "no_replica_no_local",
         "restore_from_remote",
         "local_current",
         "adopt_existing",

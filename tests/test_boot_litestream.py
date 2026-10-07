@@ -157,47 +157,85 @@ def test_fixture_version():
 
 # --- 로컬 메타 --------------------------------------------------------------------------
 
+# 실제 LTX 파일(make_fixtures.sh 가 복사한다). 최신 L0 는 0x19, 표본은 복제본 L1 의 첫 파일.
+META_FIXTURE = FIXTURES / "local_meta_after_replicate" / "meta"
+(LATEST_LTX,) = (META_FIXTURE / "ltx" / "0").iterdir()
+(SAMPLE_LTX,) = (FIXTURES / "ltx_sample").iterdir()
+SAMPLE_TXID = int(SAMPLE_LTX.name[17:33], 16)
+
+
+def l0_dir(root: Path) -> Path:
+    l0 = root / ".app.db-litestream" / "ltx" / "0"
+    l0.mkdir(parents=True, exist_ok=True)
+    return l0
+
+
+def ltx_name(min_txid: int, max_txid: int) -> str:
+    return f"{min_txid:016x}-{max_txid:016x}.ltx"
+
+
+def patched(src: Path, **fields: int) -> bytes:
+    """실제 LTX 헤더의 필드를 바꾼 바이트(superfly/ltx v0.5.2 ltx.go Header.MarshalBinary)."""
+    data = bytearray(src.read_bytes())
+    offsets = {"flags": (4, 4), "page_size": (8, 4), "min_txid": (16, 8), "max_txid": (24, 8)}
+    for key, value in fields.items():
+        off, size = offsets[key]
+        data[off : off + size] = value.to_bytes(size, "big")
+    return bytes(data)
+
 
 def test_fixture_local_meta_after_replicate(tmp_path):
     """업로드·L0 정리·종료 뒤에도 메타에 최신 L0 파일이 남는다(실측). 원격 최대와 같다."""
-    db = tmp_path / "app.db"
-    for rel in (FIXTURES / "local_meta_after_replicate" / "files").read_text().split():
-        p = tmp_path / rel
-        p.parent.mkdir(parents=True, exist_ok=True)
-        p.touch()
+    shutil.copytree(META_FIXTURE, tmp_path / ".app.db-litestream")
     remote = ls.parse_ltx_json(fixture("ltx_all_levels")[0])
-    assert ls.local_max_txid(db) == remote.txid == 0x19
+    assert ls.local_max_txid(tmp_path / "app.db") == remote.txid == 0x19
 
 
-def test_local_meta_takes_max_and_ignores_other_names(tmp_path):
-    l0 = tmp_path / ".app.db-litestream" / "ltx" / "0"
-    l0.mkdir(parents=True)
+def test_fixture_ltx_files_are_real():
+    assert LATEST_LTX.name == ltx_name(0x19, 0x19)
+    assert LATEST_LTX.read_bytes()[:4] == b"LTX1"
+    assert SAMPLE_LTX.read_bytes()[:4] == b"LTX1"
+    assert SAMPLE_TXID < 0x19
+
+
+def test_local_meta_ignores_other_names_and_levels(tmp_path):
+    l0 = l0_dir(tmp_path)
+    shutil.copy(LATEST_LTX, l0 / LATEST_LTX.name)
     for name in (
-        "0000000000000001-0000000000000003.ltx",
-        "0000000000000004-000000000000000a.ltx",
         "0000000000000001-00000000000000ff.ltx.tmp",
         "0000000000000001-00000000000000FF.ltx",
         "garbage",
     ):
-        (l0 / name).touch()
+        (l0 / name).write_bytes(b"x")
     # 다른 레벨은 보지 않는다(Litestream DB.MaxLTX 와 같다).
     l1 = l0.parent / "1"
     l1.mkdir()
-    (l1 / "0000000000000001-0000000000000fff.ltx").touch()
-    assert ls.local_max_txid(tmp_path / "app.db") == 0xA
+    (l1 / ltx_name(1, 0xFFF)).write_bytes(b"x")
+    assert ls.local_max_txid(tmp_path / "app.db") == 0x19
 
 
 def test_local_meta_missing_or_empty_is_none(tmp_path):
     db = tmp_path / "app.db"
     assert ls.local_max_txid(db) is None
-    (tmp_path / ".app.db-litestream" / "ltx" / "0").mkdir(parents=True)
+    l0_dir(tmp_path)
     assert ls.local_max_txid(db) is None
 
 
-def test_local_meta_unreadable_is_none(tmp_path):
-    l0 = tmp_path / ".app.db-litestream" / "ltx" / "0"
+def test_local_meta_custom_path(tmp_path):
+    l0 = tmp_path / "meta" / "ltx" / "0"
     l0.mkdir(parents=True)
-    (l0 / "0000000000000001-0000000000000001.ltx").touch()
+    shutil.copy(LATEST_LTX, l0 / LATEST_LTX.name)
+    assert ls.local_max_txid(tmp_path / "app.db", meta_path=tmp_path / "meta") == 0x19
+    assert ls.local_max_txid(tmp_path / "app.db") is None
+
+
+def test_local_meta_bad_path_is_none():
+    assert ls.local_max_txid("bad\0path") is None
+
+
+def test_local_meta_unreadable_dir_is_none(tmp_path):
+    l0 = l0_dir(tmp_path)
+    shutil.copy(LATEST_LTX, l0 / LATEST_LTX.name)
     l0.chmod(0)
     try:
         if os.access(l0, os.R_OK):
@@ -207,19 +245,141 @@ def test_local_meta_unreadable_is_none(tmp_path):
         l0.chmod(0o755)
 
 
-def test_local_meta_custom_path(tmp_path):
-    l0 = tmp_path / "meta" / "ltx" / "0"
-    l0.mkdir(parents=True)
-    (l0 / "0000000000000001-0000000000000007.ltx").touch()
-    assert ls.local_max_txid(tmp_path / "app.db", meta_path=tmp_path / "meta") == 7
+# 최신 후보(이름의 max 가 가장 큰 것)가 쓸 수 없으면, 정상인 낮은 후보가 있어도 None 이다.
+# 낮은 후보로 내려가면 실제보다 오래된 위치를 '로컬 TXID' 로 믿게 된다(리뷰 1 지적 2).
+
+
+def with_valid_lower(tmp_path: Path) -> Path:
+    l0 = l0_dir(tmp_path)
+    shutil.copy(SAMPLE_LTX, l0 / SAMPLE_LTX.name)
+    assert ls.local_max_txid(tmp_path / "app.db") == SAMPLE_TXID
+    return l0
+
+
+def test_local_meta_directory_candidate_is_none(tmp_path):
+    l0 = with_valid_lower(tmp_path)
+    (l0 / ltx_name(1, 0xFF)).mkdir()
     assert ls.local_max_txid(tmp_path / "app.db") is None
 
 
-def test_local_meta_bad_path_is_none():
-    assert ls.local_max_txid("bad\0path") is None
+def test_local_meta_empty_file_candidate_is_none(tmp_path):
+    l0 = with_valid_lower(tmp_path)
+    (l0 / ltx_name(0x19, 0x19)).touch()
+    assert ls.local_max_txid(tmp_path / "app.db") is None
+
+
+def test_local_meta_short_header_is_none(tmp_path):
+    l0 = with_valid_lower(tmp_path)
+    (l0 / LATEST_LTX.name).write_bytes(LATEST_LTX.read_bytes()[:99])
+    assert ls.local_max_txid(tmp_path / "app.db") is None
+
+
+def test_local_meta_bad_magic_is_none(tmp_path):
+    l0 = with_valid_lower(tmp_path)
+    (l0 / LATEST_LTX.name).write_bytes(b"LTX0" + LATEST_LTX.read_bytes()[4:])
+    assert ls.local_max_txid(tmp_path / "app.db") is None
+
+
+def test_local_meta_broken_latest_with_valid_lower_is_none(tmp_path):
+    l0 = with_valid_lower(tmp_path)
+    (l0 / ltx_name(0x19, 0x19)).write_bytes(b"broken")
+    assert ls.local_max_txid(tmp_path / "app.db") is None
+
+
+@pytest.mark.parametrize(
+    "fields", [{"flags": 1}, {"flags": 4}, {"page_size": 1000}, {"page_size": 0}]
+)
+def test_local_meta_invalid_header_fields_are_none(tmp_path, fields):
+    l0 = with_valid_lower(tmp_path)
+    (l0 / LATEST_LTX.name).write_bytes(patched(LATEST_LTX, **fields))
+    assert ls.local_max_txid(tmp_path / "app.db") is None
+
+
+def test_local_meta_reversed_range_is_none(tmp_path):
+    l0 = with_valid_lower(tmp_path)
+    data = patched(LATEST_LTX, min_txid=0x200, max_txid=0x1FF)
+    (l0 / ltx_name(0x200, 0x1FF)).write_bytes(data)
+    assert ls.local_max_txid(tmp_path / "app.db") is None
+
+
+def test_local_meta_zero_min_txid_is_none(tmp_path):
+    l0 = with_valid_lower(tmp_path)
+    (l0 / ltx_name(0, 0x19)).write_bytes(patched(LATEST_LTX, min_txid=0))
+    assert ls.local_max_txid(tmp_path / "app.db") is None
+
+
+@pytest.mark.parametrize(("min_txid", "max_txid"), [(1, 0xFF), (0x19, 0x1A), (0x18, 0x19)])
+def test_local_meta_header_name_mismatch_is_none(tmp_path, min_txid, max_txid):
+    # 헤더는 0x19-0x19 인데 이름은 다르다.
+    l0 = with_valid_lower(tmp_path)
+    shutil.copy(LATEST_LTX, l0 / ltx_name(min_txid, max_txid))
+    assert ls.local_max_txid(tmp_path / "app.db") is None
+
+
+def test_local_meta_symlink_candidate_is_none(tmp_path):
+    # Litestream 은 메타에 심볼릭 링크를 만들지 않는다. 링크는 따라가지 않는다.
+    l0 = with_valid_lower(tmp_path)
+    target = tmp_path / "elsewhere.ltx"
+    shutil.copy(LATEST_LTX, target)
+    (l0 / LATEST_LTX.name).symlink_to(target)
+    assert ls.local_max_txid(tmp_path / "app.db") is None
+
+
+def test_local_meta_fifo_candidate_is_none_without_blocking(tmp_path):
+    l0 = with_valid_lower(tmp_path)
+    os.mkfifo(l0 / LATEST_LTX.name)
+    result: list[int | None] = []
+    t = threading.Thread(target=lambda: result.append(ls.local_max_txid(tmp_path / "app.db")))
+    t.daemon = True
+    t.start()
+    t.join(timeout=5)
+    assert not t.is_alive(), "local_max_txid blocked on a FIFO"
+    assert result == [None]
+
+
+def test_local_meta_unreadable_file_is_none(tmp_path):
+    l0 = with_valid_lower(tmp_path)
+    latest = l0 / LATEST_LTX.name
+    shutil.copy(LATEST_LTX, latest)
+    latest.chmod(0)
+    try:
+        if os.access(latest, os.R_OK):
+            pytest.skip("running with permissions that ignore mode bits")
+        assert ls.local_max_txid(tmp_path / "app.db") is None
+    finally:
+        latest.chmod(0o644)
 
 
 # --- 가짜 실행 파일: rc·stderr·타임아웃 ----------------------------------------------------
+
+
+@pytest.mark.parametrize("field", ["binary", "config", "db_path"])
+def test_remote_query_bad_path_is_remote_error(tmp_path, field):
+    kw = {"db_path": "app.db", "config": "c.yml", "binary": fake_binary(tmp_path, "echo '[]'")}
+    kw[field] = "bad\0" + kw[field]
+    result = ls.remote_max_txid(**kw)
+    assert type(result) is RemoteError
+    assert "embedded null byte" in result.message
+
+
+def test_check_version_bad_binary_path_is_message():
+    problem = ls.check_version(binary="bad\0binary")
+    assert problem is not None
+    assert "embedded null byte" in problem
+
+
+@pytest.mark.parametrize("field", ["binary", "config", "db_path", "output"])
+def test_restore_bad_path_is_failure(tmp_path, field):
+    kw = {
+        "db_path": "app.db",
+        "output": str(tmp_path / "out.db"),
+        "config": "c.yml",
+        "binary": fake_binary(tmp_path, "exit 0"),
+    }
+    kw[field] = "bad\0" + kw[field]
+    result = ls.restore(**kw)
+    assert result.ok is False
+    assert "embedded null byte" in result.reason
 
 
 def test_missing_binary_is_remote_error(tmp_path):

@@ -78,14 +78,22 @@ wait "$pid" || true
 capture ltx_all_levels "$LS" ltx -config ls.yml -level all -json "$LAB/app.db"
 capture ltx_l0_default "$LS" ltx -config ls.yml -json "$LAB/app.db"
 capture ltx_all_levels_text "$LS" ltx -config ls.yml -level all "$LAB/app.db"
-# 로컬 메타 디렉터리(.app.db-litestream) 의 파일 목록. 업로드·정리·종료 뒤의 상태다.
-(cd "$LAB" && find .app.db-litestream -type f | sort) >"$LAB/.meta"
-mkdir -p "$OUT/local_meta_after_replicate"
-cp "$LAB/.meta" "$OUT/local_meta_after_replicate/files"
+# 로컬 메타 디렉터리(.app.db-litestream) 를 그대로 복사한다. 업로드·정리·종료 뒤의 상태다.
+META_OUT="$OUT/local_meta_after_replicate"
+rm -rf -- "$META_OUT"
+mkdir -p "$META_OUT"
+cp -R "$LAB/.app.db-litestream" "$META_OUT/meta"
+# 낮은 TXID 의 실제 LTX 파일 하나(복제본 L1 의 첫 파일). 로컬 메타 검증 테스트가 쓴다.
+SAMPLE_OUT="$OUT/ltx_sample"
+rm -rf -- "$SAMPLE_OUT"
+mkdir -p "$SAMPLE_OUT"
+first_l1=$(cd "$LAB/replica/ltx/1" && ls | sort | head -n 1)
+cp "$LAB/replica/ltx/1/$first_l1" "$SAMPLE_OUT/$first_l1"
 
 # L0 만 사라진 복제본(외부 lifecycle·부분 복사 흉내). 기본(L0)은 빈 목록, -level all 은 최대값을 본다.
 cp -R replica replica-nol0
-rm -r -- "$LAB/replica-nol0/ltx/0"
+NOL0="$LAB/replica-nol0/ltx/0"
+rm -r -- "$NOL0"
 capture ltx_no_l0_default "$LS" ltx -json "file://$LAB/replica-nol0"
 capture ltx_no_l0_all_levels "$LS" ltx -level all -json "file://$LAB/replica-nol0"
 
