@@ -25,6 +25,11 @@
 - 권장 설정은 `database.py` 의 표 하나가 정본이다. dj-lite 에 의존하지 않는다(D-10). 기본으로 켜는 값은 실측 근거가 있어야 한다.
 - 의존성은 Django 만 필수다. channels-nats(`[nats]`)와 channels-lite(`[channels-lite]`)는 extra 로 둔다.
 
+## CI
+- GitHub Actions(`.github/workflows/ci.yml`)가 정본이다: lint(ruff) + Python 3.13/3.14 × Django 5.2/6.1 매트릭스.
+- 로컬에서는 `scripts/ci-local.sh` 로 같은 워크플로를 act 로 돌린다(`lint`, `test <py> <django>` 로 좁힐 수 있다). 지원 범위를 바꾸면 이 매트릭스와 DESIGN §5 를 함께 고친다.
+- act 는 Linux 컨테이너만 돌린다. macOS·Windows 잡은 로컬에서 재현되지 않는다.
+
 ## 함정 (실측에서 나온 것)
 - Litestream endpoint 에 `http://` 가 빠지면 HTTPS 로 접속해 restore 가 무한 대기한다.
 - `litestream ltx` 는 기본으로 L0 만 나열한다. 최대 TXID 를 볼 때는 `-level all` 을 쓴다.

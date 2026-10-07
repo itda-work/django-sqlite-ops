@@ -9,3 +9,13 @@ Django 에서 SQLite 를 운영 DB 로 안전하게 쓰기 위한 **운영 도�
 - 배포 프로필: `single-server`(InMemory), `single-server-multiproc`(channels-nats 추천, channels_redis 호환)
 
 설계서: [`docs/DESIGN.md`](docs/DESIGN.md) · 결정: [`docs/DECISIONS.md`](docs/DECISIONS.md) · 근거: [`docs/research/`](docs/research/)
+
+## 개발
+
+```bash
+uv venv && uv pip install -e . --group dev
+uv run --no-sync pytest
+
+scripts/ci-local.sh                 # GitHub Actions CI 를 act 로 로컬 실행 (lint + 전체 매트릭스)
+scripts/ci-local.sh test 3.14 6.1   # 매트릭스 한 칸만
+```
