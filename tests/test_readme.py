@@ -9,6 +9,7 @@ from pathlib import Path
 
 import pytest
 
+from django_sqlite_ops.boot import cli
 from django_sqlite_ops.database import recommended, sqlite_database
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -105,3 +106,17 @@ def test_readme_default_table_matches_code():
     assert set(rows) == set(code)
     for name, value in code.items():
         assert rows[name].startswith(f"`{value}`"), (name, rows[name])
+
+
+def test_readme_boot_exit_codes_match_code():
+    section = README.split("#### 종료 코드", 1)[1].split("\n#### ", 1)[0]
+    shown = set(re.findall(r"^\| `(\d+)` \|", section, flags=re.M))
+    codes = {
+        cli.EXIT_REFUSE,
+        cli.EXIT_INTEGRITY,
+        cli.EXIT_RESTORE,
+        cli.EXIT_LOCK,
+        cli.EXIT_USAGE,
+        cli.EXIT_EXEC,
+    }
+    assert shown == {str(c) for c in codes}

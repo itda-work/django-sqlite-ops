@@ -395,6 +395,12 @@ def test_unsupported_version_is_remote_error(tmp_path):
     assert argv_log(tmp_path) == ["version"]
 
 
+def test_version_reads_or_returns_none(tmp_path):
+    assert ls.version(binary=fake_binary(tmp_path, "exit 0")) == "0.5.17"
+    assert ls.version(binary=fake_binary(tmp_path, "exit 0", version="dev")) is None
+    assert ls.version(binary=str(tmp_path / "nope")) is None
+
+
 def test_unparseable_version_is_remote_error(tmp_path):
     binary = fake_binary(tmp_path, "echo '[]'", version="development build")
     result = ls.remote_max_txid("app.db", config="c.yml", binary=binary)

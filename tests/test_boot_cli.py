@@ -797,7 +797,7 @@ def test_boot_main_imports_without_django():
 
 
 def _replicate_until_caught_up(db: Path, config: Path, *, above: int = 0) -> int:
-    """replicate 를 돌려 원격과 로컬 메타의 TXID 가 ``above`` 보다 커진 뒤 같아질 때까지 기다린다."""
+    """replicate 를 돌려 원격·로컬 메타 TXID 가 ``above`` 보다 커지고 같아질 때까지 기다린다."""
     proc = subprocess.Popen(
         [LITESTREAM, "replicate", "-config", str(config)],
         stdout=subprocess.DEVNULL,

@@ -57,13 +57,28 @@ python -m django_sqlite_ops.boot \
     [--on-unknown refuse|restore|keep-local]   # 기본 refuse
     [--adopt-existing]                         # 기존 DB 최초 도입 전용 (D-11)
     [--init-new]                               # 생애 첫 배포 전용: 빈 복제본에서 새 DB (D-13)
+    [--meta-path PATH]                         # 기본 <db 디렉터리>/.<db 이름>-litestream
+    [--litestream BIN] [--ltx-timeout S] [--restore-timeout S]   # 기본 litestream, 30, 600
     -- <다음 명령...>                          # 예: litestream replicate -exec "uvicorn ..."
 ```
-1. **잠금 획득**: `<db>.boot.lock` (OS 파일 잠금). 같은 볼륨에서 두 번 부팅하는 것을 막는다. 다른 머신 사이의 이중 replicate 는 막지 못한다. 이는 문서와 `sqlite_doctor` 경고로 다룬다.
-2. **판정** (§4-3)
-3. **조치**: 판정 결과에 따라 복원하거나, 그대로 두거나, 거부한다.
-4. **무결성 확인**: `PRAGMA quick_check` 결과가 `ok` 가 아니면 exit 3 으로 끝낸다.
-5. **exec**: `--` 뒤의 명령으로 프로세스를 교체한다. `migrate` 는 그 명령 안에서(또는 운영자가 따로) 실행한다.
+구현은 `boot/cli.py`(진입점 `boot/__main__.py`)다. 표준 라이브러리만 쓴다. 단계마다 stderr 에 `[boot] ...` 한 줄을 남긴다(입력, 판정의 state·action·reason_code·reason, 조치, 결과). 거부하면 사유 코드별로 다음에 할 일을 `[boot] hint: ...` 한 줄로 안내한다.
+
+1. **잠금 획득**: `<db>.boot.lock` 에 `flock(LOCK_EX | LOCK_NB)`. 이미 잡혀 있으면 exit 5. 잠금 fd 는 **exec 된 명령에 상속된다**. 그래서 `litestream replicate -exec ...` 와 그 자식이 살아 있는 동안 같은 볼륨에서 두 번째 boot 는 잠금에서 막힌다(exit 5). 거부·실패로 돌아올 때는 잠금을 풀고 끝난다. 다른 머신 사이의 이중 replicate 는 막지 못한다. 이는 문서와 `sqlite_doctor` 경고로 다룬다. `fcntl` 이 없는 플랫폼(Windows)은 판정할 수 없으므로 exit 64 다(§12).
+2. **중단된 격리 재개**: `<db>.stale-<ts>.partial/` 이 남아 있으면 앞선 부팅이 격리 도중 죽은 것이다. 판정 전에 그 격리를 끝낸다(멱등, §4-3 격리). 둘 이상이면 판정할 수 없으므로 exit 2.
+3. **판정 입력 수집**: 로컬 DB 존재(DB 경로가 정규 파일. 디렉터리·심볼릭 링크 등 그 밖의 것이면 exit 2), `local_max_txid()`, `remote_max_txid()`.
+   - **DB 파일 없이 `-wal`/`-shm`/`-journal` 만 남은 경우**는 `decide()` 를 부르지 않고 `unknown/orphan_sidecars` 로 거부한다(exit 2). 남은 WAL 이 어느 DB 의 것인지 알 수 없고, 그 옆에 복원하면 옛 WAL 이 새 DB 에 섞인다. 단 `--on-unknown restore` 이고 원격에 복제본(TXID)이 있으면 이 파일들을 격리 대상에 넣고 복원한다(`quarantine_and_restore`).
+4. **판정** (§4-3): `decide()` 한 번.
+5. **조치**: 판정 결과에 따라 복원하거나, 그대로 두거나, 거부한다(아래 '조치 실행').
+6. **무결성 확인**: DB 파일이 있으면 표준 `sqlite3` 로 읽기 전용 URI(`file:...?mode=ro`)를 열어 `PRAGMA quick_check` 가 `ok` 인지 본다. 아니면(열 수 없음 포함) exit 3. DB 파일이 없으면(새 DB) 건너뛴다. 확인하려고 빈 DB 를 만들지 않는다.
+7. **상태 파일**: `<db>.boot-state.json` 을 원자적으로 쓴다(§7).
+8. **exec**: `os.execvp` 로 `--` 뒤의 명령으로 프로세스를 교체한다. 실행하지 못하면(명령 없음 등) exit 127. `migrate` 는 그 명령 안에서(또는 운영자가 따로) 실행한다.
+
+**조치 실행** (순서가 안전성이다)
+- `PROCEED`: 아무것도 바꾸지 않는다. `fresh/new_db` 여도 DB 파일을 만들지 않는다(앱이 만든다, §4-1). `adopt` 나 `new_db` 로 진행하면 "첫 배포/도입 뒤에는 이 옵션을 끈다(D-11/D-13)" 한 줄을 남긴다.
+- `RESTORE`·`QUARANTINE_AND_RESTORE`: **먼저** DB 와 같은 디렉터리(같은 파일시스템이어야 rename 이 원자적이다)에 매번 새 `<db>.restore-<ts>-<rand>/` 를 만들고 그 안으로 `restore()` 한다. 실패하면 로컬은 **하나도 바꾸지 않고** exit 4 다(L7). 실패한 임시 디렉터리는 조사용으로 남기고, 다음 부팅은 이를 판정에 쓰지 않는다. 복원 디렉터리에 DB 와 `-shm` 말고 다른 파일(`-wal` 등)이 있으면 DB 만 옮기면 내용이 빠지므로 실패로 본다. 복원이 성공했을 때만 격리 대상 중 **있는 것**(DB·사이드카·메타)을 격리한다. `RESTORE` 는 로컬 DB 가 없을 때이므로 보통 옮길 것이 없지만, TXID 를 읽을 수 없는 메타 디렉터리가 남아 있으면 그것을 옮긴다. 그다음 임시 DB 를 `os.rename` 으로 DB 경로에 놓는다(설치). 그 순간 DB 경로나 사이드카 자리에 무엇이 있으면 exit 2. 임시 디렉터리는 비운 뒤 지운다.
+- `KEEP_LOCAL`: 바꾸지 않는다. stderr 에 `WARNING: unknown_at_boot` 한 줄, 상태 파일에 `unknown_at_boot: true`.
+- `REFUSE`: exit 2. 사유와 사유 코드별 안내 한 줄.
+- 격리·설치 도중의 파일 오류는 exit 4 다. 격리가 반쯤이면 `.partial` 이 남고 다음 부팅이 2 단계에서 끝낸다.
 
 ### 4-3. 판정 (상태 4가지)
 | 상태 | 조건 | 기본 동작 |
@@ -73,10 +88,16 @@ python -m django_sqlite_ops.boot \
 | `adopt` | `--adopt-existing` 이 있고, 로컬 DB 있음 + 로컬 메타 없음 + 원격 조회 성공·빈 목록 (D-11) | 그대로 진행(기존 DB 를 처음 Litestream 에 올림) |
 | `unknown` | 그 밖의 모든 경우: 원격 조회 실패·타임아웃·파싱 실패, 로컬 메타 없음, DB 없이 메타만 남음, 로컬 DB 는 있는데 원격이 빈 목록, 로컬 DB 도 원격도 없는데 `--init-new` 없음, 원격이 앞섬 | **기동 거부(exit 2)**. 사유를 한 줄로 출력 |
 
-- `--on-unknown restore` : 로컬을 `<db>.stale-<ts>/` 디렉터리 하나로 **원자적으로** 옮긴 뒤 복원한다. 옮기기는 디렉터리 rename 한 번으로 한다. 파일을 하나씩 옮기면 중간에 죽었을 때 반쯤 옮겨진 상태가 남는다.
+- `--on-unknown restore` : 복원을 임시 디렉터리에 먼저 끝낸 뒤, 로컬을 `<db>.stale-<ts>/` 디렉터리 하나로 옮기고 복원본을 설치한다. 여러 파일을 한 번에 옮기는 원자적 연산은 없으므로 **재개 가능하게** 옮긴다(L6).
+  1. `<db>.stale-<ts>.partial/` 을 만들고, 그 안에 `manifest.json`(옮길 원래 경로와 이름, 순서)을 임시 파일 + rename 으로 쓴다. 디렉터리를 fsync 한다.
+  2. 대상을 순서대로 하나씩 rename 해 넣는다. 순서는 `boot/cli.py` 의 `quarantine_targets()` 한 곳에 있다: DB → `-wal` → `-shm` → `-journal` → 메타 디렉터리. 없는 대상은 건너뛴다.
+  3. fsync(디렉터리) 뒤 `.partial` 을 `<db>.stale-<ts>/` 로 rename 한다. 이 rename 이 격리의 완료 표시다.
+  - 도중에 죽으면 `.partial` 이 남는다. 다음 부팅은 판정 전에 manifest 를 따라 아직 원래 자리에 있는 대상만 마저 옮기고 3 을 한다(멱등). manifest 를 따르므로 재개 때 `--meta-path` 가 달라도 원래 목록대로 옮긴다. manifest 를 쓰기 전에 죽었으면 옮긴 파일이 없으므로 `.partial` 만 지운다. 원래 자리와 `.partial` 안에 같은 이름이 둘 다 있으면(그 사이 누가 새 파일을 만들었다) 판정할 수 없으므로 exit 2.
+  - 격리를 마친 뒤 설치 전에 죽으면 로컬 DB·메타가 없으므로 다음 부팅은 `fresh` 로 복원한다. 설치 뒤 exec 전에 죽으면 D-14 와 같은 상태(DB 있음, 메타 없음)가 되어 `--on-unknown restore` 면 한 번 더 격리·복원한다. 어느 kill 지점에서도 DB 와 메타가 다른 격리 디렉터리로 갈라지지 않는다(테스트로 고정).
+  - rename 은 같은 파일시스템 안에서만 원자적이다. 메타 디렉터리가 DB 와 다른 파일시스템에 있으면 복원 전에 거부한다(exit 2).
 - `--on-unknown keep-local` : 로컬을 그대로 두고 진행하되, stderr 와 헬스 상태에 `unknown_at_boot` 를 남긴다. **원격 조회가 성공했을 때만** 통한다. 원격 조회 실패면 정책과 무관하게 거부한다(D-12, S3 장애 중 옛 볼륨 재부팅 방지).
-- `--adopt-existing` : 기존 DB 를 처음 Litestream 에 올릴 때 쓴다. 정확히 (로컬 DB 있음, 로컬 메타 없음, 원격 조회 성공·빈 목록) 일 때만 `adopt` 로 진행하고, 그 밖의 모든 조합에서는 결과가 바뀌지 않는다. 그래서 켜 둔 채로 두어도 다른 사고를 통과시키지 않는다. `keep-local` 을 최초 도입 절차로 쓰지 않는다(D-11).
-- `--init-new` : 생애 첫 배포에서 새 DB 로 시작할 때 쓴다. 정확히 (로컬 DB 없음, 로컬 메타 없음, 원격 조회 성공·빈 목록) 일 때만 `fresh/new_db` 로 진행하고, 없으면 같은 조합을 `unknown/no_replica_no_local` 로 거부한다. Litestream 은 복제본 경로·prefix 오타와 "복제본 없음"을 같은 빈 목록(rc 0, `[]`)으로 돌려주므로(#3 실측) 빈 목록만으로 새 DB 를 시작하면 오타 난 경로에 새 DB 를 복제해 기존 복제본을 버리게 된다. 첫 복제 뒤에는 원격이 비지 않으므로 켜 둔 채로 두어도 다른 조합의 결과는 바뀌지 않는다(D-13, D-11 과 같은 꼴).
+- `--adopt-existing` : 기존 DB 를 처음 Litestream 에 올릴 때 쓴다. 정확히 (로컬 DB 있음, 로컬 메타 없음, 원격 조회 성공·빈 목록) 일 때만 `adopt` 로 진행하고, 그 밖의 모든 조합에서는 결과가 바뀌지 않는다. 그래서 켜 둔 채로 두어도 다른 사고를 통과시키지 않는다. `keep-local` 을 최초 도입 절차로 쓰지 않는다(D-11). **도입 배포가 끝나면 끈다.** 판정 함수는 '도입했음'을 기억하지 않으므로, 켜 둔 채로 두면 나중에 메타와 복제본이 함께 사라진(예: prefix 오타) 상황에서 같은 조합이 다시 성립해 그 DB 를 새 복제본으로 올린다(D-13 과 같은 이유).
+- `--init-new` : 생애 첫 배포에서 새 DB 로 시작할 때 쓴다. 정확히 (로컬 DB 없음, 로컬 메타 없음, 원격 조회 성공·빈 목록) 일 때만 `fresh/new_db` 로 진행하고, 없으면 같은 조합을 `unknown/no_replica_no_local` 로 거부한다. Litestream 은 복제본 경로·prefix 오타와 "복제본 없음"을 같은 빈 목록(rc 0, `[]`)으로 돌려주므로(#3 실측) 빈 목록만으로 새 DB 를 시작하면 오타 난 경로에 새 DB 를 복제해 기존 복제본을 버리게 된다. 이 조합 밖에서는 결과를 바꾸지 않지만, 판정 함수는 '첫 배포였음'을 기억하지 않으므로 나중에 DB·메타가 함께 사라지고 복제본 경로까지 틀리면 같은 조합이 다시 성립한다. 그래서 **첫 배포 뒤에는 끈다**(D-13 정정).
 - **원격 TXID 조회**는 `litestream ltx -config <설정> -level all -json <db 경로>` 로 설정 파일의 복제본을 모든 레벨에 걸쳐 보고, 항목들의 `max_txid`(16자리 16진수) 최대값을 쓴다. 기본(`-level` 생략)은 L0 만 나열해 L0 가 사라진 복제본을 빈 목록으로 오판한다(0.5.17 `ltx -h` 와 실측). 구현은 `boot/litestream.py` 의 `remote_max_txid()`.
   - rc 0 + `[]` → `RemoteEmpty`. 0.5.17 은 복제본 경로가 없을 때와 비어 있을 때 모두 이 출력이라 둘을 구분할 수 없다(경로 오타도 빈 목록이다). 조회 모듈은 사실(빈 목록)만 돌려주고, 이를 어떻게 다룰지는 판정 정책이 정한다. 빈 목록의 처리는 아래 상태 규칙표를 따르며, 로컬 DB·메타가 모두 없을 때 새 DB 로 시작하려면 `--init-new` 가 필요하다(D-13).
   - rc ≠ 0(설정에 없는 DB·설정 파일 없음·YAML 오류·접근 불가 모두 rc 1, stderr `Error: ...`), 타임아웃(기본 30초), JSON·스키마 이상, 검증하지 않은 Litestream 버전(`litestream version` 이 `VERIFIED_VERSIONS`, 현재 0.5.17 밖) → `RemoteError`.
@@ -122,11 +143,19 @@ python -m django_sqlite_ops.boot \
 `docs/reference/guard_spike.py` 는 랩에서 D4(옛 볼륨 재부팅)를 막는 데 성공했다. 그러나 그대로 옮기면 안 된다. 교차 리뷰에서 지적됐고, 코드로 직접 확인한 결함이다.
 - 원격 조회 실패와 빈 목록을 둘 다 "로컬 유지, exit 0"으로 처리한다 → v1 에서는 `unknown` 으로 판정한다.
 - 메타가 없으면 원격으로 복원한다. 그러면 더 새로운 로컬을 버릴 수 있다 → v1 에서는 `unknown` 으로 판정한다.
-- 격리를 파일별 rename 으로 한다 → v1 은 디렉터리 하나로 원자적으로 옮긴다.
+- 격리를 파일별 rename 으로 하고 진행 표시가 없다. 중간에 죽으면 반쯤 옮겨진 상태가 남고 다음 부팅이 그것을 모른다 → v1 은 `.partial` 디렉터리와 manifest 로 진행 중임을 남기고, 다음 부팅이 판정 전에 마저 끝낸다(§4-3). 또 복원을 격리보다 먼저 끝내므로 복원이 실패하면 로컬은 바뀌지 않는다.
 - L0 만 본다 → v1 은 `-level all` 을 쓴다.
 
 ### 4-5. 종료 코드
-`0` 진행(exec) · `2` unknown 거부 · `3` 무결성 실패 · `4` 복원 실패 · `5` 잠금 실패 · `64` 사용법 오류
+| 코드 | 뜻 |
+|---|---|
+| `0` | 진행. 실제로는 exec 로 프로세스가 바뀌므로 boot 가 0 을 돌려주는 일은 없고, 이후 종료 코드는 exec 된 명령의 것이다 |
+| `2` | 거부: `unknown`(+ `refuse` 정책, 원격 조회 실패 등), DB 없이 사이드카만 남음, `.partial` 이 둘 이상, DB 경로가 정규 파일이 아님, 설치 자리가 비어 있지 않음, 상태 파일을 쓸 수 없음 |
+| `3` | 무결성 실패: `PRAGMA quick_check` 가 `ok` 가 아니거나 DB 를 열 수 없음 |
+| `4` | 복원 실패: `litestream restore` 실패·타임아웃·결과 이상, 격리·설치 도중의 파일 오류. 복원 실패면 로컬은 바뀌지 않았다 |
+| `5` | 잠금 실패: 다른 boot 나 그것이 exec 한 명령이 잠금을 쥐고 있음, 잠금 파일을 만들 수 없음 |
+| `64` | 사용법 오류: 인자 오류, `--` 뒤 명령 없음, POSIX `fcntl` 이 없는 플랫폼 |
+| `127` | exec 실패: `--` 뒤 명령을 실행할 수 없음(없는 명령, 실행 권한 없음) |
 
 ## 5. Django 쪽 구성
 
@@ -205,7 +234,21 @@ django_sqlite_ops/
 
 - `caught_up`: 원격 최대 TXID == 로컬 최대 TXID
 - `backlog`: 로컬 TXID 가 원격보다 앞서 있고, 그 상태가 `SQLITE_OPS_BACKLOG_GRACE`(기본 60초)보다 오래 지속됨
-- `unknown`: 원격 조회 실패, 메타를 읽을 수 없음, 부팅 때 `keep-local` 로 진행함(`keep-local` 은 부팅 시 원격 조회가 성공했을 때만 통하므로 — D-12 — 이 표시는 원격이 비었거나 앞섰거나 로컬 메타가 없던 부팅을 뜻한다)
+- `unknown`: 원격 조회 실패, 메타를 읽을 수 없음, 부팅 때 `keep-local` 로 진행함(부팅 상태 파일의 `unknown_at_boot`)(`keep-local` 은 부팅 시 원격 조회가 성공했을 때만 통하므로 — D-12 — 이 표시는 원격이 비었거나 앞섰거나 로컬 메타가 없던 부팅을 뜻한다)
+- **부팅 상태 파일** `<db>.boot-state.json`: boot 가 exec 직전에 임시 파일 + rename 으로 원자적으로 쓴다(거부·실패한 부팅은 쓰지 않으므로 앞선 성공 부팅의 내용이 남는다). 헬스(#7)가 읽는다.
+  ```json
+  {
+    "version": 1,
+    "state": "fresh | match | adopt | unknown",
+    "action": "proceed | restore | quarantine_and_restore | keep_local",
+    "reason_code": "decide() 의 사유 코드 또는 orphan_sidecars",
+    "reason": "사람용 한 줄",
+    "unknown_at_boot": true,
+    "litestream_version": "0.5.17",
+    "at": "2026-10-08T01:02:03Z"
+  }
+  ```
+  `unknown_at_boot` 는 `action` 이 `keep_local` 일 때만 참이다. `litestream_version` 은 읽지 못하면 `null`, `at` 은 UTC.
 - **"마지막 업로드 시각"은 지연 지표로 쓰지 않는다.** 쓰기가 없는 정상 DB 도 업로드 시각은 오래되기 때문이다.
 - **원격 조회 비용**: 요청마다 S3 를 부르지 않는다. 백그라운드 스레드나 캐시로 N초(기본 15초)마다 갱신한다. 정확한 방식은 구현 단계에서 정한다.
 - 헬스는 "지금 복제가 따라오는가"만 말한다. "복구할 수 있는가"는 별도의 주기적 복원 검증(`sqlite_doctor --restore-test`, 2단계)으로 본다.
@@ -282,7 +325,7 @@ django_sqlite_ops/
 ## 12. 미검증·확인 필요
 - ASGI 에서의 `CONN_MAX_AGE` 와 VFS 동작 (미검증)
 - 실제 클라우드 S3·R2·Tigris (미검증. 비용이 들어 마스터 승인 필요)
-- Windows 에서 boot CLI 의 파일 잠금과 디렉터리 rename 원자성 [확인 필요]
+- Windows 에서 boot CLI 의 파일 잠금과 디렉터리 rename 원자성 [확인 필요]. 그때까지 boot 는 `fcntl` 이 없으면 exit 64 로 거부한다
 - channels-nats D2 의 196/200 이 하네스 문제인지 [확인 필요]
 - "같은 이력" 증명 방법(자동 판정의 전제) [확인 필요]
 - Litestream 상류 #1506(VFS 확장 로드), #1271·#1363(writable VFS) 머지 여부
