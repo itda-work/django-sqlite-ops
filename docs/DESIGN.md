@@ -66,14 +66,40 @@ python -m django_sqlite_ops.boot \
 ### 4-3. 판정 (상태 3가지)
 | 상태 | 조건 | 기본 동작 |
 |---|---|---|
-| `fresh` | 로컬 DB 파일이 없음 | 원격에 복제본이 있으면 복원, 없으면 그대로 진행(새 DB) |
+| `fresh` | 로컬 DB 파일과 로컬 메타가 모두 없고, 원격 조회 성공 | 원격에 복제본이 있으면 복원, 없으면 그대로 진행(새 DB) |
 | `match` | 로컬 메타의 최대 TXID ≥ 원격 최대 TXID, 그리고 원격 조회 성공 | 그대로 진행 |
-| `unknown` | 그 밖의 모든 경우: 원격 조회 실패·타임아웃, 로컬 메타 없음, 원격이 앞섬, 파싱 실패 | **기동 거부(exit 2)**. 사유를 한 줄로 출력 |
+| `unknown` | 그 밖의 모든 경우: 원격 조회 실패·타임아웃·파싱 실패, 로컬 메타 없음, DB 없이 메타만 남음, 로컬 DB 는 있는데 원격이 빈 목록, 원격이 앞섬 | **기동 거부(exit 2)**. 사유를 한 줄로 출력 |
 
 - `--on-unknown restore` : 로컬을 `<db>.stale-<ts>/` 디렉터리 하나로 **원자적으로** 옮긴 뒤 복원한다. 옮기기는 디렉터리 rename 한 번으로 한다. 파일을 하나씩 옮기면 중간에 죽었을 때 반쯤 옮겨진 상태가 남는다.
 - `--on-unknown keep-local` : 로컬을 그대로 두고 진행하되, stderr 와 헬스 상태에 `unknown_at_boot` 를 남긴다.
 - **원격 TXID 조회**는 `litestream ltx -level all <url>` 로 모든 레벨을 본다. 기본은 L0 만 나열한다(0.5.17 `ltx -h` 로 확인).
-- 판정에 쓰는 정보와 비교 규칙은 `boot/decide.py` 의 순수 함수 하나에 모은다. 입력은 (로컬 존재 여부, 로컬 메타 TXID|None, 원격 조회 결과|오류)이고 출력은 (상태, 사유)다. 표 기반 단위 테스트로 모든 조합을 고정한다.
+- 판정에 쓰는 정보와 비교 규칙은 `boot/decide.py` 의 순수 함수 `decide()` 하나에 모은다. 입력은 (로컬 존재 여부, 로컬 메타 TXID|None, 원격 조회 결과, `on_unknown`)이고, 원격 조회 결과는 실패(`RemoteError`)·빈 목록(`RemoteEmpty`)·최대 TXID(`RemoteTxid`) 세 타입으로 구분한다. 출력은 (상태, 조치, 사유 코드, 사람용 사유 한 줄)이다. 표 기반 단위 테스트(`tests/test_boot_decide.py`)로 모든 조합을 고정한다.
+
+상태 규칙 (위에서부터 처음 맞는 줄. `*` 는 무관):
+
+| 로컬 DB | 로컬 TXID | 원격 | 상태 | 사유 코드 |
+|---|---|---|---|---|
+| 없음 | 값 있음 | * | `unknown` | `stale_meta` — DB 는 없는데 메타만 남음 |
+| * | * | 실패 | `unknown` | `remote_error` — DB 가 없어도 복제본 유무를 모르므로 새 DB 로 시작하면 원격을 덮을 수 있다 |
+| 없음 | 없음 | 빈 목록 | `fresh` | `new_db` |
+| 없음 | 없음 | n | `fresh` | `restore_from_remote` |
+| 있음 | 없음 | 성공 | `unknown` | `no_local_meta` |
+| 있음 | t | 빈 목록 | `unknown` | `remote_empty` — 빈 목록을 '로컬 유지'로 보지 않는다(설정 오류·경로 오타일 수 있다) |
+| 있음 | t | n, t ≥ n | `match` | `local_current` — 복제되지 않은 로컬 커밋 보존(L5) |
+| 있음 | t | n, t < n | `unknown` | `remote_ahead` |
+
+조치 규칙:
+
+| 상태 | `refuse`(기본) | `restore` | `keep-local` |
+|---|---|---|---|
+| `fresh`, 빈 목록 | `PROCEED` | `PROCEED` | `PROCEED` |
+| `fresh`, n | `RESTORE` | `RESTORE` | `RESTORE` |
+| `match` | `PROCEED` | `PROCEED` | `PROCEED` |
+| `unknown`, 원격 n 있음 | `REFUSE` | `QUARANTINE_AND_RESTORE` | 로컬 DB 있으면 `KEEP_LOCAL`, 없으면 `REFUSE` |
+| `unknown`, 원격 실패·빈 목록 | `REFUSE` | `REFUSE`(복원할 것이 없다) | 로컬 DB 있으면 `KEEP_LOCAL`, 없으면 `REFUSE` |
+
+- `QUARANTINE_AND_RESTORE` 는 로컬(DB·메타)을 `<db>.stale-<ts>/` 로 옮긴 뒤 복원한다. `stale_meta` 도 남은 메타를 옮겨야 하므로 같은 조치다. `KEEP_LOCAL` 은 진행하되 `unknown_at_boot` 를 남긴다(§7). `REFUSE` 는 exit 2 다.
+- 안전 불변식(테스트로 고정): 로컬 DB 가 있으면 `RESTORE` 는 나오지 않는다(덮어쓰기는 반드시 격리를 거친다). 원격 조회 실패면 `PROCEED`·`RESTORE`·`QUARANTINE_AND_RESTORE` 는 나오지 않는다. `refuse` 면 `unknown` 은 모두 `REFUSE` 다.
 
 ### 4-4. 스파이크 guard.py 와의 차이 (고친 결함)
 `docs/reference/guard_spike.py` 는 랩에서 D4(옛 볼륨 재부팅)를 막는 데 성공했다. 그러나 그대로 옮기면 안 된다. 교차 리뷰에서 지적됐고, 코드로 직접 확인한 결함이다.
