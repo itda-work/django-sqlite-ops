@@ -382,7 +382,7 @@ def test_resume_after_crash_before_each_rename(lab, monkeypatch, n):
             cli.quarantine(db, meta)
     partials = [p for p in lab.iterdir() if p.name.endswith(".partial")]
     assert len(partials) == 1
-    cli.resume_quarantine(db)
+    cli.resume_quarantine(db, ls.default_meta_path(db))
     assert not [p for p in lab.iterdir() if p.name.endswith(".partial")]
     finals = stale_dirs(lab)
     if n == 1:
@@ -394,22 +394,8 @@ def test_resume_after_crash_before_each_rename(lab, monkeypatch, n):
     assert snapshot(finals[0], skip=("manifest.json",)) == before
     assert [p.name for p in lab.iterdir()] == [finals[0].name]
     # 다시 불러도 아무 일도 없다(멱등).
-    cli.resume_quarantine(db)
+    cli.resume_quarantine(db, ls.default_meta_path(db))
     assert stale_dirs(lab) == finals
-
-
-def test_resume_follows_manifest_not_current_meta_path(lab, monkeypatch):
-    db = lab / "app.db"
-    make_db(db, 1)
-    meta = lab / "custom-meta"
-    meta.mkdir()
-    with monkeypatch.context() as m:
-        crash_on_rename(m, 3)  # db 를 옮긴 뒤, meta 전에
-        with pytest.raises(KeyboardInterrupt):
-            cli.quarantine(db, meta)
-    cli.resume_quarantine(db)  # 재개는 인자의 meta 경로를 받지 않는다
-    (final,) = stale_dirs(lab)
-    assert sorted(os.listdir(final)) == ["app.db", "custom-meta", "manifest.json"]
 
 
 def test_two_partials_refuse(lab):
@@ -417,7 +403,7 @@ def test_two_partials_refuse(lab):
     (lab / "app.db.stale-20260101T000000.000001Z.partial").mkdir()
     (lab / "app.db.stale-20260101T000000.000002Z.partial").mkdir()
     with pytest.raises(cli._Exit) as exc:
-        cli.resume_quarantine(db)
+        cli.resume_quarantine(db, ls.default_meta_path(db))
     assert exc.value.code == cli.EXIT_REFUSE
 
 
@@ -427,7 +413,7 @@ def test_partial_without_manifest_but_with_files_refuses(lab):
     partial.mkdir()
     (partial / "app.db").write_bytes(b"x")
     with pytest.raises(cli._Exit) as exc:
-        cli.resume_quarantine(db)
+        cli.resume_quarantine(db, ls.default_meta_path(db))
     assert exc.value.code == cli.EXIT_REFUSE
     assert (partial / "app.db").exists()
 
@@ -440,7 +426,7 @@ def test_resume_conflict_refuses(lab, monkeypatch):
             cli.quarantine(db, meta)
     make_db(db, 1)  # 누군가 그 사이에 새 DB 를 만들었다
     with pytest.raises(cli._Exit) as exc:
-        cli.resume_quarantine(db)
+        cli.resume_quarantine(db, ls.default_meta_path(db))
     assert exc.value.code == cli.EXIT_REFUSE
     assert "both" in exc.value.message
 
@@ -448,8 +434,284 @@ def test_resume_conflict_refuses(lab, monkeypatch):
 def test_other_names_are_not_partials(lab):
     (lab / "other.db.stale-20260101T000000.000001Z.partial").mkdir()
     (lab / "app.db.restore-20260101T000000.000001Z-abcd").mkdir()
-    cli.resume_quarantine(lab / "app.db")
+    cli.resume_quarantine(lab / "app.db", ls.default_meta_path(lab / "app.db"))
     assert len(list(lab.iterdir())) == 2
+
+
+# --- 라운드 1: manifest 는 이동 명령이 아니다 ------------------------------------------------
+# 재개는 현재 DB(와 --meta-path)에서 다시 유도한 대상과 manifest 를 대조하고, 전체를 먼저 검증한다.
+# 하나라도 어긋나면 아무것도 옮기지 않고 exit 2 다.
+
+PARTIAL = "app.db.stale-20261008T000000.000001Z.partial"
+
+
+def forged(lab: Path, manifest) -> Path:
+    partial = lab / PARTIAL
+    partial.mkdir()
+    text = manifest if isinstance(manifest, str) else json.dumps(manifest)
+    (partial / "manifest.json").write_text(text)
+    return partial
+
+
+def entry(role: str, src: Path, name: str | None = None) -> dict:
+    return {"role": role, "src": str(src), "name": src.name if name is None else name}
+
+
+def good_manifest(lab: Path, *entries: dict) -> dict:
+    return {"version": 1, "db": str(lab / "app.db"), "entries": list(entries)}
+
+
+def assert_resume_refused(lab: Path, meta: Path | None = None) -> str:
+    db = lab / "app.db"
+    before = snapshot(lab)
+    with pytest.raises(cli._Exit) as exc:
+        cli.resume_quarantine(db, meta or ls.default_meta_path(db))
+    assert exc.value.code == cli.EXIT_REFUSE
+    assert snapshot(lab) == before  # 아무것도 움직이지 않았다
+    return exc.value.message
+
+
+def test_forged_manifest_cannot_move_another_db(lab):
+    # 리뷰 run-2 재현: 다른 DB(app.db2)를 격리 안으로 끌어갔다.
+    other = lab / "app.db2"
+    other.write_text("valuable unrelated db")
+    forged(lab, {"entries": [{"src": str(other), "name": "stolen.db"}]})
+    assert_resume_refused(lab)
+    assert other.read_text() == "valuable unrelated db"
+
+
+def test_manifest_with_other_db_src_refuses(lab):
+    other = lab / "app.db2"
+    other.write_text("x")
+    forged(lab, good_manifest(lab, entry("db", other, "app.db")))
+    assert_resume_refused(lab)
+
+
+def test_manifest_for_another_db_refuses(lab):
+    make_db(lab / "app.db", 1)
+    m = good_manifest(lab, entry("db", lab / "app.db"))
+    m["db"] = str(lab / "other.db")
+    forged(lab, m)
+    assert_resume_refused(lab)
+
+
+@pytest.mark.parametrize(
+    "manifest",
+    [
+        "not json",
+        "[]",
+        {"version": 2, "entries": []},
+        {"entries": []},
+        {"version": 1, "entries": []},
+        {"version": True, "db": "x", "entries": []},
+    ],
+)
+def test_manifest_schema_mismatch_refuses(lab, manifest):
+    make_db(lab / "app.db", 1)
+    if isinstance(manifest, dict) and "db" not in manifest and manifest.get("version") == 1:
+        manifest["db"] = 1
+    forged(lab, manifest)
+    assert_resume_refused(lab)
+
+
+def test_manifest_entry_missing_in_both_places_refuses(lab):
+    # 리뷰 run-2 재현: 원래 자리에도 격리 안에도 없는 항목을 완료로 확정했다.
+    forged(lab, good_manifest(lab, entry("db", lab / "app.db")))
+    assert_resume_refused(lab)
+    assert [p.name for p in stale_dirs(lab)] == [PARTIAL]  # 완료로 확정하지 않았다
+
+
+def test_manifest_validated_before_any_move(lab):
+    # 첫 항목(db)은 옮길 수 있지만 뒤 항목(메타)이 양쪽에 다 없다 → db 도 옮기지 않는다.
+    make_db(lab / "app.db", 1)
+    meta = ls.default_meta_path(lab / "app.db")
+    forged(lab, good_manifest(lab, entry("db", lab / "app.db"), entry("meta", meta)))
+    assert_resume_refused(lab)
+    assert (lab / "app.db").exists()
+
+
+@pytest.mark.parametrize("name", ["", ".", "..", "a/b", "../app.db", "manifest.json", "x.db"])
+def test_manifest_bad_entry_name_refuses(lab, name):
+    make_db(lab / "app.db", 1)
+    forged(lab, good_manifest(lab, entry("db", lab / "app.db", name)))
+    assert_resume_refused(lab)
+
+
+@pytest.mark.parametrize(
+    "entries",
+    [
+        [{"role": "bogus", "src": "app.db", "name": "app.db"}],
+        [{"role": "db", "src": "app.db"}],
+        [{"role": "db", "src": "app.db", "name": "app.db"}] * 2,
+        [
+            {"role": "shm", "src": "app.db-shm", "name": "app.db-shm"},
+            {"role": "db", "src": "app.db", "name": "app.db"},
+        ],
+    ],
+)
+def test_manifest_bad_entries_refuse(lab, entries):
+    make_db(lab / "app.db", 1)
+    (lab / "app.db-shm").write_bytes(b"s")
+    fixed = [{**e, "src": str(lab / e["src"])} for e in entries]
+    forged(lab, {"version": 1, "db": str(lab / "app.db"), "entries": fixed})
+    assert_resume_refused(lab)
+
+
+def test_unknown_file_inside_partial_refuses(lab):
+    make_db(lab / "app.db", 1)
+    partial = forged(lab, good_manifest(lab, entry("db", lab / "app.db")))
+    (partial / "intruder").write_text("x")
+    assert_resume_refused(lab)
+
+
+def test_meta_path_differs_from_manifest_refuses(lab, monkeypatch):
+    db = lab / "app.db"
+    make_db(db, 1)
+    meta = lab / "custom-meta"
+    meta.mkdir()
+    with monkeypatch.context() as m:
+        crash_on_rename(m, 3)  # db 를 옮긴 뒤, meta 전에
+        with pytest.raises(KeyboardInterrupt):
+            cli.quarantine(db, meta)
+    message = assert_resume_refused(lab, ls.default_meta_path(db))
+    assert "--meta-path" in message
+    cli.resume_quarantine(db, meta)  # 원래 인자로는 끝난다
+    (final,) = stale_dirs(lab)
+    assert sorted(os.listdir(final)) == ["app.db", "custom-meta", "manifest.json"]
+
+
+def test_symlinked_partial_refuses(lab):
+    real = lab / "elsewhere"
+    real.mkdir()
+    (real / "manifest.json").write_text(json.dumps(good_manifest(lab)))
+    (lab / PARTIAL).symlink_to(real)
+    assert_resume_refused(lab)
+
+
+def test_symlinked_manifest_refuses(lab):
+    make_db(lab / "app.db", 1)
+    target = lab.parent / "m.json"
+    target.write_text(json.dumps(good_manifest(lab, entry("db", lab / "app.db"))))
+    partial = lab / PARTIAL
+    partial.mkdir()
+    (partial / "manifest.json").symlink_to(target)
+    assert_resume_refused(lab)
+
+
+# --- 라운드 1: 격리 대상의 심볼릭 링크와 예약 이름 -----------------------------------------------
+
+
+def linked_meta_volume(lab: Path) -> Path:
+    """리뷰 run-6 재현: 기본 메타 경로가 상대 링크(.app.db-litestream -> actual-meta)."""
+    db = lab / "app.db"
+    make_db(db, 3)
+    l0 = lab / "actual-meta" / "ltx" / "0"
+    l0.mkdir(parents=True)
+    shutil.copy(LATEST_LTX, l0 / LATEST_LTX.name)
+    ls.default_meta_path(db).symlink_to("actual-meta")
+    assert ls.local_max_txid(db) == 0x19
+    return db
+
+
+def test_symlinked_meta_refuses_quarantine_and_restore(lab, fake, no_exec, capsys):
+    linked_meta_volume(lab)
+    fake.remote_txid(0x20)
+    before = snapshot(lab)
+    assert main_inproc(boot_args(lab, fake, "--on-unknown", "restore"), no_exec) == 2
+    assert "symbolic link" in capsys.readouterr().err
+    assert snapshot(lab, skip=("app.db.boot.lock",)) == before
+    assert "restore" not in fake.calls()
+    assert not stale_dirs(lab)
+
+
+def test_symlinked_meta_still_allowed_for_match(lab, fake, no_exec):
+    # 조회 규약(DESIGN §4-3): 메타 디렉터리 링크는 판정·PROCEED 에서는 따라간다.
+    linked_meta_volume(lab)
+    fake.remote_txid(0x19)
+    assert main_inproc(boot_args(lab, fake), no_exec) == "exec"
+    assert state(lab)["state"] == "match"
+
+
+@pytest.mark.parametrize("sidecar", ["app.db-wal", "app.db-shm", "app.db-journal"])
+def test_symlinked_sidecar_refuses_quarantine(lab, fake, no_exec, sidecar):
+    db = lab / "app.db"
+    make_db(db, 1)
+    write_meta(db)
+    (lab / "payload").write_bytes(b"p")
+    (lab / sidecar).symlink_to("payload")
+    fake.remote_txid(0x20)
+    before = snapshot(lab)
+    assert main_inproc(boot_args(lab, fake, "--on-unknown", "restore"), no_exec) == 2
+    assert snapshot(lab, skip=("app.db.boot.lock",)) == before
+    assert "restore" not in fake.calls()
+
+
+@pytest.mark.parametrize("meta_name", ["manifest.json", "manifest.json.tmp-abcd1234"])
+def test_meta_named_like_manifest_refuses_before_restore(lab, fake, no_exec, meta_name):
+    # 리뷰 run-2 collision 재현: DB 를 옮긴 뒤 메타에서 충돌해 재개할 수 없는 partial 이 남았다.
+    db = lab / "app.db"
+    make_db(db, 1)
+    meta = lab / meta_name
+    meta.mkdir()
+    (meta / "data").write_text("meta")
+    fake.remote_txid(0x20)
+    before = snapshot(lab)
+    args = boot_args(lab, fake, "--on-unknown", "restore", "--meta-path", str(meta))
+    assert main_inproc(args, no_exec) == 2
+    assert snapshot(lab, skip=("app.db.boot.lock",)) == before
+    assert "restore" not in fake.calls()
+    with pytest.raises(cli._Exit):
+        cli.check_quarantinable(db, meta)
+
+
+def test_db_named_manifest_refuses_before_restore(lab, fake, no_exec):
+    db = lab / "manifest.json"
+    make_db(db, 1)
+    write_meta(db)
+    fake.remote_txid(0x20)
+    before = snapshot(lab)
+    args = boot_args(lab, fake, "--on-unknown", "restore")
+    args[args.index(str(lab / "app.db"))] = str(db)
+    assert main_inproc(args, no_exec) == 2
+    assert snapshot(lab, skip=("manifest.json.boot.lock",)) == before
+    assert "restore" not in fake.calls()
+
+
+# --- 라운드 1: 잠금 파일 --------------------------------------------------------------------
+
+
+def test_symlinked_lock_file_refuses(lab):
+    target = lab / "target.lock"
+    target.write_text("")
+    cli.lock_path(lab / "app.db").symlink_to(target)
+    with pytest.raises(cli._Exit) as exc:
+        cli.acquire_lock(lab / "app.db")
+    assert exc.value.code == cli.EXIT_LOCK
+
+
+@pytest.mark.parametrize("kind", ["dir", "fifo"])
+def test_non_regular_lock_file_refuses(lab, kind):
+    path = cli.lock_path(lab / "app.db")
+    path.mkdir() if kind == "dir" else os.mkfifo(path)
+    with pytest.raises(cli._Exit) as exc:
+        cli.acquire_lock(lab / "app.db")
+    assert exc.value.code == cli.EXIT_LOCK
+
+
+def test_lock_file_replaced_during_acquire_refuses(lab, monkeypatch):
+    path = cli.lock_path(lab / "app.db")
+    real_flock = fcntl.flock
+
+    def flock(fd, op):
+        real_flock(fd, op)
+        path.unlink()
+        path.write_text("")  # 다른 inode
+
+    monkeypatch.setattr(cli.fcntl, "flock", flock)
+    with pytest.raises(cli._Exit) as exc:
+        cli.acquire_lock(lab / "app.db")
+    assert exc.value.code == cli.EXIT_LOCK
+    assert "replaced" in exc.value.message
 
 
 # --- 임시 복원·설치 ---------------------------------------------------------------------------

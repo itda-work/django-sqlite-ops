@@ -61,6 +61,8 @@ SIDECAR_SUFFIXES = ("-wal", "-shm", "-journal")
 ORPHAN_SIDECARS = "orphan_sidecars"
 
 _MANIFEST = "manifest.json"
+# 원자적 쓰기의 임시 파일 이름: <이름>.tmp-<rand>
+_TMP_INFIX = ".tmp-"
 _STATE_VERSION = 1
 
 
@@ -92,13 +94,18 @@ def sidecars(db: Path) -> list[Path]:
     return [db.with_name(db.name + s) for s in SIDECAR_SUFFIXES]
 
 
-def quarantine_targets(db: Path, meta: Path) -> list[Path]:
-    """격리 대상과 순서. 이 목록 하나만 쓴다(격리·재개·사이드카 판단 모두).
+def quarantine_roles(db: Path, meta: Path) -> list[tuple[str, Path]]:
+    """격리 대상의 (역할, 경로)와 순서. 이 목록 하나만 쓴다(격리·재개 검증·사이드카 판단 모두).
 
     DB 를 먼저 옮긴다. 도중에 죽으면 DB 는 이미 빠져 있으므로, 남은 사이드카·메타가 다음
     부팅에서 '진행 중 격리'로 이어서 옮겨진다. 메타는 마지막이다.
     """
-    return [db, *sidecars(db), meta]
+    side = zip(("wal", "shm", "journal"), sidecars(db), strict=True)
+    return [("db", db), *side, ("meta", meta)]
+
+
+def quarantine_targets(db: Path, meta: Path) -> list[Path]:
+    return [p for _, p in quarantine_roles(db, meta)]
 
 
 def _timestamp() -> str:
@@ -139,7 +146,12 @@ def _fsync_dirs(*dirs: Path) -> None:
 
 
 def acquire_lock(db: Path) -> int:
-    """``<db>.boot.lock`` 에 배타 잠금을 건 fd. exec 에 상속시켜 명령이 사는 동안 유지된다."""
+    """``<db>.boot.lock`` 에 배타 잠금을 건 fd. exec 에 상속시켜 명령이 사는 동안 유지된다.
+
+    잠금 파일은 정규 파일이어야 한다(링크·디렉터리·FIFO 거부). 잠근 뒤 경로가 아직 그 파일을
+    가리키는지(inode) 확인한다. 이 검사는 획득 순간만 본다. 그 뒤 누가 잠금 파일을 지우거나
+    바꾸면 flock 의 보호는 사라진다(DESIGN §4-2).
+    """
     if fcntl is None:  # pragma: no cover - Windows
         raise _Exit(
             EXIT_USAGE,
@@ -147,28 +159,56 @@ def acquire_lock(db: Path) -> int:
         )
     path = lock_path(db)
     try:
-        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        st = os.lstat(path)
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise _Exit(EXIT_LOCK, f"cannot stat lock file {path}: {exc}") from None
+    else:
+        if not stat.S_ISREG(st.st_mode):
+            raise _Exit(EXIT_LOCK, f"lock file {path} is not a regular file (or is a symlink)")
+    flags = os.O_RDWR | os.O_CREAT | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_NONBLOCK", 0)
+    try:
+        fd = os.open(path, flags, 0o644)
     except OSError as exc:
         raise _Exit(EXIT_LOCK, f"cannot open lock file {path}: {exc}") from None
     try:
-        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
-    except OSError as exc:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise _Exit(EXIT_LOCK, f"lock file {path} is not a regular file")
+        try:
+            fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError as exc:
+            if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
+                raise _Exit(
+                    EXIT_LOCK,
+                    f"lock {path} is held by another boot or by the command it exec'd "
+                    "(another process is using this volume)",
+                ) from None
+            raise _Exit(EXIT_LOCK, f"cannot lock {path}: {exc}") from None
+        held = os.fstat(fd)
+        try:
+            now = os.lstat(path)
+        except OSError:
+            now = None
+        if now is None or (now.st_dev, now.st_ino) != (held.st_dev, held.st_ino):
+            raise _Exit(EXIT_LOCK, f"lock file {path} was replaced while locking")
+    except BaseException:
         os.close(fd)
-        if exc.errno in (errno.EWOULDBLOCK, errno.EAGAIN, errno.EACCES):
-            raise _Exit(
-                EXIT_LOCK,
-                f"lock {path} is held by another boot or by the command it exec'd "
-                "(another process is using this volume)",
-            ) from None
-        raise _Exit(EXIT_LOCK, f"cannot lock {path}: {exc}") from None
+        raise
     return fd
 
 
 # --- 2·5. 격리 ----------------------------------------------------------------------------
+#
+# manifest 는 "무엇을 옮기려 했는지"의 기록일 뿐 이동 명령이 아니다. 재개는 현재 DB(와
+# --meta-path)에서 다시 유도한 대상과 대조해 일치할 때만, 전체를 먼저 검증한 뒤에 옮긴다.
+# 이 검증은 사고·손상 대비이며, 쓰기 권한을 가진 공격자에 대한 인증이 아니다.
+
+_MANIFEST_VERSION = 1
 
 
 def _write_json_atomic(path: Path, data: dict) -> None:
-    tmp = path.with_name(f"{path.name}.tmp-{secrets.token_hex(4)}")
+    tmp = path.with_name(f"{path.name}{_TMP_INFIX}{secrets.token_hex(4)}")
     fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
     try:
         os.write(fd, (json.dumps(data, indent=2) + "\n").encode())
@@ -179,42 +219,41 @@ def _write_json_atomic(path: Path, data: dict) -> None:
     fsync_path(path.parent)
 
 
-def _move_into(partial: Path, entries: list[dict]) -> None:
-    """manifest 순서대로 아직 원래 자리에 있는 대상을 ``partial`` 안으로 옮긴다(멱등)."""
-    for entry in entries:
-        src, dest = Path(entry["src"]), partial / entry["name"]
-        if os.path.lexists(src):
-            if os.path.lexists(dest):
-                raise _Exit(
-                    EXIT_REFUSE,
-                    f"cannot finish quarantine: both {src} and {dest} exist; inspect manually",
-                )
-            os.rename(src, dest)
-            log(f"quarantine: moved {src} -> {dest}")
-
-
-def _finish(partial: Path, final: Path, entries: list[dict]) -> None:
-    _move_into(partial, entries)
-    _fsync_dirs(partial, partial.parent, *(Path(e["src"]).parent for e in entries))
-    if os.path.lexists(final):
-        raise _Exit(EXIT_REFUSE, f"cannot finish quarantine: {final} already exists")
-    os.rename(partial, final)
-    fsync_path(final.parent)
-    log(f"quarantine: done -> {final}")
+def _reserved(name: str) -> bool:
+    """격리 디렉터리 안에서 우리가 쓰는 이름(manifest 와 그 임시 파일)."""
+    return name == _MANIFEST or name.startswith(_MANIFEST + _TMP_INFIX)
 
 
 def check_quarantinable(db: Path, meta: Path) -> None:
-    """격리를 시작하기 전에(복원보다도 먼저) rename 으로 옮길 수 있는지 본다.
+    """격리를 시작하기 전에(복원보다도 먼저) 옮길 수 있는지 본다. 아니면 exit 2.
 
-    rename 은 같은 파일시스템 안에서만 원자적이다. 메타가 다른 볼륨에 있으면 거부한다.
+    - 격리 대상(DB·사이드카·메타) 경로 자체가 심볼릭 링크면 거부한다. 링크를 rename 하면 실체는
+      밖에 남고 격리본에는 끊어진 링크만 남는다. 링크 실체 보존은 v0.1 에서 지원하지 않는다.
+      (판정·PROCEED·KEEP_LOCAL 에서 메타 디렉터리 링크를 따라가는 조회 규약과는 별개다.)
+    - 대상 이름이 서로 겹치거나 격리 디렉터리의 예약 이름(manifest)과 겹치면 거부한다.
+    - rename 은 같은 파일시스템 안에서만 원자적이다. 다른 파일시스템이면 거부한다.
     """
-    targets = [p for p in quarantine_targets(db, meta) if os.path.lexists(p)]
-    names = [p.name for p in targets]
+    names = [p.name for _, p in quarantine_roles(db, meta)]
     if len(set(names)) != len(names):
         raise _Exit(EXIT_REFUSE, f"cannot quarantine: duplicate target names {names}")
+    clash = [n for n in names if _reserved(n)]
+    if clash:
+        raise _Exit(
+            EXIT_REFUSE,
+            f"cannot quarantine: {clash} collide with the reserved name {_MANIFEST!r}; "
+            "rename the db or --meta-path",
+        )
     try:
         dev = os.stat(db.parent).st_dev
-        for p in targets:
+        for _, p in quarantine_roles(db, meta):
+            if not os.path.lexists(p):
+                continue
+            if os.path.islink(p):
+                raise _Exit(
+                    EXIT_REFUSE,
+                    f"cannot quarantine {p}: it is a symbolic link; boot does not move link "
+                    "targets (v0.1). Replace the link with the real file or directory",
+                )
             if os.stat(p.parent).st_dev != dev:
                 raise _Exit(
                     EXIT_REFUSE,
@@ -224,17 +263,32 @@ def check_quarantinable(db: Path, meta: Path) -> None:
         raise _Exit(EXIT_REFUSE, f"cannot quarantine: {exc}") from None
 
 
+def _move_all(partial: Path, entries: list[tuple[str, Path, str]]) -> None:
+    """검증이 끝난 목록에서 아직 원래 자리에 있는 대상을 순서대로 ``partial`` 안으로 옮긴다."""
+    for _, src, name in entries:
+        if os.path.lexists(src):
+            os.rename(src, partial / name)
+            log(f"quarantine: moved {src} -> {partial / name}")
+
+
+def _finish(partial: Path, final: Path, entries: list[tuple[str, Path, str]]) -> None:
+    _move_all(partial, entries)
+    _fsync_dirs(partial, partial.parent, *(src.parent for _, src, _ in entries))
+    os.rename(partial, final)
+    fsync_path(final.parent)
+    log(f"quarantine: done -> {final}")
+
+
 def quarantine(db: Path, meta: Path) -> Path | None:
     """있는 격리 대상을 ``<db>.stale-<ts>/`` 로 옮긴다. 옮길 것이 없으면 ``None``.
 
-    먼저 ``.partial`` 디렉터리와 manifest(원래 경로·옮길 이름·순서)를 내구화한 뒤 옮긴다.
-    manifest 가 있으므로 재개는 이번 실행의 인자(예: ``--meta-path``)가 바뀌어도 원래 목록을 따른다.
+    먼저 ``.partial`` 디렉터리와 manifest(대상 DB, 항목마다 역할·원래 경로·이름, 순서)를
+    내구화한 뒤 옮긴다.
     """
-    targets = [p for p in quarantine_targets(db, meta) if os.path.lexists(p)]
-    if not targets:
-        return None
     check_quarantinable(db, meta)
-    names = [p.name for p in targets]
+    present = [(role, p) for role, p in quarantine_roles(db, meta) if os.path.lexists(p)]
+    if not present:
+        return None
     while True:
         ts = _timestamp()
         partial = db.with_name(f"{db.name}.stale-{ts}.partial")
@@ -247,15 +301,73 @@ def quarantine(db: Path, meta: Path) -> Path | None:
             continue
         break
     fsync_path(partial.parent)
-    entries = [{"src": os.path.abspath(p), "name": p.name} for p in targets]
-    _write_json_atomic(partial / _MANIFEST, {"final": final.name, "entries": entries})
-    log(f"quarantine: started {partial} ({', '.join(names)})")
+    entries = [(role, Path(os.path.abspath(p)), p.name) for role, p in present]
+    manifest = {
+        "version": _MANIFEST_VERSION,
+        "db": os.path.abspath(db),
+        "entries": [{"role": r, "src": str(src), "name": n} for r, src, n in entries],
+    }
+    _write_json_atomic(partial / _MANIFEST, manifest)
+    log(f"quarantine: started {partial} ({', '.join(n for _, _, n in entries)})")
     _finish(partial, final, entries)
     return final
 
 
-def resume_quarantine(db: Path) -> None:
-    """앞선 부팅이 격리 도중 죽었으면(``.partial`` 이 남음) 판정 전에 끝낸다. 둘 이상이면 거부."""
+def _refuse_resume(partial: Path, why: str) -> _Exit:
+    return _Exit(EXIT_REFUSE, f"cannot resume interrupted quarantine {partial}: {why}")
+
+
+def _load_manifest(db: Path, meta: Path, partial: Path) -> list[tuple[str, Path, str]]:
+    """manifest 를 읽어 현재 DB·메타에서 유도한 대상과 대조한다. 어긋나면 exit 2."""
+    manifest = partial / _MANIFEST
+    if not stat.S_ISREG(os.lstat(manifest).st_mode):
+        raise _refuse_resume(partial, "manifest.json is not a regular file (or is a symlink)")
+    try:
+        data = json.loads(manifest.read_text())
+    except (OSError, ValueError) as exc:
+        raise _refuse_resume(partial, f"cannot read manifest: {exc}") from None
+    if (
+        type(data) is not dict
+        or type(data.get("version")) is not int
+        or data["version"] != _MANIFEST_VERSION
+        or type(data.get("db")) is not str
+        or type(data.get("entries")) is not list
+    ):
+        raise _refuse_resume(partial, "manifest schema mismatch")
+    if data["db"] != os.path.abspath(db):
+        raise _refuse_resume(partial, f"manifest is for db {data['db']!r}, not {db}")
+
+    expected = {role: Path(os.path.abspath(p)) for role, p in quarantine_roles(db, meta)}
+    order = list(expected)
+    entries: list[tuple[str, Path, str]] = []
+    for item in data["entries"]:
+        if type(item) is not dict or set(item) != {"role", "src", "name"}:
+            raise _refuse_resume(partial, "manifest entry schema mismatch")
+        role, src, name = item["role"], item["src"], item["name"]
+        if not all(type(v) is str for v in (role, src, name)) or role not in expected:
+            raise _refuse_resume(partial, f"manifest entry has invalid role {role!r}")
+        if src != str(expected[role]):
+            if role == "meta":
+                raise _refuse_resume(
+                    partial,
+                    f"meta path in manifest {src!r} differs from --meta-path {expected[role]}; "
+                    "rerun with the original --meta-path",
+                )
+            raise _refuse_resume(partial, f"manifest entry {role} has unexpected src {src!r}")
+        if name != expected[role].name or _reserved(name):
+            raise _refuse_resume(partial, f"manifest entry {role} has invalid name {name!r}")
+        entries.append((role, expected[role], name))
+    roles = [r for r, _, _ in entries]
+    if len(set(roles)) != len(roles) or roles != sorted(roles, key=order.index):
+        raise _refuse_resume(partial, "manifest entries are duplicated or out of order")
+    return entries
+
+
+def resume_quarantine(db: Path, meta: Path) -> None:
+    """앞선 부팅이 격리 도중 죽었으면(``.partial`` 이 남음) 판정 전에 끝낸다.
+
+    전체를 먼저 검증하고, 하나라도 어긋나면 아무것도 옮기지 않고 exit 2 다. 둘 이상이면 거부.
+    """
     pattern = _partial_re(db)
     try:
         found = sorted(n for n in os.listdir(db.parent) if pattern.fullmatch(n))
@@ -271,24 +383,31 @@ def resume_quarantine(db: Path) -> None:
         )
     partial = db.parent / found[0]
     final = db.with_name(found[0].removesuffix(".partial"))
-    manifest = partial / _MANIFEST
-    if not manifest.exists():
+    if not stat.S_ISDIR(os.lstat(partial).st_mode):
+        raise _refuse_resume(partial, "it is not a directory (or is a symlink)")
+    contents = set(os.listdir(partial))
+    if _MANIFEST not in contents:
         # manifest 를 쓰기 전에 죽었다. manifest 는 무엇보다 먼저 쓰므로 옮긴 파일이 없다.
-        leftovers = [n for n in os.listdir(partial) if not n.startswith(_MANIFEST + ".tmp-")]
+        leftovers = sorted(n for n in contents if not _reserved(n))
         if leftovers:
-            raise _Exit(
-                EXIT_REFUSE,
-                f"interrupted quarantine {partial} has no manifest but contains {leftovers}",
-            )
+            raise _refuse_resume(partial, f"no manifest but contains {leftovers}")
         shutil.rmtree(partial)
         fsync_path(partial.parent)
         log(f"quarantine: removed {partial} (interrupted before any file was moved)")
         return
-    try:
-        data = json.loads(manifest.read_text())
-        entries = [{"src": str(e["src"]), "name": str(e["name"])} for e in data["entries"]]
-    except (OSError, ValueError, KeyError, TypeError) as exc:
-        raise _Exit(EXIT_REFUSE, f"cannot read {manifest}: {exc}") from None
+    entries = _load_manifest(db, meta, partial)
+    unknown = sorted(contents - {_MANIFEST} - {n for _, _, n in entries})
+    if unknown:
+        raise _refuse_resume(partial, f"unexpected files {unknown}")
+    for role, src, name in entries:
+        here, there = os.path.lexists(src), os.path.lexists(partial / name)
+        if here == there:
+            where = "both the original place and" if here else "neither the original place nor"
+            raise _refuse_resume(partial, f"{role} {name} is in {where} the quarantine")
+        if os.path.islink(src if here else partial / name):
+            raise _refuse_resume(partial, f"{role} {name} is a symbolic link")
+    if os.path.lexists(final):
+        raise _refuse_resume(partial, f"{final} already exists")
     log(f"quarantine: resuming interrupted {partial}")
     _finish(partial, final, entries)
 
@@ -586,7 +705,7 @@ def _run_locked(args: argparse.Namespace, command: list[str], lock_fd: int) -> i
     db = args.db
     log(f"lock: {lock_path(db)}")
     try:
-        resume_quarantine(db)
+        resume_quarantine(db, args.meta_path)
     except OSError as exc:
         raise _Exit(EXIT_REFUSE, f"cannot finish interrupted quarantine: {exc}") from None
 
