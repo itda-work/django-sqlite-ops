@@ -598,6 +598,185 @@ def test_symlinked_manifest_refuses(lab):
     assert_resume_refused(lab)
 
 
+# --- 라운드 2: manifest 에서 빠진 역할 -----------------------------------------------------------
+# 재개는 manifest 항목만이 아니라 quarantine_roles() 의 모든 역할을 원래 자리·partial 양쪽에서 본다.
+
+
+def wal_only_commit(db: Path) -> None:
+    """WAL 에만 있는 커밋(행 42)을 남기고 죽는다. DB·-wal·-shm 이 남는다."""
+    code = (
+        "import sqlite3, os, sys; c = sqlite3.connect(sys.argv[1]); "
+        "c.execute('PRAGMA journal_mode=WAL'); c.execute('CREATE TABLE t(x)'); "
+        "c.execute('INSERT INTO t VALUES (42)'); c.commit(); os._exit(0)"
+    )
+    subprocess.run([sys.executable, "-c", code, str(db)], check=True)
+    assert Path(f"{db}-wal").stat().st_size > 0
+
+
+def drop_role(lab: Path, role: str) -> None:
+    (partial,) = [p for p in lab.iterdir() if p.name.endswith(".partial")]
+    m = json.loads((partial / "manifest.json").read_text())
+    m["entries"] = [e for e in m["entries"] if e["role"] != role]
+    (partial / "manifest.json").write_text(json.dumps(m))
+
+
+def test_role_omitted_from_manifest_left_in_place_refuses(lab, monkeypatch):
+    # 리뷰 run-11 OMITTED 재현: DB 를 옮긴 뒤 WAL 전에 죽고, manifest 에서 wal 항목이 빠졌다.
+    db = lab / "app.db"
+    wal_only_commit(db)
+    meta = ls.default_meta_path(db)
+    meta.mkdir()
+    with monkeypatch.context() as m:
+        crash_on_rename(m, 3)  # manifest(1), db(2) 뒤, wal(3) 전
+        with pytest.raises(KeyboardInterrupt):
+            cli.quarantine(db, meta)
+    drop_role(lab, "wal")
+    message = assert_resume_refused(lab)
+    assert "wal" in message
+    assert Path(f"{db}-wal").exists()
+
+
+def test_role_omitted_before_any_move_keeps_commit_readable(lab, monkeypatch):
+    db = lab / "app.db"
+    wal_only_commit(db)
+    meta = ls.default_meta_path(db)
+    meta.mkdir()
+    with monkeypatch.context() as m:
+        crash_on_rename(m, 2)  # manifest(1) 뒤, db(2) 전
+        with pytest.raises(KeyboardInterrupt):
+            cli.quarantine(db, meta)
+    drop_role(lab, "wal")
+    assert_resume_refused(lab)
+    # 원래 자리의 DB+WAL 로 커밋을 읽을 수 있다.
+    conn = sqlite3.connect(db)
+    try:
+        assert conn.execute("SELECT x FROM t").fetchall() == [(42,)]
+    finally:
+        conn.close()
+
+
+def test_role_omitted_but_already_inside_partial_refuses(lab):
+    make_db(lab / "app.db", 1)
+    partial = forged(lab, good_manifest(lab, entry("db", lab / "app.db")))
+    (partial / "app.db-wal").write_bytes(b"w")  # manifest 에 없는 역할이 partial 안에
+    assert_resume_refused(lab)
+
+
+def test_role_absent_from_the_start_is_allowed(lab, monkeypatch):
+    db = lab / "app.db"
+    make_db(db, 1)  # -wal·-shm·-journal·메타 없음
+    with monkeypatch.context() as m:
+        crash_on_rename(m, 3)  # partial→final 전
+        with pytest.raises(KeyboardInterrupt):
+            cli.quarantine(db, ls.default_meta_path(db))
+    cli.resume_quarantine(db, ls.default_meta_path(db))
+    (final,) = stale_dirs(lab)
+    assert sorted(os.listdir(final)) == ["app.db", "manifest.json"]
+
+
+# --- 라운드 2: 경로 정규화 -----------------------------------------------------------------------
+# 부모 디렉터리만 realpath 로 해석하고 마지막 구성요소는 그대로 붙인다. abspath 처럼 'alias/..'
+# 를 문자열로 접으면 링크 뒤의 실제 위치와 다른 파일을 가리킨다(리뷰 run-12).
+
+
+def parent_alias(lab: Path) -> Path:
+    """lab/alias -> storage/deep. 'alias/..' 는 실제로 storage 다."""
+    (lab / "storage" / "deep").mkdir(parents=True)
+    (lab / "alias").symlink_to("storage/deep", target_is_directory=True)
+    return lab / "storage"
+
+
+@pytest.mark.parametrize(
+    ("raw", "expected"),
+    [
+        ("{lab}/alias/../app.db", "{lab}/storage/app.db"),
+        ("{lab}/alias/app.db", "{lab}/storage/deep/app.db"),
+        ("{lab}/./storage//app.db", "{lab}/storage/app.db"),
+    ],
+)
+def test_canonical_path_resolves_parent_only(lab, raw, expected):
+    parent_alias(lab)
+    got = cli.canonical_path(raw.format(lab=lab))
+    assert got == Path(expected.format(lab=lab))
+
+
+def test_canonical_path_keeps_last_component_link(lab):
+    parent_alias(lab)
+    (lab / "link.db").symlink_to("storage/app.db")
+    assert cli.canonical_path(str(lab / "link.db")) == lab / "link.db"
+
+
+@pytest.mark.parametrize("raw", ["", ".", "..", "/d/.", "/d/..", "/d/", "a/b/.."])
+def test_bad_last_component_is_usage_error(raw):
+    with pytest.raises(SystemExit) as exc:
+        cli.parse_args(["--db", raw, "--config", "c.yml", "--", "true"])
+    assert exc.value.code == cli.EXIT_USAGE
+    with pytest.raises(SystemExit) as exc:
+        cli.parse_args(["--db", "/d/app.db", "--meta-path", raw, "--config", "c", "--", "x"])
+    assert exc.value.code == cli.EXIT_USAGE
+
+
+def test_parse_args_canonicalizes_db_and_meta(lab):
+    storage = parent_alias(lab)
+    args, _ = cli.parse_args(["--db", f"{lab}/alias/../app.db", "--config", "c", "--", "true"])
+    assert args.db == storage / "app.db"
+    assert args.meta_path == storage / ".app.db-litestream"
+
+
+def test_parent_symlink_dotdot_db_moves_only_the_intended_db(lab, fake, no_exec):
+    # 리뷰 run-12 재현: 별개의 lab/app.db 가 격리로 끌려갔다.
+    storage = parent_alias(lab)
+    make_db(storage / "app.db", 2)
+    write_meta(storage / "app.db")
+    make_db(lab / "app.db", 3)
+    write_meta(lab / "app.db")
+    unrelated = snapshot(lab, skip=("storage", "alias", "fake"))
+    fake.remote_txid(0x20)
+    args = boot_args(lab, fake, "--on-unknown", "restore")
+    args[args.index(str(lab / "app.db"))] = f"{lab}/alias/../app.db"
+    assert main_inproc(args, no_exec) == "exec"
+    assert snapshot(lab, skip=("storage", "alias", "fake")) == unrelated
+    assert count_rows(storage / "app.db") == 7  # 복원본
+    (final,) = [p for p in storage.iterdir() if ".stale-" in p.name]
+    assert count_rows(final / "app.db") == 2
+    assert (final / ".app.db-litestream").is_dir()
+
+
+def test_parent_symlink_dotdot_meta_moves_only_the_intended_meta(lab, fake, no_exec):
+    storage = parent_alias(lab)
+    db = lab / "app.db"
+    make_db(db, 2)
+    for where in (storage, lab):
+        (where / "custom-meta" / "ltx" / "0").mkdir(parents=True)
+        shutil.copy(LATEST_LTX, where / "custom-meta" / "ltx" / "0" / LATEST_LTX.name)
+    (lab / "custom-meta" / "keep").write_text("unrelated")
+    fake.remote_txid(0x20)
+    args = boot_args(
+        lab, fake, "--on-unknown", "restore", "--meta-path", f"{lab}/alias/../custom-meta"
+    )
+    assert main_inproc(args, no_exec) == "exec"
+    assert (lab / "custom-meta" / "keep").read_text() == "unrelated"
+    assert not (storage / "custom-meta").exists()
+    (final,) = stale_dirs(lab)
+    assert sorted(os.listdir(final)) == ["app.db", "custom-meta", "manifest.json"]
+
+
+def test_stable_parent_symlink_still_works(lab, fake, no_exec):
+    storage = parent_alias(lab)
+    db = lab / "alias" / "app.db"
+    make_db(db, 2)
+    write_meta(db)
+    fake.remote_txid(0x20)
+    args = boot_args(lab, fake, "--on-unknown", "restore")
+    args[args.index(str(lab / "app.db"))] = str(db)
+    assert main_inproc(args, no_exec) == "exec"
+    deep = storage / "deep"
+    assert count_rows(deep / "app.db") == 7
+    (final,) = [p for p in deep.iterdir() if ".stale-" in p.name]
+    assert count_rows(final / "app.db") == 2
+    assert (deep / "app.db.boot-state.json").exists()
+
+
 # --- 라운드 1: 격리 대상의 심볼릭 링크와 예약 이름 -----------------------------------------------
 
 

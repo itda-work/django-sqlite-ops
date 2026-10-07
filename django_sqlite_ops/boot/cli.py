@@ -82,6 +82,21 @@ def log(message: str) -> None:
 # --- 경로 --------------------------------------------------------------------------------
 
 
+def canonical_path(raw: str | os.PathLike[str]) -> Path:
+    """``--db``·``--meta-path`` 를 한 번 정한다. 부모 디렉터리만 ``realpath`` 로 해석한다.
+
+    ``os.path.abspath`` 처럼 ``..`` 를 문자열로 접지 않는다. ``alias/..`` 는 링크 뒤의 실제
+    부모이므로, 접으면 다른 파일을 가리킨다. 마지막 구성요소는 그대로 붙인다: 그것이 링크면
+    따라가지 않고 기존 정책대로 따로 검사한다. 마지막 구성요소가 ``.``·``..``·빈 문자열이면
+    ``ValueError``. 이미 정한 경로에 다시 불러도 같다.
+    """
+    text = os.fspath(raw)
+    name = os.path.basename(text)
+    if name in ("", ".", ".."):
+        raise ValueError(f"path must end with a file name: {text!r}")
+    return Path(os.path.realpath(os.path.dirname(text) or ".")) / name
+
+
 def lock_path(db: Path) -> Path:
     return db.with_name(db.name + ".boot.lock")
 
@@ -233,6 +248,7 @@ def check_quarantinable(db: Path, meta: Path) -> None:
     - 대상 이름이 서로 겹치거나 격리 디렉터리의 예약 이름(manifest)과 겹치면 거부한다.
     - rename 은 같은 파일시스템 안에서만 원자적이다. 다른 파일시스템이면 거부한다.
     """
+    db, meta = canonical_path(db), canonical_path(meta)
     names = [p.name for _, p in quarantine_roles(db, meta)]
     if len(set(names)) != len(names):
         raise _Exit(EXIT_REFUSE, f"cannot quarantine: duplicate target names {names}")
@@ -285,6 +301,7 @@ def quarantine(db: Path, meta: Path) -> Path | None:
     먼저 ``.partial`` 디렉터리와 manifest(대상 DB, 항목마다 역할·원래 경로·이름, 순서)를
     내구화한 뒤 옮긴다.
     """
+    db, meta = canonical_path(db), canonical_path(meta)
     check_quarantinable(db, meta)
     present = [(role, p) for role, p in quarantine_roles(db, meta) if os.path.lexists(p)]
     if not present:
@@ -301,10 +318,10 @@ def quarantine(db: Path, meta: Path) -> Path | None:
             continue
         break
     fsync_path(partial.parent)
-    entries = [(role, Path(os.path.abspath(p)), p.name) for role, p in present]
+    entries = [(role, p, p.name) for role, p in present]
     manifest = {
         "version": _MANIFEST_VERSION,
-        "db": os.path.abspath(db),
+        "db": str(db),
         "entries": [{"role": r, "src": str(src), "name": n} for r, src, n in entries],
     }
     _write_json_atomic(partial / _MANIFEST, manifest)
@@ -334,10 +351,10 @@ def _load_manifest(db: Path, meta: Path, partial: Path) -> list[tuple[str, Path,
         or type(data.get("entries")) is not list
     ):
         raise _refuse_resume(partial, "manifest schema mismatch")
-    if data["db"] != os.path.abspath(db):
+    if data["db"] != str(db):
         raise _refuse_resume(partial, f"manifest is for db {data['db']!r}, not {db}")
 
-    expected = {role: Path(os.path.abspath(p)) for role, p in quarantine_roles(db, meta)}
+    expected = dict(quarantine_roles(db, meta))
     order = list(expected)
     entries: list[tuple[str, Path, str]] = []
     for item in data["entries"]:
@@ -368,6 +385,7 @@ def resume_quarantine(db: Path, meta: Path) -> None:
 
     전체를 먼저 검증하고, 하나라도 어긋나면 아무것도 옮기지 않고 exit 2 다. 둘 이상이면 거부.
     """
+    db, meta = canonical_path(db), canonical_path(meta)
     pattern = _partial_re(db)
     try:
         found = sorted(n for n in os.listdir(db.parent) if pattern.fullmatch(n))
@@ -399,6 +417,15 @@ def resume_quarantine(db: Path, meta: Path) -> None:
     unknown = sorted(contents - {_MANIFEST} - {n for _, _, n in entries})
     if unknown:
         raise _refuse_resume(partial, f"unexpected files {unknown}")
+    # manifest 에 없는 역할의 파일이 어디에든 있으면 거부한다. 자동으로 보충하지 않는다.
+    # (예: WAL 항목이 빠진 manifest 로 DB 만 격리하면 DB 와 WAL 이 갈라진다.)
+    listed = {role for role, _, _ in entries}
+    for role, path in quarantine_roles(db, meta):
+        if role in listed:
+            continue
+        for where in (path, partial / path.name):
+            if os.path.lexists(where):
+                raise _refuse_resume(partial, f"{role} {where} exists but is not in the manifest")
     for role, src, name in entries:
         here, there = os.path.lexists(src), os.path.lexists(partial / name)
         if here == there:
@@ -548,7 +575,7 @@ def build_parser() -> argparse.ArgumentParser:
         epilog="exit codes: 2 refused, 3 integrity, 4 restore failed, 5 lock, 64 usage, "
         "127 exec failed",
     )
-    p.add_argument("--db", required=True, type=Path, help="SQLite database path")
+    p.add_argument("--db", required=True, help="SQLite database path")
     p.add_argument("--config", required=True, type=Path, help="litestream config path")
     p.add_argument(
         "--on-unknown",
@@ -566,7 +593,7 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="first deploy ever: start a new db on an empty replica; turn off afterwards (D-13)",
     )
-    p.add_argument("--meta-path", type=Path, help="litestream meta dir (default: .<db>-litestream)")
+    p.add_argument("--meta-path", help="litestream meta dir (default: .<db>-litestream)")
     p.add_argument("--litestream", default="litestream", help="litestream binary")
     p.add_argument("--ltx-timeout", type=_seconds, default=ls.DEFAULT_LTX_TIMEOUT)
     p.add_argument("--restore-timeout", type=_seconds, default=ls.DEFAULT_RESTORE_TIMEOUT)
@@ -583,8 +610,13 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     args = parser.parse_args(own)
     if not command:
         parser.error("missing command after '--'")
-    if args.meta_path is None:
-        args.meta_path = ls.default_meta_path(args.db)
+    # 잠금·사이드카·임시 복원·격리·설치·상태 파일이 모두 이 한 번 정한 경로를 쓴다.
+    try:
+        args.db = canonical_path(args.db)
+        meta = ls.default_meta_path(args.db) if args.meta_path is None else args.meta_path
+        args.meta_path = canonical_path(meta)
+    except ValueError as exc:
+        parser.error(str(exc))
     return args, command
 
 
