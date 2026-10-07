@@ -3,7 +3,7 @@
 - 상태: 설계 확정 전 단계(v1). 구현은 아직 없다.
 - 작성: Django전문가-아이스버그(itda-django), 2026-10-07
 - 근거: `docs/research/` 의 보고서 6편과 교차 리뷰 원문. 수치는 모두 그 보고서의 실측이다.
-- 이름 `django-sqlite-ops` 는 가칭이다. 공개 전에 바꿀 수 있다(→ `docs/DECISIONS.md` D-6).
+- 이름 `django-sqlite-ops` 는 가칭이다. PyPI 배포 전에 바꿀 수 있다(→ `docs/DECISIONS.md` D-6).
 
 ---
 
