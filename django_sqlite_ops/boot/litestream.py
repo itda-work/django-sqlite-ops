@@ -274,8 +274,9 @@ def default_meta_path(db_path: str | os.PathLike[str]) -> Path:
 def _read_ltx_range(path: Path) -> tuple[int, int] | None:
     """LTX 파일 헤더의 (min TXID, max TXID). 정규 파일·헤더 형식이 아니면 ``None``.
 
-    심볼릭 링크는 따라가지 않는다. Litestream 은 메타에 링크를 만들지 않으므로 링크가 있다는 것
-    자체가 예상 밖 상태다. FIFO·장치 파일에서 멈추지 않도록 열기 전후로 정규 파일인지 본다.
+    LTX 파일 자체가 심볼릭 링크이면 거부한다. Litestream 은 ``ltx/0`` 안에 파일 링크를 만들지
+    않으므로 예상 밖 상태다. 상위 디렉터리(메타 디렉터리·``ltx``·``ltx/0``)의 링크는 허용하고
+    따라간다(볼륨 연결 등). FIFO·장치 파일에서 멈추지 않도록 열기 전후로 정규 파일인지 본다.
     """
     try:
         if not stat.S_ISREG(os.lstat(path).st_mode):
@@ -314,10 +315,10 @@ def local_max_txid(
     L0 파일을 지우지 않으므로 업로드·압축·종료 뒤에도 남는다(db.go ``EnforceL0RetentionByTime``,
     실측).
 
-    고른 후보 **하나**를 검증한다. 정규 파일(링크 아님), 읽기 가능, 1 ≤ min ≤ max, LTX 헤더의
-    매직·flags·page size 가 유효하고 헤더의 min/max 가 이름과 같아야 한다. 하나라도 어긋나면
-    낮은 후보로 내려가지 않고 ``None`` 이다. 체크섬·페이지 전체 검증(Litestream ``DB.Pos()`` 의
-    ``Decoder.Verify()``)은 하지 않는다.
+    고른 후보 **하나**를 검증한다. 정규 파일(파일 자체가 링크면 거부, 상위 디렉터리 링크는
+    허용), 읽기 가능, 1 ≤ min ≤ max, LTX 헤더의 매직·flags·page size 가 유효하고 헤더의
+    min/max 가 이름과 같아야 한다. 하나라도 어긋나면 낮은 후보로 내려가지 않고 ``None`` 이다.
+    체크섬·페이지 전체 검증(Litestream ``DB.Pos()`` 의 ``Decoder.Verify()``)은 하지 않는다.
     """
     try:
         meta = Path(meta_path) if meta_path is not None else default_meta_path(db_path)
