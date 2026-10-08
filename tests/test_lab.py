@@ -206,7 +206,9 @@ def test_l6_d14_requarantine_layout():
     assert any("meta" in p for p in c.quarantine_problems(final, fp, expected_stales=2))
 
 
-def _real_health_timeline(observations: list[float], outage: float = 20):
+def _real_health_timeline(
+    observations: list[float], outage: float = 20, times: list[float] | None = None
+):
     """실제 ``health.alias_status`` 로 만든 단절 중 표본(1초 간격, 0.1초부터).
 
     ``observations`` 는 성공한 조회가 끝난 시각(단절 시작 = 0초)이다. 각 표본 시각에는 그때까지
@@ -217,8 +219,9 @@ def _real_health_timeline(observations: list[float], outage: float = 20):
     from django_sqlite_ops.wal import IN_SYNC, WalEvidence
 
     timeline = []
-    t = 0.1
-    while t < outage:
+    if times is None:
+        times = [0.1 + i for i in range(int(outage))]
+    for t in times:
         observed = max(o for o in observations if o <= t)
         sample = Sample(
             observed=observed,
@@ -228,8 +231,7 @@ def _real_health_timeline(observations: list[float], outage: float = 20):
             wal=WalEvidence(IN_SYNC, "in sync"),
         )
         r = alias_status(sample, t, refresh=2, grace=10)
-        timeline.append((round(t, 1), r["status"], r["code"], r["age"]))
-        t += 1.0
+        timeline.append((round(t, 4), r["status"], r["code"], r["age"]))
     return timeline
 
 
@@ -263,3 +265,20 @@ def test_l8a_returning_to_caught_up_during_outage_fails():
     timeline[12] = (timeline[12][0], "caught_up", "in_sync", 0.5)
     problems = c.full_outage_problems(timeline, refresh=2)
     assert any("left unknown" in p for p in problems), problems
+
+
+def test_l8a_rounded_age_at_threshold_passes():
+    """리뷰 2: 마지막 관측 6.0004초 뒤 실제 응답은 stale 인데 age 는 6.0 으로 반올림된다."""
+    c = _checks()
+    times = [0.1, 1.1, 2.1, 3.1, 4.1, 5.1, 6.0004] + [7.1 + i for i in range(13)]
+    timeline = _real_health_timeline([0.0], times=times)
+    assert timeline[6][1:] == ("unknown", "stale", 6.0)
+    assert c.full_outage_problems(timeline, refresh=2) == []
+
+
+def test_l8a_clearly_young_stale_fails():
+    c = _checks()
+    timeline = _real_health_timeline([0.0])
+    timeline[3] = (timeline[3][0], "unknown", "stale", 5.0)
+    problems = c.full_outage_problems(timeline, refresh=2)
+    assert any("age 5.0 < 6" in p for p in problems), problems

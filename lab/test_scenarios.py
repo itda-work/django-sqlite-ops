@@ -535,7 +535,8 @@ def test_L8a_health_full_s3_outage(stack, run_id, rec):
     """
     _l8(stack, run_id, rec, "l8a", "")
     # 마지막 관측의 age 가 REFRESH × 3 을 넘으면 stale 이다. 단절 직전에 끝난 조회가 있으면
-    # 전환이 그만큼 늦으므로 경과 시간 기준의 제한(_checks.full_outage_deadline)으로 본다.
+    # 전환이 그만큼 늦으므로 경과 시간 기준의 허용 시간으로 본다
+    # (_checks.full_outage_deadline — 보장 상한이 아니라 랩의 가정).
     rec["stale_deadline_s"] = full_outage_deadline(2)
     problems = full_outage_problems(rec["outage_timeline"], refresh=2)
     rec["problems"] = problems

@@ -18,6 +18,9 @@ MANIFEST = "manifest.json"
 STALE_PREFIX = f"{DB}.stale-"
 # health.py STALE_FACTOR: 마지막 관측이 REFRESH × 3 보다 오래되면 stale
 STALE_FACTOR = 3
+# 응답의 age 는 소수 셋째 자리로 반올림된다(health.py). 판정은 반올림 전 값으로 하므로
+# age 를 문턱과 비교할 때 반올림 오차만큼 허용한다(예: 6.0004초 → stale, 응답 age 6.0).
+AGE_ROUNDING = 0.0005
 
 
 def _is_target(rel: str) -> bool:
@@ -137,8 +140,13 @@ def quarantine_problems(
 def full_outage_deadline(refresh: float, sample_interval: float = 1.0) -> float:
     """단절 시작부터 ``unknown(stale)`` 이 보여야 하는 마지막 시각(초).
 
-    stale 문턱 ``REFRESH × 3`` + 단절 직전에 시작해 단절 직후 끝난 조회 하나(최대 REFRESH 만큼 관측
-    시각을 늦춘다) + 표본 간격 + 스케줄 여유 1초.
+    **랩의 허용 시간(가정)**이다.
+
+    stale 문턱 ``REFRESH × 3`` + 단절 직전에 시작해 단절 직후 끝난 조회 하나의 여유(REFRESH 로
+    가정) + 표본 간격 + 스케줄 여유 1초. health.py 는 조회 하나가 끝나는 시간을 제한하지 않고
+    (REFRESH 는 조회가 끝난 뒤 기다리는 간격이다) 관측 시각은 조회가 끝날 때 찍히므로, 이 값은
+    조회 시간에서 도출된 보장 상한이 아니다. 단절 직전 조회가 REFRESH 보다 오래 걸려 성공하면 이
+    제한을 넘길 수 있다(그때는 L8a 가 실패로 알린다).
     """
     return refresh * STALE_FACTOR + refresh + sample_interval + 1.0
 
@@ -151,6 +159,9 @@ def full_outage_problems(timeline: list, refresh: float, sample_interval: float 
     - 그 뒤 단절이 끝날 때까지 모든 표본이 그 상태를 유지한다.
     - 전환 전의 ``caught_up`` 은 결과의 age 가 stale 문턱 이하일 때만 정상이다.
     - ``stale`` 표본의 age 는 문턱을 넘는다.
+
+    age 비교는 응답의 반올림(``AGE_ROUNDING``)만큼 허용한다: ``caught_up`` 은 age ≤ 문턱 + 오차,
+    ``stale`` 은 age ≥ 문턱 − 오차.
     """
     problems = []
     limit = refresh * STALE_FACTOR
@@ -163,11 +174,11 @@ def full_outage_problems(timeline: list, refresh: float, sample_interval: float 
     if t_first > deadline:
         problems.append(f"became unknown at {t_first}s, later than {deadline}s")
     for t, s, _c, age in timeline[:first]:
-        if s == "caught_up" and (age is None or age > limit):
+        if s == "caught_up" and (age is None or age > limit + AGE_ROUNDING):
             problems.append(f"caught_up at {t}s with age {age} > {limit}")
     for t, s, c, age in timeline[first:]:
         if (s, c) not in down:
             problems.append(f"left unknown during the outage at {t}s: {s}/{c}")
-        if c == "stale" and (age is None or age <= limit):
-            problems.append(f"stale at {t}s with age {age} <= {limit}")
+        if c == "stale" and (age is None or age < limit - AGE_ROUNDING):
+            problems.append(f"stale at {t}s with age {age} < {limit}")
     return problems

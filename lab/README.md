@@ -67,7 +67,7 @@ P2 는 채널 레이어를 런타임에 쓰지 않는다(channels-nats 를 설�
 | L5 | S3 를 끊고 25건 → SIGKILL → S3 복구 → 재부팅 | `match`(`local_current`), 65건, 뒤이어 복제본 65건 |
 | L6 | L2 의 옛 볼륨 + `--on-unknown restore`. rename 마다 잠드는 훅(`lab_hooks/sitecustomize.py`)으로 k 번째 rename 직후 SIGKILL, 모든 k 에 대해 → 훅 없이 재실행 | kill 직전 훅 로그의 rename 수가 정확히 k. 재실행 성공·150건, `.partial` 없음. kill 전 템플릿의 DB·`-wal`·`-shm`·메타 하위 전부가 **같은 하나의** 격리 디렉터리에 같은 해시로 있고 그 밖에는 manifest 뿐, 템플릿 파일 내용이 그 밖 어디에도 없음. 설치 뒤 kill(D-14)이면 격리 디렉터리 2개, 두 번째는 manifest·복원본 DB(+사이드카)만 (`_checks.quarantine_problems`) |
 | L7 | 복제본의 모든 LTX 객체 가운데 64바이트를 뒤집음(filer API) | 새 컨테이너 exit 4 / 메타 삭제 볼륨 + `--on-unknown restore` exit 4, 로컬 파일 해시 무변경, 격리 없음 |
-| L8a | 쓰기를 계속하며 `s3` 20초 끔(업로드·헬스 조회 모두) | 경과 시간 기준: `REFRESH × 3` + 진행 중 조회 여유(`REFRESH`) + 표본 간격 + 1초 안에 `unknown`(`stale`/`remote_error`)로 바뀌고 단절이 끝날 때까지 유지. 전환 전 `caught_up` 은 age ≤ `REFRESH × 3`, `stale` 은 age > 그 값(`_checks.full_outage_problems`). 복구 뒤 `caught_up`, 쓰기 오류 0 |
+| L8a | 쓰기를 계속하며 `s3` 20초 끔(업로드·헬스 조회 모두) | 경과 시간 기준: 랩의 허용 시간(가정) `REFRESH × 3` + 진행 중 조회 여유(`REFRESH` 로 가정) + 표본 간격 + 1초 안에 `unknown`(`stale`/`remote_error`)로 바뀌고 단절이 끝날 때까지 유지. 전환 전 `caught_up` 은 age ≤ `REFRESH × 3`, `stale` 은 age > 그 값(응답 age 의 반올림 0.0005 허용, `_checks.full_outage_problems`). 복구 뒤 `caught_up`, 쓰기 오류 0 |
 | L8b | 헬스 조회는 `s3h` 로 두고 업로드 경로 `s3` 만 20초 끔 | `backlog`(`local_ahead`) → 복구 뒤 `caught_up` |
 
 L8 은 `LAB_HEALTH_REFRESH=2`, `LAB_HEALTH_GRACE=10` 으로 줄여 돈다(기본 15·60초면 20초 끊김이 grace 안에 든다).
