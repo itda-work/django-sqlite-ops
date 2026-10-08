@@ -259,11 +259,40 @@ django_sqlite_ops/
 - SQLite 버전 하한 검사: Django 가 이미 한다.
 
 ### 6-2. `sqlite_doctor` (명시 실행, 실제 연결)
-- 별칭마다 실제 `journal_mode`, `busy_timeout`, `synchronous`, SQLite 버전, 파일 크기, WAL 크기를 보고, §6-0 권장값과 다른 항목을 표시한다. `init_command` 가 실행된 뒤의 **실제 값**을 보므로 정적 체크와 결과가 다를 수 있다.
-- 마운트 종류를 본다. 네트워크 파일시스템(NFS·SMB)이면 경고한다. 판정할 수 없으면 `unknown` 으로 적는다.
-- Litestream 설정 파일을 읽고, 그 안의 DB 경로가 `DATABASES` 와 맞는지 대조한다.
-- 채널 레이어 백엔드와 그 의미론 요약을 출력한다(§8 표 참조).
-- 출력은 사람용 텍스트와 `--json` 두 가지다. 종료 코드는 0(문제 없음), 1(경고), 2(오류)다.
+로직은 `django_sqlite_ops/doctor.py`, 명령(`management/commands/sqlite_doctor.py`)은 옵션·출력·종료 코드만 맡는다. 옵션: `--database ALIAS`(반복), `--litestream-config PATH`, `--litestream BIN`, `--json`.
+
+- **연결하면 `init_command` 가 실행된다.** 그래서 진단이 상태를 바꿀 수 있다(`journal_mode=WAL` 은 지속된다, 교차 리뷰). 명시 실행 명령으로만 두고 도움말·README 에 적는다.
+- **DB 별칭**(sqlite3 엔진, 역할은 `checks._role()` — 단 `vfs=litestream` 이면 `mode=ro` 가 있어도 VFS 로 본다):
+  - DB 파일이 없으면 **연결하지 않고** `error`(연결하면 빈 DB 가 생긴다, §4-1). 정규 파일이 아니어도 `error`. VFS 별칭(확장 필요)과 역할 `unknown` 별칭은 연결하지 않고 `unknown`. 메모리 DB 는 연결하되 "메모리 DB" 로만 적는다.
+  - 파일 DB 는 연결 전에 파일·`-wal` 크기를 재고, 연결 뒤 실제 `transaction_mode`(Django 연결 속성), §6-0 표의 PRAGMA 전부, `foreign_keys`, `sqlite_version()` 을 읽는다. 표와 다르면 `warn`. 읽기 전용 별칭은 쓰기 권고(`transaction_mode`·`journal_mode`·`synchronous`)를 비교하지 않는다(§6-1 과 같은 원칙). 값 매핑(`synchronous` 0–3 → OFF/NORMAL/FULL/EXTRA)은 `doctor._SYNCHRONOUS` 한 곳에 둔다. 연결 실패는 `error` 한 줄.
+- **마운트**: DB 파일(없으면 존재하는 상위 디렉터리)의 실제 경로로 파일시스템 종류를 찾는다. Linux 는 `/proc/self/mountinfo` 의 가장 긴 마운트 지점(같으면 나중 줄), macOS 는 `statfs(2)`(ctypes), 그 밖의 POSIX 는 `mount` 출력. 네트워크 FS(nfs·nfs4·cifs·smb*·smbfs·afpfs·webdav·sshfs·9p·ceph·glusterfs·lustre 등)는 `warn`(https://www.sqlite.org/useovernet.html), 아는 로컬 FS(ext4·xfs·btrfs·zfs·apfs·overlay·tmpfs 등)는 `ok`, 그 밖은 `unknown`.
+- **Litestream 설정**(`--litestream-config` 가 있을 때만. 없으면 `ok` "skipped"): `litestream databases -config C -json` 으로 DB 목록을 읽는다(YAML 파서를 넣지 않는다). 버전 검사·타임아웃은 boot 헬퍼(`boot/litestream.py` 의 `config_databases`)를 쓴다. 0.5.17 은 경로를 절대 경로로 내보내며 `..` 는 문자열로 접고 링크는 남긴다. 상대 경로와 `dir:` 항목은 Litestream 작업 디렉터리 기준이 되므로(`dir:` 항목은 작업 디렉터리 자체로 나온다, 실측) 새 임시 디렉터리에서 실행해 그 아래로 풀린 항목을 `warn` 으로 골라낸다.
+  - 대조는 실제 경로(`realpath`)로 한다(D-15). 설정 경로가 실제 경로가 아니면 `warn` — boot 가 거부할 구성이다.
+  - 쓰기 별칭인데 설정에 없음 → `warn`(복제되지 않음). 설정에 있는데 `DATABASES` 에 없음 → `ok`(정보). 실행·파싱 실패(설정 파일 없음, 깨진 YAML, 바이너리 없음, 검증 안 된 버전) → `error`.
+- **채널 레이어**: `settings.CHANNEL_LAYERS` 를 읽기만 한다(`channels` 를 import 하지 않는다). 백엔드 경로로 종류를 알아보고 §8 표의 의미론을 한 줄로 요약한다. InMemory 는 프로필이 `single-server-multiproc` 이면 `warn`(프로필이 다중 프로세스를 명시하므로). channels_redis pub/sub 은 의미론 미측정이라 `unknown`, 모르는 백엔드도 `unknown`. channels-lite 는 §8 규칙대로 채널 DB 가 앱 DB(`default` 별칭이거나 다른 별칭과 같은 실제 파일)면 `warn`, Litestream 설정이 있고 채널 DB 가 복제 대상이면 `warn`. channels-lite aio 결함 패치(§9)는 #8 에서 다룬다.
+- **수준**: `ok` · `warn` · `error` · `unknown`. 판정할 수 없으면 숨기지 않고 `unknown` 으로 적는다.
+- **종료 코드**: 0 문제 없음 · 1 경고 또는 `unknown` · 2 오류. 명령은 0 이 아니면 `SystemExit(code)` 로 끝난다.
+- **사람용 출력**: 섹션(`settings`·`database`·`mount`·`litestream`·`channels`)별 표, 줄 앞에 수준. 마지막 줄 `summary: N warning(s), N error(s), N unknown -> exit N`.
+- **`--json` 스키마(`version: 1`)**:
+  ```json
+  {
+    "version": 1,
+    "items": [
+      {
+        "section": "settings | database | mount | litestream | channels",
+        "alias": "DB 별칭·채널 레이어 별칭, 또는 null",
+        "key": "profile | role | file | wal | connect | alias | transaction_mode | journal_mode | synchronous | busy_timeout | foreign_keys | sqlite_version | filesystem | config | config_path | replicated | extra | backend | database",
+        "level": "ok | warn | error | unknown",
+        "value": "실제 값(문자열·정수) 또는 null",
+        "expected": "권장값·기대값 또는 null",
+        "message": "사람용 한 줄"
+      }
+    ],
+    "summary": {"ok": 0, "warn": 0, "error": 0, "unknown": 0},
+    "exit_code": 0
+  }
+  ```
+  `key` 목록은 늘어날 수 있다. 소비자는 모르는 `key` 를 무시한다. 필드를 빼거나 뜻을 바꾸면 `version` 을 올린다.
 
 ## 7. 헬스
 

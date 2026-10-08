@@ -9,7 +9,7 @@ Django 에서 SQLite 를 운영 DB 로 안전하게 쓰게 하는 **운영 도�
 | 권장 설정 `sqlite_database()` | 구현됨 | [#1](https://github.com/itda-work/django-sqlite-ops/issues/1) |
 | boot CLI (복원 판정·복원·잠금) | 구현됨 | [#2](https://github.com/itda-work/django-sqlite-ops/issues/2) · [#3](https://github.com/itda-work/django-sqlite-ops/issues/3) · [#4](https://github.com/itda-work/django-sqlite-ops/issues/4) |
 | 시스템 체크 | 구현됨 | [#5](https://github.com/itda-work/django-sqlite-ops/issues/5) |
-| `sqlite_doctor` 관리 명령 | 예정 | [#6](https://github.com/itda-work/django-sqlite-ops/issues/6) |
+| `sqlite_doctor` 관리 명령 | 구현됨 | [#6](https://github.com/itda-work/django-sqlite-ops/issues/6) |
 | 복제 헬스 | 예정 | [#7](https://github.com/itda-work/django-sqlite-ops/issues/7) |
 | 배포 프로필 문서 | 예정 | [#9](https://github.com/itda-work/django-sqlite-ops/issues/9) |
 | channels-lite 패치 | 예정 | [#8](https://github.com/itda-work/django-sqlite-ops/issues/8) |
@@ -173,7 +173,7 @@ DATABASES = {
 
 #### 직접 쓴 설정과 dj-lite
 
-`sqlite_database()` 를 쓰지 않아도 된다. 직접 쓴 dict 나 dj-lite 가 만든 설정도 [시스템 체크](#시스템-체크)가 같은 권장값 표를 기준으로 검사한다. `sqlite_doctor` 도 같은 표를 쓸 예정이다([#6](https://github.com/itda-work/django-sqlite-ops/issues/6)).
+`sqlite_database()` 를 쓰지 않아도 된다. 직접 쓴 dict 나 dj-lite 가 만든 설정도 [시스템 체크](#시스템-체크)가 같은 권장값 표를 기준으로 검사한다. [`sqlite_doctor`](#sqlite_doctor) 도 같은 표로 실제 값을 비교한다.
 
 ### boot CLI
 
@@ -298,7 +298,7 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 
 ### 시스템 체크
 
-`INSTALLED_APPS` 에 `"django_sqlite_ops"` 를 넣으면 `manage.py check` 가 `DATABASES` 의 SQLite 별칭(`ENGINE` 이 `django.db.backends.sqlite3`)을 [권장값](#기본값)과 비교한다. **설정만 읽고 DB 를 열지 않는다.** 그래서 DB 파일이 없어도, 빌드 단계에서도 돌릴 수 있다. 실제로 적용된 PRAGMA 값은 `sqlite_doctor`(예정)가 본다.
+`INSTALLED_APPS` 에 `"django_sqlite_ops"` 를 넣으면 `manage.py check` 가 `DATABASES` 의 SQLite 별칭(`ENGINE` 이 `django.db.backends.sqlite3`)을 [권장값](#기본값)과 비교한다. **설정만 읽고 DB 를 열지 않는다.** 그래서 DB 파일이 없어도, 빌드 단계에서도 돌릴 수 있다. 실제로 적용된 PRAGMA 값은 [`sqlite_doctor`](#sqlite_doctor)가 본다.
 
 ```bash
 python manage.py check --deploy   # W001·W002·W004 는 --deploy 일 때만 나온다
@@ -344,7 +344,69 @@ DATABASES = {
 
 ### `sqlite_doctor`
 
-예정. DB 에 실제로 연결해 PRAGMA·마운트·Litestream 설정을 진단한다. [#6](https://github.com/itda-work/django-sqlite-ops/issues/6)
+`manage.py check` 는 설정 문자열만 본다. `sqlite_doctor` 는 **DB 에 실제로 연결해** `init_command` 가 실행된 뒤의 값을 보고, 파일시스템 종류·Litestream 설정·채널 레이어까지 한 번에 진단한다. 배포 직후, 설정을 바꾼 뒤, 장애를 조사할 때 명시적으로 실행한다.
+
+```bash
+python manage.py sqlite_doctor
+python manage.py sqlite_doctor --database default --litestream-config /etc/litestream.yml
+python manage.py sqlite_doctor --json          # 모니터링·스크립트용
+```
+
+| 옵션 | 뜻 |
+|---|---|
+| `--database ALIAS` | 볼 별칭(여러 번 줄 수 있다). 없으면 sqlite3 엔진 별칭 전부 |
+| `--litestream-config PATH` | Litestream 설정 파일. 주면 그 DB 목록을 `DATABASES` 와 대조한다. 없으면 이 섹션은 건너뛴다 |
+| `--litestream BIN` | Litestream 바이너리(기본 PATH 의 `litestream`, 0.5.17 만 받는다) |
+| `--json` | JSON 출력(스키마 `version: 1`, [DESIGN §6-2](docs/DESIGN.md)) |
+
+> **주의 — 연결하면 `init_command` 가 실행된다.** Django 는 연결할 때마다 `OPTIONS["init_command"]` 를 실행하므로 진단이 DB 를 바꿀 수 있다. 예를 들어 `PRAGMA journal_mode=WAL` 은 파일에 남고 `-wal`·`-shm` 파일이 생긴다. 앱이 연결할 때와 같은 일이 일어날 뿐이지만, 운영 DB 에서 돌린다는 점을 알고 실행한다.
+>
+> **DB 파일이 없으면 연결하지 않는다.** SQLite 는 없는 파일에 연결하면 빈 DB 를 만든다. 그러면 boot 가 다음 부팅에서 복원 대신 그 빈 DB 를 판정하게 된다. 그래서 파일이 없으면 오류로 적고 연결하지 않는다.
+
+무엇을 보나:
+
+- **database** — 별칭마다 역할(쓰기·읽기 전용·메모리·VFS), 파일 크기, `-wal` 크기(연결 전), 실제 `transaction_mode`·`journal_mode`·`synchronous`·`busy_timeout`·`foreign_keys`·SQLite 버전. [권장값](#기본값)과 다르면 `warn`. 읽기 전용 별칭은 쓰기 권고(`transaction_mode`·`journal_mode`·`synchronous`)를 비교하지 않는다. 메모리 DB 는 "메모리 DB" 로만 적는다. Litestream VFS 별칭과 역할을 판정할 수 없는 별칭(W004)은 연결하지 않고 `unknown`. 연결 실패는 `error`.
+- **mount** — DB 파일(없으면 존재하는 상위 디렉터리)의 파일시스템 종류. NFS·SMB/CIFS·AFP·sshfs 같은 네트워크 파일시스템이면 `warn` 이다. SQLite 의 파일 잠금을 믿을 수 없고 WAL 이 동작하지 않는다([SQLite 문서](https://www.sqlite.org/useovernet.html)). 로컬로 확인되지 않은 종류(알 수 없는 FUSE 등)는 `unknown`.
+- **litestream** — `litestream databases -config PATH -json` 으로 설정의 DB 목록을 읽어 실제 경로로 대조한다. 쓰기 별칭이 설정에 없으면 `warn`(복제되지 않음). 설정 경로가 실제 경로가 아니면(부모에 링크) `warn` — boot 가 거부하는 구성이다(D-15). 상대 경로·`dir:` 항목은 Litestream 의 작업 디렉터리 기준으로 풀려 대조할 수 없으므로 `warn`. 설정에만 있는 DB 는 `ok`(정보). 설정 파일 없음·깨진 YAML·바이너리 없음은 `error`.
+- **channels** — `CHANNEL_LAYERS` 를 읽기만 한다(`channels` 를 import 하지 않는다). 백엔드별 의미론을 한 줄로 요약한다. `InMemoryChannelLayer` 는 프로필이 `single-server-multiproc` 이면 `warn`. channels-lite 는 채널 DB 가 앱 DB 와 같은 파일이면 `warn`, Litestream 설정의 복제 대상이면 `warn`. 모르는 백엔드(`channels_redis` pub/sub 포함)는 `unknown`.
+
+출력 예:
+
+```text
+[settings]
+  OK      -  profile  single-server
+
+[database]
+  OK      default  role              write
+  OK      default  file              8192  — bytes
+  OK      default  wal               -  — no -wal file
+  OK      default  transaction_mode  IMMEDIATE (expected IMMEDIATE)
+  OK      default  journal_mode      WAL (expected WAL)
+  WARN    default  synchronous       FULL (expected NORMAL)  — differs from the recommended value (DESIGN §6-0)
+  OK      default  busy_timeout      5000 (expected 5000)
+  OK      default  foreign_keys      1
+  OK      default  sqlite_version    3.53.1
+
+[mount]
+  OK      default  filesystem  ext4  — local filesystem
+
+[litestream]
+  OK      -        config      /etc/litestream.yml  — 1 database(s)
+  OK      default  replicated  /srv/app/app.sqlite3  — in the config
+
+[channels]
+  OK      default  backend  channels.layers.InMemoryChannelLayer  — in-memory: one process only; messages do not reach other processes or workers
+
+summary: 1 warning(s), 0 error(s), 0 unknown -> exit 1
+```
+
+| 종료 코드 | 뜻 |
+|---|---|
+| 0 | 문제 없음 |
+| 1 | 경고 또는 판정할 수 없는 항목(`unknown`)이 있음 |
+| 2 | 오류가 있음(DB 파일 없음, 연결 실패, Litestream 설정을 읽지 못함 등) |
+
+`call_command("sqlite_doctor")` 로 부르면 종료 코드가 0 이 아닐 때 `SystemExit` 가 난다.
 
 ### 복제 헬스
 
