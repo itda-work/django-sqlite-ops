@@ -8,7 +8,7 @@ Django 에서 SQLite 를 운영 DB 로 안전하게 쓰게 하는 **운영 도�
 |---|---|---|
 | 권장 설정 `sqlite_database()` | 구현됨 | [#1](https://github.com/itda-work/django-sqlite-ops/issues/1) |
 | boot CLI (복원 판정·복원·잠금) | 구현됨 | [#2](https://github.com/itda-work/django-sqlite-ops/issues/2) · [#3](https://github.com/itda-work/django-sqlite-ops/issues/3) · [#4](https://github.com/itda-work/django-sqlite-ops/issues/4) |
-| 시스템 체크 | 예정 | [#5](https://github.com/itda-work/django-sqlite-ops/issues/5) |
+| 시스템 체크 | 구현됨 | [#5](https://github.com/itda-work/django-sqlite-ops/issues/5) |
 | `sqlite_doctor` 관리 명령 | 예정 | [#6](https://github.com/itda-work/django-sqlite-ops/issues/6) |
 | 복제 헬스 | 예정 | [#7](https://github.com/itda-work/django-sqlite-ops/issues/7) |
 | 배포 프로필 문서 | 예정 | [#9](https://github.com/itda-work/django-sqlite-ops/issues/9) |
@@ -26,7 +26,7 @@ uv add git+https://github.com/itda-work/django-sqlite-ops
 pip install git+https://github.com/itda-work/django-sqlite-ops
 ```
 
-`INSTALLED_APPS` 에 넣을 것은 아직 없다. 권장 설정은 `settings.py` 에서 함수 하나만 부른다.
+`INSTALLED_APPS` 에 `"django_sqlite_ops"` 를 넣는다. 그래야 `manage.py check` 가 [시스템 체크](#시스템-체크)를 돈다. 권장 설정은 `settings.py` 에서 함수 하나만 부른다.
 
 ## 빠른 시작
 
@@ -37,6 +37,11 @@ from pathlib import Path
 from django_sqlite_ops.database import sqlite_database
 
 BASE_DIR = Path(__file__).resolve().parent.parent
+
+INSTALLED_APPS = [
+    # ...
+    "django_sqlite_ops",
+]
 
 DATABASES = {
     "default": sqlite_database(BASE_DIR / "app.sqlite3"),
@@ -168,7 +173,7 @@ DATABASES = {
 
 #### 직접 쓴 설정과 dj-lite
 
-`sqlite_database()` 를 쓰지 않아도 된다. 직접 쓴 dict 나 dj-lite 가 만든 설정도, 나중에 들어올 시스템 체크와 `sqlite_doctor` 가 같은 권장값 표를 기준으로 검사한다(예정, [#5](https://github.com/itda-work/django-sqlite-ops/issues/5) · [#6](https://github.com/itda-work/django-sqlite-ops/issues/6)).
+`sqlite_database()` 를 쓰지 않아도 된다. 직접 쓴 dict 나 dj-lite 가 만든 설정도 [시스템 체크](#시스템-체크)가 같은 권장값 표를 기준으로 검사한다. `sqlite_doctor` 도 같은 표를 쓸 예정이다([#6](https://github.com/itda-work/django-sqlite-ops/issues/6)).
 
 ### boot CLI
 
@@ -293,7 +298,49 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 
 ### 시스템 체크
 
-예정. `manage.py check` 에서 DB 를 열지 않고 설정만 권장값과 비교한다. [#5](https://github.com/itda-work/django-sqlite-ops/issues/5)
+`INSTALLED_APPS` 에 `"django_sqlite_ops"` 를 넣으면 `manage.py check` 가 `DATABASES` 의 SQLite 별칭(`ENGINE` 이 `django.db.backends.sqlite3`)을 [권장값](#기본값)과 비교한다. **설정만 읽고 DB 를 열지 않는다.** 그래서 DB 파일이 없어도, 빌드 단계에서도 돌릴 수 있다. 실제로 적용된 PRAGMA 값은 `sqlite_doctor`(예정)가 본다.
+
+```bash
+python manage.py check --deploy   # W001·W002·W004 는 --deploy 일 때만 나온다
+```
+
+| ID | 조건 | 언제 | 고치는 법 |
+|---|---|---|---|
+| `sqlite_ops.E001` | `SQLITE_OPS` 가 dict 가 아니거나 `PROFILE` 이 알 수 없는 이름 | 항상 | `PROFILE` 을 `"single-server"`·`"single-server-multiproc"` 중 하나로. 이 오류가 있으면 다른 체크는 돌지 않는다 |
+| `sqlite_ops.W001` | `OPTIONS["transaction_mode"]` 가 `IMMEDIATE` 가 아님(없음 포함, 대소문자 무시) | `--deploy` | `sqlite_database()` 를 쓰거나 `"transaction_mode": "IMMEDIATE"` 를 넣는다 |
+| `sqlite_ops.W002` | `OPTIONS["init_command"]` 에서 `journal_mode` 가 `WAL` 로 설정되지 않음, 또는 `journal_mode` 를 언급하는 문장의 형식을 판정할 수 없음 | `--deploy` | `sqlite_database()` 를 쓰거나 `init_command` 에 `PRAGMA journal_mode=WAL` 을 넣는다 |
+| `sqlite_ops.W003` | 이름이 Litestream VFS(`vfs=litestream` 이 든 `file:` URI)인 별칭의 `CONN_MAX_AGE` 가 `None` 이 아님, `ASGI_APPLICATION` 미설정(WSGI) | 항상 | 그 별칭에 `"CONN_MAX_AGE": None`. WSGI 실측에서 요청당 1,008ms → 1.7ms |
+| `sqlite_ops.W004` | `NAME` 의 URI 로 별칭 역할(쓰기·읽기 전용·메모리·VFS)을 판정할 수 없음. 이때 W001·W002 는 내지 않는다 | `--deploy` | `%00` 을 빼고, URI 쿼리 키 `mode`·`immutable`·`vfs` 를 한 번씩, 표준 표기(`mode=ro\|rw\|rwc\|memory`, `immutable=1\|0`)로 쓴다 |
+
+- 기준값은 `sqlite_database()` 와 같은 권장값 표에서 읽는다. 프로필은 `SQLITE_OPS["PROFILE"]` 이고 없으면 `"single-server"` 다.
+- `sqlite_database()` 로 만든 설정은 경고가 없다(W003 은 VFS 별칭에 `CONN_MAX_AGE` 를 따로 줘야 한다).
+- W002 는 Django 처럼 `init_command` 를 `;` 로 나눈 각 문장을 본다. SQL 주석(`-- …`, `/* … */`)은 지우고 본다. `PRAGMA journal_mode = wal`, `PRAGMA main.journal_mode=WAL`, `PRAGMA "journal_mode"=WAL`, `PRAGMA journal_mode('wal')` 처럼 대소문자·공백·인용 식별자·`main.` 접두가 달라도 인정하고, 여러 번 설정했으면 마지막 값을 본다. `temp.` 같은 다른 스키마는 이 DB 의 모드를 바꾸지 않으므로 세지 않는다.
+- 정적 체크는 SQL 파서가 아니다. `journal_mode` 를 언급하는데 위 형식이 아닌 문장(`SELECT … pragma_journal_mode`, 알 수 없는 값 등)이 있으면 **판정할 수 없다는 W002** 를 낸다. 메시지에 그 문장이 나온다. `PRAGMA journal_mode=WAL` 형식으로 고쳐 쓴다.
+- 별칭의 역할은 `NAME` 으로 판별한다. `NAME` 이 `Path` 면 문자열로 바꿔 본다. `file:` URI 는 SQLite 처럼 첫 `?`·`#` 로 파일명과 쿼리를 나눈 **뒤** 퍼센트 디코딩한다(`file:%3Amemory%3A` 는 메모리, `…/q%3Fmode%3Dro.sqlite3` 는 파일명이 `q?mode=ro.sqlite3` 인 쓰기 DB).
+  - 메모리 DB — `:memory:`, 파일명이 정확히 `:memory:` 인 URI(`file::memory:`, `file::memory:?cache=shared`), `mode=memory`: WAL 이 의미 없어 W002 를 건너뛴다. `file::memory:backup.sqlite3` 는 실제 파일이라 검사한다.
+  - 읽기 전용 — `mode=ro`, `immutable` 참값(`1`·`yes`·`true`·`on`, 대소문자 무시): W001·W002 를 건너뛴다. 읽기 전용 연결에 `PRAGMA journal_mode=WAL` 을 넣으면 `attempt to write a readonly database` 로 연결이 깨지거나(`mode=ro`) 아무 효과가 없다(`immutable`). `immutable` 거짓값(`0`·`no`·`false`·`off`)은 쓰기 DB 다.
+  - Litestream VFS(`vfs=litestream`): W001·W002 를 건너뛴다. W003 은 그대로 본다.
+  - **판정할 수 없음 → W004** — `mode`·`immutable`·`vfs` 가 두 번 이상 나오거나(`mode=rwc&mode=ro`), `mode` 가 `ro`·`rw`·`rwc`·`memory` 가 아니거나(`mode=RO`, `mode=ro%00x`), `immutable` 이 위 불리언 표기가 아닐 때(`immutable=2`), 디코딩한 파일명이나 쿼리 키·값에 NUL(`%00`)이 있을 때(`mode%00x=ro` — SQLite 는 NUL 앞까지만 읽어 역할 키가 숨는다. URI 가 아닌 일반 경로의 `%00` 은 글자 그대로라 해당 없다). 이때는 W001·W002 를 내지 않는다. SQLite 는 중복 키를 순서에 따라 다르게 해석해서(`mode=rwc&mode=ro` 는 읽기 전용, `mode=ro&mode=rwc` 는 연결 오류) 쓰기 권고를 따르면 연결이 깨질 수 있기 때문이다. W004 는 쓰기 설정을 넣어도 사라지지 않는다. 쿼리 키를 한 번씩, 표준 표기로 고쳐 쓴다.
+- W003 은 ASGI 에서는 내지 않는다. ASGI 의 영속 연결은 아직 재지 않았고, Django 는 async 에서 영속 연결을 끄라고 권한다.
+- 경고를 끄려면 Django 표준 `SILENCED_SYSTEM_CHECKS` 를 쓴다. 이 앱의 체크만 돌리려면 `check --tag sqlite_ops`.
+
+```python
+# settings.py — 직접 쓴 설정도 같은 기준으로 검사된다
+INSTALLED_APPS = ["django_sqlite_ops"]
+
+SQLITE_OPS = {"PROFILE": "single-server-multiproc"}
+
+DATABASES = {
+    "default": {
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": "/srv/app/app.sqlite3",
+        "OPTIONS": {
+            "transaction_mode": "IMMEDIATE",
+            "init_command": "PRAGMA journal_mode=WAL;PRAGMA busy_timeout=5000",
+        },
+    },
+}
+```
 
 ### `sqlite_doctor`
 
@@ -316,6 +363,7 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 - **`options={"timeout": ...}` 을 줬는데 대기 시간이 그대로다.** `busy_timeout`(밀리초)이 `timeout`(초)보다 우선한다. 위 [`timeout` 과 `busy_timeout`](#timeout-과-busy_timeout) 을 본다.
 - **DB 파일 옆에 `-wal`, `-shm` 파일이 생긴다.** WAL 모드의 정상 동작이다. 연결이 열려 있는 동안 커밋된 내용 일부가 `-wal` 에만 있을 수 있으므로, DB 파일을 복사·백업할 때 `.sqlite3` 파일만 따로 옮기지 않는다.
 - **`ValueError: ... use pragmas={...} instead`** — `options` 에 `init_command` 를 넣었다. PRAGMA 는 `pragmas` 로 준다.
+- **`manage.py check` 에 `sqlite_ops.*` 가 안 나온다.** `INSTALLED_APPS` 에 `"django_sqlite_ops"` 가 있는지, W001·W002 라면 `--deploy` 를 붙였는지 본다.
 
 설계서: [`docs/DESIGN.md`](docs/DESIGN.md) · 결정: [`docs/DECISIONS.md`](docs/DECISIONS.md) · 근거: [`docs/research/`](docs/research/)
 

@@ -73,7 +73,12 @@ print(json.dumps(result))
 
 
 @pytest.mark.parametrize(
-    "index", [i for i, block in enumerate(PYTHON_BLOCKS) if "DATABASES = {" in block]
+    "index",
+    [
+        i
+        for i, block in enumerate(PYTHON_BLOCKS)
+        if "DATABASES = {" in block and "SQLITE_OPS" not in block
+    ],
 )
 def test_readme_databases_example_connects(index, tmp_path):
     namespace = {"__file__": str(_settings_file(tmp_path)), "__name__": "readme_example"}
@@ -92,6 +97,55 @@ def test_readme_databases_example_connects(index, tmp_path):
     for alias, (mode, busy, sidecars) in json.loads(result.stdout).items():
         expected_busy = 10000 if alias == "events" else 5000
         assert (mode, busy, sidecars) == ("wal", expected_busy, [True, True]), alias
+
+
+CHECK_SCRIPT = """
+import json
+import sys
+
+import django
+from django.conf import settings
+
+config = json.loads(sys.argv[1])
+settings.configure(USE_TZ=True, **config)
+django.setup()
+
+from django.core.checks import run_checks
+
+ids = [m.id for m in run_checks(include_deployment_checks=True) if m.id.startswith("sqlite_ops.")]
+print(json.dumps(ids))
+"""
+
+CHECK_BLOCKS = [i for i, block in enumerate(PYTHON_BLOCKS) if "SQLITE_OPS" in block]
+
+
+def test_readme_has_check_example():
+    assert CHECK_BLOCKS
+
+
+@pytest.mark.parametrize("index", CHECK_BLOCKS)
+def test_readme_check_example_has_no_warnings(index, tmp_path):
+    # 시스템 체크 절의 settings 예는 check --deploy 에서 sqlite_ops 경고가 없어야 한다
+    namespace = {"__file__": str(_settings_file(tmp_path)), "__name__": "readme_example"}
+    exec(PYTHON_BLOCKS[index], namespace)
+    config = {key: namespace[key] for key in ("INSTALLED_APPS", "SQLITE_OPS", "DATABASES")}
+    assert "django_sqlite_ops" in config["INSTALLED_APPS"]
+    result = subprocess.run(
+        [sys.executable, "-c", CHECK_SCRIPT, json.dumps(config)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert json.loads(result.stdout) == []
+
+
+def test_readme_check_ids_match_code():
+    section = README.split("### 시스템 체크", 1)[1].split("\n### ", 1)[0]
+    shown = set(re.findall(r"^\| `(sqlite_ops\.[EW]\d{3})` \|", section, flags=re.M))
+    source = (ROOT / "django_sqlite_ops" / "checks.py").read_text(encoding="utf-8")
+    assert shown == set(re.findall(r'id="(sqlite_ops\.[EW]\d{3})"', source))
 
 
 def test_readme_default_table_matches_code():
