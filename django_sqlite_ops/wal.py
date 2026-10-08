@@ -165,6 +165,27 @@ def _first_commit_after(
             return offset
 
 
+def _snapshot(fd: int) -> tuple[int, int, int, bytes]:
+    """처음 연 WAL 의 (st_dev, st_ino, 크기, 헤더 32바이트)."""
+    st = os.fstat(fd)
+    return st.st_dev, st.st_ino, st.st_size, _pread(fd, WAL_HEADER_SIZE, 0)
+
+
+def _unchanged(fd: int, path: str, snap: tuple[int, int, int, bytes]) -> bool:
+    """읽는 동안 WAL 이 바뀌지 않았는가: 같은 경로가 같은 파일(dev, ino)이고, 크기와 헤더
+    (salt·체크섬 포함 32바이트)가 처음과 같다. 확인할 수 없으면 바뀐 것으로 본다."""
+    try:
+        st = os.fstat(fd)
+        at_path = os.lstat(path)
+        return (
+            (st.st_dev, st.st_ino, st.st_size) == snap[:3]
+            and (at_path.st_dev, at_path.st_ino) == snap[:2]
+            and _pread(fd, WAL_HEADER_SIZE, 0) == snap[3]
+        )
+    except (OSError, ValueError):
+        return False
+
+
 def compare(wal_path: str, ltx: LtxWalRange | None, *, limit: int = SCAN_LIMIT) -> WalEvidence:
     """현재 WAL 에 최신 L0 가 담지 않은 커밋이 있는가.
 
@@ -175,65 +196,92 @@ def compare(wal_path: str, ltx: LtxWalRange | None, *, limit: int = SCAN_LIMIT) 
       Litestream 이 관측했는지 알 수 없다).
     - WAL 이 없거나 헤더를 읽을 수 없음, L0 에 WAL 정보가 없음, page size 불일치, L0 끝이
       프레임 경계가 아니거나 WAL 보다 김, 그 직전 프레임의 salt 가 다름 → NO_EVIDENCE.
+
+    잠금 없이 읽으므로 읽는 사이에 체크포인트(TRUNCATE·RESTART)나 쓰기가 끼어들 수 있다.
+    Litestream 은 체크포인트를 막는 읽기 트랜잭션을 쥐고 읽지만 헬스는 DB 연결을 열지 않는다.
+    예: L0 끝 직전 프레임을 읽은 직후 TRUNCATE 가 WAL 을 0바이트로 만들면 꼬리 스캔은 EOF 를
+    보고 이미 있던 미복제 커밋을 "없음"으로 읽는다(review-3 재현). 그래서 PENDING 이 아닌 결과를
+    돌려주기 전에 처음 연 WAL 의 (dev, ino)·크기·헤더를 다시 확인하고, 바뀌었으면 한 번만 다시
+    읽는다. 다시 읽어도 바뀌면 NO_EVIDENCE("the -wal changed during read"). PENDING 은 L0 뒤의
+    유효한 커밋 프레임을 이미 읽었다는 근거이므로 그대로 돌려준다.
     """
     if ltx is None:
         return WalEvidence(NO_EVIDENCE, "the latest local L0 has no WAL position")
+    for _attempt in range(2):
+        result, stable = _compare_once(wal_path, ltx, limit)
+        if stable:
+            return result
+    return WalEvidence(NO_EVIDENCE, "the -wal changed during read", ltx.end)
+
+
+def _compare_once(wal_path: str, ltx: LtxWalRange, limit: int) -> tuple[WalEvidence, bool]:
+    """한 번 읽는다. ``(결과, 믿을 수 있는가)``.
+
+    PENDING 이거나 읽는 동안 WAL 이 그대로였으면 참이다.
+    """
     fd = _open(wal_path)
     if fd is None:
-        return WalEvidence(NO_EVIDENCE, "no readable -wal file", ltx.end)
+        return WalEvidence(NO_EVIDENCE, "no readable -wal file", ltx.end), True
     try:
-        header = _parse_header(_pread(fd, WAL_HEADER_SIZE, 0))
-        if header is None:
-            return WalEvidence(NO_EVIDENCE, "the -wal header is empty or not valid", ltx.end)
-        if header.page_size != ltx.page_size:
-            return WalEvidence(NO_EVIDENCE, "the -wal page size differs from the L0", ltx.end)
-        frame = FRAME_HEADER_SIZE + header.page_size
-        same = (header.salt1, header.salt2) == (ltx.salt1, ltx.salt2)
-        if not same:
-            end = _first_commit_after(fd, header, WAL_HEADER_SIZE, header.checksum, limit)
-            if end is False:
-                return WalEvidence(NO_EVIDENCE, "the -wal scan limit was reached", ltx.end)
-            if end is None:
-                return WalEvidence(
-                    NO_EVIDENCE,
-                    "the -wal restarted after the latest L0 and has no commit yet",
-                    ltx.end,
-                    salt_match=False,
-                )
-            return WalEvidence(
-                PENDING,
-                "the -wal restarted after the latest L0 and has commits not in it",
-                ltx.end,
-                end,
-                False,
-            )
-        if ltx.end == WAL_HEADER_SIZE:
-            seed = header.checksum
-        else:
-            if (ltx.end - WAL_HEADER_SIZE) % frame or ltx.end < WAL_HEADER_SIZE + frame:
-                return WalEvidence(
-                    NO_EVIDENCE, "the L0 WAL end is not on a frame boundary", ltx.end
-                )
-            if os.fstat(fd).st_size < ltx.end:
-                return WalEvidence(NO_EVIDENCE, "the -wal is shorter than the L0 WAL end", ltx.end)
-            prev = _pread(fd, FRAME_HEADER_SIZE, ltx.end - frame)
-            if len(prev) < FRAME_HEADER_SIZE:
-                return WalEvidence(NO_EVIDENCE, "the -wal is shorter than the L0 WAL end", ltx.end)
-            _pgno, _commit, salt1, salt2, c1, c2 = struct.unpack(">6I", prev)
-            if (salt1, salt2) != (header.salt1, header.salt2):
-                return WalEvidence(
-                    NO_EVIDENCE, "the -wal frame before the L0 WAL end was overwritten", ltx.end
-                )
-            seed = (c1, c2)
-        end = _first_commit_after(fd, header, ltx.end, seed, limit)
+        try:
+            snap = _snapshot(fd)
+            result = _evaluate(fd, snap[3], ltx, limit)
+        except OSError:
+            return WalEvidence(NO_EVIDENCE, "the -wal could not be read", ltx.end), False
+        if result.state == PENDING:
+            return result, True
+        return result, _unchanged(fd, wal_path, snap)
+    finally:
+        os.close(fd)
+
+
+def _evaluate(fd: int, raw_header: bytes, ltx: LtxWalRange, limit: int) -> WalEvidence:
+    header = _parse_header(raw_header)
+    if header is None:
+        return WalEvidence(NO_EVIDENCE, "the -wal header is empty or not valid", ltx.end)
+    if header.page_size != ltx.page_size:
+        return WalEvidence(NO_EVIDENCE, "the -wal page size differs from the L0", ltx.end)
+    frame = FRAME_HEADER_SIZE + header.page_size
+    same = (header.salt1, header.salt2) == (ltx.salt1, ltx.salt2)
+    if not same:
+        end = _first_commit_after(fd, header, WAL_HEADER_SIZE, header.checksum, limit)
         if end is False:
             return WalEvidence(NO_EVIDENCE, "the -wal scan limit was reached", ltx.end)
         if end is None:
             return WalEvidence(
-                IN_SYNC, "every -wal commit is within the latest L0", ltx.end, None, True
+                NO_EVIDENCE,
+                "the -wal restarted after the latest L0 and has no commit yet",
+                ltx.end,
+                salt_match=False,
             )
-        return WalEvidence(PENDING, "the -wal has commits after the latest L0", ltx.end, end, True)
-    except OSError:
-        return WalEvidence(NO_EVIDENCE, "the -wal could not be read", ltx.end)
-    finally:
-        os.close(fd)
+        return WalEvidence(
+            PENDING,
+            "the -wal restarted after the latest L0 and has commits not in it",
+            ltx.end,
+            end,
+            False,
+        )
+    if ltx.end == WAL_HEADER_SIZE:
+        seed = header.checksum
+    else:
+        if (ltx.end - WAL_HEADER_SIZE) % frame or ltx.end < WAL_HEADER_SIZE + frame:
+            return WalEvidence(NO_EVIDENCE, "the L0 WAL end is not on a frame boundary", ltx.end)
+        if os.fstat(fd).st_size < ltx.end:
+            return WalEvidence(NO_EVIDENCE, "the -wal is shorter than the L0 WAL end", ltx.end)
+        prev = _pread(fd, FRAME_HEADER_SIZE, ltx.end - frame)
+        if len(prev) < FRAME_HEADER_SIZE:
+            return WalEvidence(NO_EVIDENCE, "the -wal is shorter than the L0 WAL end", ltx.end)
+        _pgno, _commit, salt1, salt2, c1, c2 = struct.unpack(">6I", prev)
+        if (salt1, salt2) != (header.salt1, header.salt2):
+            return WalEvidence(
+                NO_EVIDENCE, "the -wal frame before the L0 WAL end was overwritten", ltx.end
+            )
+        seed = (c1, c2)
+    end = _first_commit_after(fd, header, ltx.end, seed, limit)
+    if end is False:
+        return WalEvidence(NO_EVIDENCE, "the -wal scan limit was reached", ltx.end)
+    if end is None:
+        return WalEvidence(
+            IN_SYNC, "every -wal commit is within the latest L0", ltx.end, None, True
+        )
+    return WalEvidence(PENDING, "the -wal has commits after the latest L0", ltx.end, end, True)

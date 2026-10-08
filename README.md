@@ -503,6 +503,7 @@ urlpatterns = [
 **WAL 위치 근거** (형식: [SQLite WAL](https://www.sqlite.org/fileformat2.html#walformat), superfly/ltx v0.5.2 `Header`, Litestream 0.5.17 `db.go`):
 - 판정: 현재 `-wal` 의 salt 가 최신 L0 의 salt 와 같으면, L0 끝(`WALOffset + WALSize`) 뒤에 유효한 커밋 프레임이 있으면 pending, 없으면 in_sync. salt 가 다르면(L0 이후 WAL 이 다시 시작됨) 새 salt 의 커밋이 있으면 pending, 없으면 판정할 수 없음.
 - 프레임은 salt 와 누적 체크섬이 맞을 때만 센다(SQLite 의 복구 규칙과 같다). 쓰다 만 프레임은 커밋으로 세지 않는다. L0 끝 뒤의 프레임만, 첫 커밋까지만 읽는다(한 번에 최대 64 MiB).
+- 잠금 없이 읽으므로 읽는 도중 체크포인트가 `-wal` 을 비우거나 다시 시작할 수 있다. 그래서 "L0 뒤 커밋 없음"이라고 답하기 전에 처음 연 `-wal` 이 그대로인지(같은 파일, 같은 크기, 같은 헤더) 다시 보고, 바뀌었으면 한 번만 다시 읽는다. 그래도 바뀌면 판정하지 않는다(`no_wal_evidence`).
 - pending 지속 시간은 처음 관측한 때부터 monotonic 으로 세고, 최신 L0 의 WAL 위치가 바뀌면(Litestream 이 진행 중) 다시 센다. 쓰기가 계속되는 바쁜 DB 도 Litestream 이 살아 있으면 `backlog` 가 되지 않는다(실측: 30ms 간격 쓰기 30초, 0.5초마다 판정, grace 3초에서 모두 `caught_up`).
 - Litestream 이 도는 동안에는 Litestream 이 연결을 쥐고 있어 `-wal` 이 남으므로 이 근거가 늘 있다.
 

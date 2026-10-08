@@ -1537,3 +1537,202 @@ def test_busy_db_with_progressing_upload_is_not_backlog(tmp_path):
         m.refresh_once()
         assert m.report()["status"] == expected, (i, m.report())
         mono[0] += 10.0
+
+
+# --- 라운드 3 회귀 (review-3): 읽는 도중 바뀐 WAL ---------------------------------------
+#
+# 헬스는 잠금 없이 -wal 을 읽는다(Litestream 은 체크포인트를 막는 읽기 트랜잭션을 쥐지만 헬스는
+# 연결을 열지 않는다). 읽기 사이에 실제 SQLite 체크포인트를 끼워 넣으려고 os.pread 를 감싼다.
+# 감싼 함수는 실제 읽기 결과를 그대로 돌려주고, 정해진 읽기 직후 한 번(또는 매번) 훅을 실행한다.
+
+
+def wrap_pread(monkeypatch, when, action, *, once=True):
+    """``when(fd, size, offset, result)`` 이 참인 읽기 직후 ``action()`` 을 실행한다."""
+    original = os.pread
+    fired = []
+
+    def pread(fd, size, offset):
+        result = original(fd, size, offset)
+        if (not once or not fired) and when(fd, size, offset, result):
+            fired.append((size, offset))
+            action()
+        return result
+
+    monkeypatch.setattr(os, "pread", pread)
+    return fired
+
+
+def test_wal_truncate_between_reads_is_not_in_sync(wal_lab, monkeypatch):
+    """review-3 P2: 조회 전부터 L0 뒤 커밋이 있는데, L0 끝 직전 프레임 헤더를 읽은 직후
+    TRUNCATE 체크포인트가 끼어들면 꼬리 스캔은 EOF 를 본다. 이것을 in_sync 로 받으면 안 된다."""
+    end1 = wal_lab.commit()
+    rng = wal_lab.ltx(end1)
+    wal_lab.commit()  # L0 뒤 커밋(조회 전부터 있다)
+    assert wal_compare(str(wal_lab.wal), rng).state == PENDING
+    frame = rng.page_size + 24
+
+    def truncate():
+        assert wal_lab.writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall() == [(0, 0, 0)]
+
+    fired = wrap_pread(
+        monkeypatch, lambda fd, size, off, r: size == 24 and off == rng.end - frame, truncate
+    )
+    ev = wal_compare(str(wal_lab.wal), rng)
+    assert fired, "the checkpoint was not interleaved"
+    assert wal_lab.wal.stat().st_size == 0
+    assert ev.state == NO_EVIDENCE, ev
+
+
+def test_wal_changing_on_every_attempt_is_no_evidence(wal_lab, monkeypatch):
+    """두 번 다 읽는 도중 바뀌면(재시도는 1회) 'changed during read' 로 근거 없음."""
+    end1 = wal_lab.commit()
+    rng = wal_lab.ltx(end1)
+    opened = []
+    original_open = os.open
+
+    def counting_open(path, flags, *args, **kwargs):
+        if str(path) == str(wal_lab.wal):
+            opened.append(path)
+        return original_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(os, "open", counting_open)
+    # 헤더를 읽을 때마다 salt-1 을 뒤집는다(커밋은 더하지 않는다) → 두 시도 모두 헤더가 바뀐다
+    original_pread = os.pread
+
+    def flip_salt():
+        fd = original_open(wal_lab.wal, os.O_RDWR)
+        try:
+            raw = bytearray(original_pread(fd, 32, 0))
+            raw[16] ^= 0xFF
+            os.pwrite(fd, bytes(raw), 0)
+        finally:
+            os.close(fd)
+
+    fired = wrap_pread(
+        monkeypatch, lambda fd, size, off, r: size == 32 and off == 0, flip_salt, once=False
+    )
+    ev = wal_compare(str(wal_lab.wal), rng)
+    assert len(opened) == 2, opened  # 최대 1회 재시도
+    assert len(fired) == 4, fired  # 시도마다 처음 읽기·다시 확인
+    assert (ev.state, ev.reason) == (NO_EVIDENCE, "the -wal changed during read"), ev
+
+
+def test_wal_replaced_during_read_is_retried_once(wal_lab, monkeypatch, tmp_path):
+    """읽는 도중 같은 경로의 파일이 다른 inode 로 바뀌면 다시 읽는다(같은 내용이면 in_sync)."""
+    end1 = wal_lab.commit()
+    rng = wal_lab.ltx(end1)
+    frame = rng.page_size + 24
+    copy = tmp_path / "replacement-wal"
+
+    def replace():
+        copy.write_bytes(wal_lab.wal.read_bytes())
+        os.replace(copy, wal_lab.wal)
+
+    fired = wrap_pread(
+        monkeypatch, lambda fd, size, off, r: size == 24 and off == rng.end - frame, replace
+    )
+    ev = wal_compare(str(wal_lab.wal), rng)
+    assert len(fired) == 1
+    assert ev.state == IN_SYNC, ev
+
+
+def test_wal_header_rewritten_during_read_is_no_evidence(wal_lab, monkeypatch):
+    """같은 파일·같은 크기라도 헤더(salt·체크섬)가 바뀌면 바뀐 것으로 본다."""
+    end1 = wal_lab.commit()
+    rng = wal_lab.ltx(end1)
+    frame = rng.page_size + 24
+    raw = bytearray(wal_lab.wal.read_bytes()[:32])
+    raw[16] ^= 0xFF  # salt-1
+
+    def rewrite_header():
+        fd = os.open(wal_lab.wal, os.O_WRONLY)
+        try:
+            os.pwrite(fd, bytes(raw), 0)
+        finally:
+            os.close(fd)
+
+    wrap_pread(
+        monkeypatch,
+        lambda fd, size, off, r: size == 24 and off == rng.end - frame,
+        rewrite_header,
+        once=False,
+    )
+    ev = wal_compare(str(wal_lab.wal), rng)
+    assert ev.state == NO_EVIDENCE, ev
+
+
+def test_wal_pending_is_kept_even_if_wal_changes_after(wal_lab, monkeypatch):
+    """L0 뒤 커밋 프레임을 이미 읽었으면(근거 확보) 그 뒤에 WAL 이 바뀌어도 PENDING 이다."""
+    end1 = wal_lab.commit()
+    rng = wal_lab.ltx(end1)
+    end2 = wal_lab.commit()
+    frame = rng.page_size + 24
+
+    def truncate():
+        wal_lab.writer.execute("PRAGMA wal_checkpoint(TRUNCATE)").fetchall()
+
+    fired = wrap_pread(
+        monkeypatch, lambda fd, size, off, r: size == frame and off == rng.end, truncate
+    )
+    ev = wal_compare(str(wal_lab.wal), rng)
+    assert fired
+    assert (ev.state, ev.commit_end) == (PENDING, end2), ev
+
+
+@needs_litestream
+@pytest.mark.parametrize("mode", ["TRUNCATE", "RESTART"])
+def test_real_checkpoint_between_wal_reads_is_not_in_sync(
+    tmp_path, litestream_binary, mode, monkeypatch
+):
+    """review-3 checkpoint_race.py: 행 1 을 복제하고 행 2 를 커밋한(복제 안 됨) 뒤, 헬스 조회의
+    WAL 읽기 사이에 실제 체크포인트를 끼운다. 원본 2행·복원본 1행인데 in_sync 이면 안 된다."""
+    db = tmp_path / "app.sqlite3"
+    config = _config(tmp_path, "a", db, tmp_path / "replica")
+    conn = sqlite3.connect(db)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute("CREATE TABLE t (x)")
+        conn.execute("INSERT INTO t VALUES (1)")
+        conn.commit()
+        _replicate_once(litestream_binary, config)
+        rng = ltx_wal_range(local_max_ltx(str(db))[1])
+        cfg = HealthConfig(
+            (AliasConfig("default", str(config), None, litestream_binary),), 15.0, 0.0
+        )
+        m = Monitor(cfg, path_of=lambda alias: (str(db), None))
+        conn.execute("INSERT INTO t VALUES (2)")  # 헬스 조회 전부터 복제본에 없는 커밋
+        conn.commit()
+        m.refresh_once()
+        entry = m.report()["databases"]["default"]
+        assert (entry["status"], entry["code"]) == (BACKLOG, "db_not_replicated"), entry
+
+        def checkpoint():
+            conn.execute(f"PRAGMA wal_checkpoint({mode})").fetchall()
+            if mode == "RESTART":
+                conn.execute("INSERT INTO t VALUES (3)")
+                conn.commit()
+
+        frame = rng.page_size + 24
+        fired = wrap_pread(
+            monkeypatch, lambda fd, size, off, r: size == 24 and off == rng.end - frame, checkpoint
+        )
+        m.refresh_once()
+        monkeypatch.undo()
+        assert fired, "the checkpoint was not interleaved"
+        entry = m.report()["databases"]["default"]
+        assert entry["code"] != "in_sync" and entry["status"] != CAUGHT_UP, entry
+
+        restored = tmp_path / "restore.sqlite3"
+        result = litestream.restore(
+            str(db), str(restored), config=str(config), binary=litestream_binary
+        )
+        assert result.ok, result
+        rc = sqlite3.connect(f"file:{restored}?mode=ro", uri=True)
+        try:
+            assert rc.execute("SELECT x FROM t").fetchall() == [(1,)]
+        finally:
+            rc.close()
+        assert len(conn.execute("SELECT x FROM t").fetchall()) > 1
+    finally:
+        conn.close()
