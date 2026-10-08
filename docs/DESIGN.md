@@ -232,11 +232,17 @@ django_sqlite_ops/
 ### 6-1. 정적 체크 (`manage.py check`, DB 를 열지 않음)
 기준값은 §6-0 의 표에서 읽는다. `sqlite_database()` 를 쓰지 않은 설정(직접 쓴 dict, dj-lite 결과)도 같은 기준으로 검사한다.
 
+대상은 `ENGINE == "django.db.backends.sqlite3"` 인 별칭이다. 프로필은 `settings.SQLITE_OPS["PROFILE"]`(없으면 `single-server`)이다. `obj` 는 별칭 이름이다. 체크는 `ready()` 에서 등록만 하고, 설정만 읽으며 DB 연결을 만들지 않는다(테스트로 확인: 체크 전후 `connection is None`, DB 파일 생성 없음).
+
 | ID | 조건 | 수준 |
 |---|---|---|
-| `sqlite_ops.W001` | sqlite3 별칭의 `OPTIONS.transaction_mode` 가 `IMMEDIATE` 가 아님 | Warning (`--deploy` 일 때만) |
-| `sqlite_ops.W002` | `init_command` 에 `journal_mode=WAL` 이 보이지 않음 | Warning (`--deploy`) |
-| `sqlite_ops.W003` | VFS 별칭이 있고 `CONN_MAX_AGE != None`, WSGI 배포 | Warning |
+| `sqlite_ops.E001` | `SQLITE_OPS` 가 dict 가 아니거나 `PROFILE` 이 알 수 없는 이름. 이때는 이 오류 하나만 내고 다른 체크는 건너뛴다 | Error (항상) |
+| `sqlite_ops.W001` | sqlite3 별칭의 `OPTIONS.transaction_mode` 가 `IMMEDIATE` 가 아님(없음 포함, 대소문자 무시) | Warning (`--deploy` 일 때만) |
+| `sqlite_ops.W002` | `init_command` 에서 `journal_mode` 가 `WAL` 로 설정되지 않음. Django 처럼 `;` 로 나눈 문장마다 보고 마지막 설정값을 쓴다. 대소문자·공백·`main.` 접두는 인정한다. 메모리 DB(`:memory:`, `file::memory:`, `mode=memory`)는 건너뛴다 | Warning (`--deploy`) |
+| `sqlite_ops.W003` | 이름이 Litestream VFS(`vfs=litestream` 이 든 `file:` URI)인 별칭의 `CONN_MAX_AGE` 가 `None` 이 아님(키 없음 = Django 기본 0 포함), 그리고 `ASGI_APPLICATION` 미설정(WSGI 로 판단). ASGI 는 미검증이라 내지 않는다(교차 리뷰) | Warning (항상) |
+
+- W001 은 권고 수준이다. Django 는 `DEFERRED`·`EXCLUSIVE`·`IMMEDIATE` 를 모두 허용하므로 오류로 올리지 않는다(교차 리뷰).
+- 체크 태그는 `sqlite_ops` 다. `Tags.database` 는 `check --database` 없이는 돌지 않아 쓰지 않는다.
 
 뺀 것과 그 이유:
 - "다중 프로세스인데 InMemory 레이어 사용": check 시점에는 프로세스 수를 알 수 없다. wireview W006 이 이미 이 경우를 다룬다.
