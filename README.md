@@ -7,7 +7,7 @@ Django 에서 SQLite 를 운영 DB 로 안전하게 쓰게 하는 **운영 도�
 | 기능 | 상태 | 이슈 |
 |---|---|---|
 | 권장 설정 `sqlite_database()` | 구현됨 | [#1](https://github.com/itda-work/django-sqlite-ops/issues/1) |
-| boot CLI (복원 판정·복원·잠금) | 예정 | [#2](https://github.com/itda-work/django-sqlite-ops/issues/2) · [#3](https://github.com/itda-work/django-sqlite-ops/issues/3) · [#4](https://github.com/itda-work/django-sqlite-ops/issues/4) |
+| boot CLI (복원 판정·복원·잠금) | 구현됨 | [#2](https://github.com/itda-work/django-sqlite-ops/issues/2) · [#3](https://github.com/itda-work/django-sqlite-ops/issues/3) · [#4](https://github.com/itda-work/django-sqlite-ops/issues/4) |
 | 시스템 체크 | 예정 | [#5](https://github.com/itda-work/django-sqlite-ops/issues/5) |
 | `sqlite_doctor` 관리 명령 | 예정 | [#6](https://github.com/itda-work/django-sqlite-ops/issues/6) |
 | 복제 헬스 | 예정 | [#7](https://github.com/itda-work/django-sqlite-ops/issues/7) |
@@ -172,7 +172,124 @@ DATABASES = {
 
 ### boot CLI
 
-예정. 부팅 때 Litestream 복제본과 로컬 DB 를 비교해 복원하거나, 판정할 수 없으면 기동을 거부한다. [#2](https://github.com/itda-work/django-sqlite-ops/issues/2) · [#3](https://github.com/itda-work/django-sqlite-ops/issues/3) · [#4](https://github.com/itda-work/django-sqlite-ops/issues/4)
+컨테이너가 뜰 때 Litestream 복제본과 로컬 DB 를 비교해 **쓸 수 있으면 그대로, 볼륨이 비었으면 복원, 판정할 수 없으면 기동을 거부**한 뒤 다음 명령으로 넘어간다. Django 를 import 하지 않는 독립 CLI 다. `manage.py` 명령은 `django.setup()` 중에 빈 DB 파일을 만들 수 있고, 그러면 복원이 건너뛰어지기 때문이다([DESIGN §4-1](docs/DESIGN.md)).
+
+필요한 것: POSIX(Linux·macOS), PATH 의 `litestream` 0.5.17(검증한 버전만 받는다), DB 마다 복제본이 적힌 Litestream 설정 파일. 설치는 [공식 문서](https://litestream.io/install/)를 따른다.
+
+**경로 규칙**: `--db`·`--meta-path` 는 **실제 경로**로 준다. 부모 경로에 심볼릭 링크·`..`·없는 디렉터리가 있으면 exit 64 이고, 쓸 실제 경로를 안내한다. Litestream 설정의 `dbs[].path` 에도 **같은 실제 경로**를 쓴다. boot 가 이 경로로 Litestream 을 조회·복원하기 때문이다([D-15](docs/DECISIONS.md)).
+
+#### Docker entrypoint
+
+```bash
+#!/bin/sh
+# entrypoint.sh — boot 가 판정·복원한 뒤 litestream 이 앱을 띄우고 복제한다.
+exec python -m django_sqlite_ops.boot \
+    --db /data/app.sqlite3 \
+    --config /etc/litestream.yml \
+    -- litestream replicate -config /etc/litestream.yml \
+       -exec "uvicorn proj.asgi:application --host 0.0.0.0 --port 8000"
+```
+
+`--` 뒤 명령은 boot 가 판정을 통과했을 때 `exec` 로 boot 프로세스를 대체한다. `migrate` 는 그 명령 안에서(예: `-exec "sh -c 'python manage.py migrate && uvicorn ...'"`) 돌린다.
+
+| 옵션 | 기본값 | 뜻 |
+|---|---|---|
+| `--db PATH` | (필수) | SQLite DB 경로. Litestream 설정의 `path` 와 같아야 한다 |
+| `--config PATH` | (필수) | Litestream 설정 파일 |
+| `--on-unknown` | `refuse` | 판정할 수 없을 때: `refuse`(거부) · `restore`(로컬을 격리하고 복원) · `keep-local`(로컬 유지, 헬스에 `unknown_at_boot`) |
+| `--init-new` | 꺼짐 | 생애 첫 배포에서 새 DB 로 시작. 첫 배포 뒤에는 끈다 |
+| `--adopt-existing` | 꺼짐 | 기존 DB 를 처음 Litestream 에 올린다. 도입 배포 뒤에는 끈다 |
+| `--meta-path PATH` | `<db 디렉터리>/.<db 이름>-litestream` | Litestream 설정에 `meta-path` 를 바꿨다면 같은 값을 준다 |
+| `--litestream BIN` | `litestream` | 실행 파일 |
+| `--ltx-timeout S` | `30` | 원격 TXID 조회 제한 시간(초). 넘으면 거부한다 |
+| `--restore-timeout S` | `600` | 복원 제한 시간(초). DB 크기에 맞춰 늘린다 |
+
+#### 무엇을 하나
+
+1. `<db>.boot.lock` 을 잠근다. 이 잠금은 **exec 된 명령에 상속**된다. 그래서 `litestream replicate`(와 그것이 띄운 앱)가 살아 있는 동안 같은 볼륨에서 boot 를 또 돌리면 exit 5 로 막힌다. 다른 머신끼리의 이중 실행은 막지 못한다.
+2. 앞선 부팅이 격리 도중 죽었으면(`<db>.stale-<ts>.partial/`) 그 격리부터 마저 끝낸다.
+3. 로컬 DB·로컬 메타의 TXID·원격 복제본의 TXID 를 보고 판정한다([DESIGN §4-3](docs/DESIGN.md) 규칙표).
+4. 복원이 필요하면 DB 옆 임시 디렉터리(`<db>.restore-…/`)에 먼저 복원하고, 성공했을 때만 로컬을 `<db>.stale-<ts>/` 로 옮긴 뒤 복원본을 제자리에 놓는다. 복원이 실패하면 로컬은 그대로다.
+5. DB 가 있으면 읽기 전용으로 `PRAGMA quick_check` 를 한다. DB 가 없으면(새 DB) 만들지 않는다.
+6. `<db>.boot-state.json` 에 판정 결과를 남기고 명령을 exec 한다.
+
+stderr 의 `[boot] ...` 줄만 보면 무슨 일이 있었는지 알 수 있다.
+
+```text
+[boot] lock: /data/app.sqlite3.boot.lock
+[boot] inputs: local_exists=False local_txid=None remote=txid 25
+[boot] decision: state=fresh action=restore reason_code=restore_from_remote reason=no local db; restore remote txid 25
+[boot] restore: /data/app.sqlite3 -> /data/app.sqlite3.restore-20261008T010203.000001Z-1a2b3c4d/app.sqlite3
+[boot] restore: ok, txid 25
+[boot] install: /data/app.sqlite3
+[boot] integrity: quick_check ok
+[boot] state: /data/app.sqlite3.boot-state.json
+[boot] exec: litestream replicate -config /etc/litestream.yml -exec uvicorn ...
+```
+
+#### 종료 코드
+
+| 코드 | 뜻 | 할 일 |
+|---|---|---|
+| (exec) | 통과. 이후 코드는 exec 된 명령의 것이다 | — |
+| `2` | 거부. 판정할 수 없다 | 아래 사유 코드별 대처 |
+| `3` | 무결성 실패(`quick_check` 가 `ok` 아님) | DB 파일을 조사한다. 판정은 `match` 라 `--on-unknown restore` 만으로는 복원되지 않는다. 복제본이 정본이면 DB 파일(과 `-wal`·`-shm`)을 다른 곳으로 옮기고 `--on-unknown restore` 로 다시 부팅한다. 남은 메타가 `stale_meta` 로 격리되고 복원된다 |
+| `4` | 복원 실패 | 로그의 `restore failed:` 사유를 본다. 임시 복원이 실패했으면 로컬은 그대로이고, 남은 `<db>.restore-…/` 는 조사 뒤 지운다. 격리·설치 중 I/O 실패도 4 다. 격리 도중이면 `<db>.stale-…partial/` 이 남고 다음 부팅이 이어서 끝낸다. 격리를 마친 뒤(설치 중) 실패했으면 다음 부팅이 남은 상태에 따라 다시 복원하거나(로컬이 비었을 때) `no_local_meta` 로 거부한다(아래 '복원 직후 크래시 복구') |
+| `5` | 잠금 실패 | 같은 볼륨에서 이미 돌고 있는 컨테이너·프로세스를 멈춘다 |
+| `64` | 사용법 오류 | 인자를 고친다. `--` 뒤 명령이 꼭 있어야 한다. 경로가 실제 경로가 아니면 메시지의 실제 경로로 바꾸고 Litestream 설정도 같은 경로로 맞춘다 |
+| `127` | `--` 뒤 명령을 실행할 수 없음 | 명령 이름·PATH·실행 권한을 확인한다 |
+
+#### 생애 첫 배포: `--init-new` 를 한 번 쓰고 끈다
+
+볼륨도 복제본도 비어 있으면 boot 는 거부한다(`no_replica_no_local`). Litestream 은 복제본 경로·prefix 오타와 "복제본 없음"을 같은 빈 목록으로 돌려주므로, 빈 목록만 보고 새 DB 를 시작하면 오타 난 경로에 새 DB 를 올려 기존 복제본을 버리게 된다. 처음 배포할 때만 `--init-new` 를 붙인다. boot 는 DB 파일을 만들지 않고 넘어가고, 앱(`migrate`)이 만든다.
+
+```bash
+python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream.yml \
+    --init-new -- litestream replicate -config /etc/litestream.yml -exec "..."
+```
+
+첫 복제가 끝나면 **`--init-new` 를 지운다.** 켜 둔 채로 두면, 나중에 볼륨을 잃고 설정의 복제본 경로까지 틀렸을 때 다시 빈 DB 로 시작한다([D-13](docs/DECISIONS.md)).
+
+#### 기존 DB 도입: `--adopt-existing` 을 한 번 쓰고 끈다
+
+이미 운영 중인 DB 를 처음 Litestream 에 올리면 로컬 메타가 없고 복제본은 비어 있다. 이때만 `--adopt-existing` 을 붙인다. 정확히 (로컬 DB 있음, 로컬 메타 없음, 원격 빈 목록) 일 때만 통과시키고 다른 조합에는 효과가 없다. 첫 복제가 끝나면 지운다([D-11](docs/DECISIONS.md)). `--on-unknown keep-local` 을 도입 절차로 쓰지 않는다.
+
+#### 거부됐을 때 (exit 2): 사유 코드별 대처
+
+로그의 `decision: ... reason_code=...` 와 그 아래 `hint:` 줄을 본다.
+
+| 사유 코드 | 뜻 | 대처 |
+|---|---|---|
+| `no_replica_no_local` | 볼륨도 복제본도 비었다 | 첫 배포면 `--init-new` 를 한 번. 아니면 설정의 복제본 경로·prefix 를 확인한다 |
+| `remote_error` | 복제본 조회 실패·타임아웃 | 네트워크·자격 증명·endpoint(평문 HTTP 면 `http://` 를 붙인다)를 고친다. 이 경우는 `--on-unknown` 과 무관하게 거부한다([D-12](docs/DECISIONS.md)) |
+| `remote_ahead` | 복제본이 이 볼륨보다 새롭다(옛 볼륨으로 재부팅) | 복제본이 정본이면 `--on-unknown restore` 로 한 번 부팅한다. 로컬은 `<db>.stale-<ts>/` 에 남는다 |
+| `no_local_meta` | DB 는 있는데 Litestream 메타가 없다 | 아래 '복원 직후 크래시 복구'. 기존 DB 를 처음 올리는 중이고 복제본이 비었으면 `--adopt-existing` |
+| `stale_meta` | DB 없이 메타만 남았다 | `--on-unknown restore` 로 메타를 격리하고 복원한다 |
+| `remote_empty` | 복제한 적 있는 DB 인데 복제본이 비었다 | 복제본 경로·prefix·버킷을 확인한다. 로컬을 그대로 쓰려면 `--on-unknown keep-local` |
+| `orphan_sidecars` | DB 파일 없이 `-wal`/`-shm`/`-journal` 만 있다 | 파일을 조사한다. 복제본이 정본이면 `--on-unknown restore` 로 격리하고 복원한다 |
+
+`--on-unknown` 은 문제를 푼 그 한 번만 쓰고 원래(`refuse`)로 돌린다. 격리된 `<db>.stale-<ts>/` 는 boot 가 지우지 않는다. 확인한 뒤 직접 지운다.
+
+#### 복원 직후 크래시 복구
+
+복원한 DB 옆에는 Litestream 메타가 없다. `litestream replicate` 가 첫 변경을 기록하기 전에 컨테이너가 죽으면, 다음 부팅은 "DB 는 있는데 메타가 없다"(`no_local_meta`)로 거부된다. 이 DB 는 방금 복제본에서 받은 것이므로 한 번만 `--on-unknown restore` 로 부팅하면 격리하고 다시 복원한다([D-14](docs/DECISIONS.md)).
+
+```bash
+python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream.yml \
+    --on-unknown restore -- litestream replicate -config /etc/litestream.yml -exec "..."
+```
+
+#### 함정
+
+- DB 경로는 Litestream 설정의 `path` 와 같은 값을 준다. 설정에 없는 DB 면 `remote_error` 로 거부된다.
+- `/data -> /mnt/volume` 처럼 부모가 링크인 경로(`--db /data/app.sqlite3`)는 받지 않는다. 링크를 따라간 실제 경로(`/mnt/volume/app.sqlite3`)를 boot 인자와 Litestream 설정 양쪽에 쓴다. 경로는 파일 이름으로 끝나야 한다.
+- `--meta-path` 를 DB 디렉터리 자체나 그 조상으로 두지 않는다. 메타가 DB 를 포함하면 격리가 필요할 때 거부된다(exit 2).
+- 메타 디렉터리는 DB 와 같은 파일시스템에 둔다. 격리는 rename 으로 하므로 다른 볼륨에 있으면 거부한다.
+- **격리가 필요할 때(`restore` 조치) DB·`-wal`·`-shm`·`-journal`·메타 디렉터리 경로가 심볼릭 링크면 거부한다(exit 2).** 링크를 옮기면 실체가 밖에 남기 때문이다(v0.1 제약). 판정만 하고 진행하는 부팅(`match` 등)에서는 메타 디렉터리 링크를 따라가므로 평소에는 드러나지 않는다. 볼륨 안에 실제 파일·디렉터리로 둔다.
+- DB 나 `--meta-path` 의 이름을 `manifest.json` 으로 하지 않는다. 격리 디렉터리의 예약 이름이라 격리가 필요할 때 거부된다.
+- 격리 도중 죽어 `<db>.stale-…partial/` 이 남았다면 **같은 `--db`·`--meta-path`** 로 다시 부팅한다. 다르면 판정할 수 없어 거부한다. 그 안의 파일을 손으로 바꾸지 않는다.
+- `<db>.boot.lock` 을 지우지 않는다. flock 잠금은 파일에 걸리므로, 앱이 도는 중에 잠금 파일을 지우거나 바꾸면 다음 boot 가 새 파일을 잠가 이중 실행을 막지 못한다. 잠금 파일이 링크거나 정규 파일이 아니면 exit 5 다.
+- boot 는 Windows 에서 검증하지 않았다. `fcntl` 이 없으면 exit 64 다.
 
 ### 시스템 체크
 

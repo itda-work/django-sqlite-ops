@@ -38,6 +38,7 @@ __all__ = [
     "parse_version",
     "remote_max_txid",
     "restore",
+    "version",
 ]
 
 # 실측으로 출력 형식과 동작을 확인한 버전. 범위 밖이면 판정할 수 없으므로 거부한다.
@@ -163,6 +164,14 @@ def parse_version(stdout: str) -> str | None:
     """``litestream version`` 출력에서 ``X.Y.Z`` 를 읽는다. 형식이 다르면 ``None``."""
     m = _VERSION_RE.match(stdout.strip())
     return m.group(1) if m else None
+
+
+def version(*, binary: str = "litestream", timeout: float = DEFAULT_VERSION_TIMEOUT) -> str | None:
+    """``litestream version`` 의 ``X.Y.Z``. 실행·파싱에 실패하면 ``None`` (기록용, 검증 아님)."""
+    run = _run([binary, "version"], timeout)
+    if isinstance(run, str) or run.rc != 0:
+        return None
+    return parse_version(run.stdout)
 
 
 def check_version(
