@@ -172,9 +172,20 @@ COPY litestream.yml /etc/litestream.yml
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 
+# DB 의 부모 디렉터리. boot 는 없는 부모를 exit 64 로 거부한다(D-15).
+# 볼륨 없는 무상태 배포에서는 이 디렉터리가 그대로 부모가 된다.
+RUN groupadd --system --gid 10001 app \
+ && useradd --system --uid 10001 --gid app --no-create-home app \
+ && mkdir -p /data \
+ && chown app:app /data
+USER app
+
 EXPOSE 8000
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 ```
+
+- `/data` 는 앱 사용자(`app`, uid 10001) 소유다. boot 는 그 안에 잠금·상태 파일·임시 복원 디렉터리를 만들고 격리할 때 rename 하므로, DB 파일뿐 아니라 디렉터리에도 쓰기 권한이 있어야 한다.
+- 이름 있는 빈 볼륨을 `/data` 에 처음 붙이면 Docker 가 이미지의 `/data` 내용을 볼륨으로 복사한다([Docker 문서](https://docs.docker.com/engine/storage/volumes/)). 이때 소유자까지 넘어오는지는 #10 랩에서 확인한다. 바인드 마운트(`./data:/data`)면 호스트 디렉터리의 소유자를 uid 10001 로 맞춘다.
 
 `requirements.txt` 예(PyPI 배포 전이라 GitHub 아카이브로 받는다. 이미지에 `git` 이 없어도 된다):
 
@@ -182,8 +193,10 @@ ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 django-sqlite-ops @ https://github.com/itda-work/django-sqlite-ops/archive/refs/heads/main.zip
 Django>=5.2
 channels
-uvicorn
+uvicorn[standard]
 ```
+
+`uvicorn` 만 설치하면 웹소켓 구현(`websockets`·`wsproto`)이 없어 HTTP 는 되지만 웹소켓 연결을 받지 못한다. `[standard]` extra 가 `websockets` 를 함께 넣는다(uvicorn 0.54.0 메타데이터, [설치 문서](https://uvicorn.dev/installation/)).
 
 운영에서는 `main.zip` 대신 커밋 해시 아카이브(`archive/<sha>.zip`)로 고정한다.
 
@@ -249,6 +262,7 @@ boot 의 판정·사유 코드·종료 코드는 [README boot CLI](../../README.
 
 ### 무상태 교체 (볼륨 없음)
 
+- 볼륨이 없어도 이미지의 `/data`(Dockerfile 에서 만들고 앱 사용자 소유로 둔 디렉터리)가 DB 의 부모 디렉터리가 된다. boot 는 없는 부모를 exit 64 로 거부하므로, 이미지를 직접 만들 때도 이 단계를 빼지 않는다.
 - 볼륨 없이 새 컨테이너를 띄우면 boot 는 `fresh` 로 판정해 복제본을 복원한다. Docker 랩에서 새 컨테이너가 2.4초 만에 복원하고 200건 중 200건으로 떴다(docker D1c).
 - **정지 후 기동**으로 배포한다: 옛 컨테이너를 멈추고(마지막 sync 를 위해 `docker stop`) 새 컨테이너를 띄운다. 두 컨테이너가 겹치면 둘 다 쓴다(§1).
 - 볼륨이 없으므로 호스트가 죽으면 마지막 sync 이후의 쓰기를 잃는다(약 1초, scenarios RPO). S3 가 끊긴 동안 쌓인 변경도 그 서버 디스크에만 있다(docker D2: 20초 단절 동안 WAL 8.5MB).

@@ -260,3 +260,26 @@ def test_layer_semantics_table_matches_design():
     doc_table = _table(DOCS["single-server-multiproc"], header)
     assert len(doc_table) >= 6
     assert doc_table == design_table
+
+
+DOCKERFILE = _blocks("dockerfile")
+REQUIREMENTS = [b for b in _blocks("text") if "django-sqlite-ops @" in b[2]]
+
+
+def test_dockerfile_prepares_db_parent_directory():
+    # boot 는 없는 부모를 exit 64 로 거부한다(D-15). 볼륨 없는 배포에서도 /data 가 있어야 한다
+    assert [b[0] for b in DOCKERFILE] == ["single-server"]
+    source = DOCKERFILE[0][2]
+    assert "mkdir -p /data" in source
+    assert "chown app:app /data" in source
+    assert re.search(r"^USER app$", source, flags=re.M)
+    # 디렉터리를 만든 뒤에 앱 사용자로 바꾼다
+    assert source.index("mkdir -p /data") < source.index("\nUSER app")
+
+
+def test_requirements_include_websocket_support():
+    # uvicorn 만으로는 웹소켓 구현이 없다. [standard] 가 websockets 를 넣는다
+    assert [b[0] for b in REQUIREMENTS] == ["single-server"]
+    lines = REQUIREMENTS[0][2].split()
+    assert "uvicorn[standard]" in lines
+    assert "uvicorn" not in lines
