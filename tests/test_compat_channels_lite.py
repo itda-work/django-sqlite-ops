@@ -5,7 +5,7 @@
 같은 메시지를 받는다.
 
 재현 시나리오는 새 인터프리터에서 돈다(Django 설정은 프로세스당 한 번, 패치는 클래스를 바꾼다).
-channels-lite[aio] 가 없으면 건너뛴다.
+channels-lite[aio] 가 없으면 건너뛴다(``REQUIRE_CHANNELS_LITE=1`` 이면 실패, ``_channels_lite.py``).
 """
 
 import importlib.util
@@ -17,15 +17,9 @@ from difflib import unified_diff
 from pathlib import Path
 
 import pytest
+from _channels_lite import needs_channels_lite_aio, skip_or_fail
 
 ROOT = Path(__file__).resolve().parent.parent
-
-needs_channels_lite_aio = pytest.mark.skipif(
-    any(
-        importlib.util.find_spec(m) is None for m in ("channels_lite", "aiosqlite", "aiosqlitepool")
-    ),
-    reason="channels-lite[aio] is not installed",
-)
 
 # 수신자 둘(레이어 인스턴스 둘 = 프로세스 둘)이 같은 일반 채널 하나를 경쟁한다. 송신자는 따로다.
 # - prior: 수신자마다 다른 채널로 먼저 send 한다. 풀이 그 연결을 다시 주므로 total_changes > 0.
@@ -220,7 +214,7 @@ print(inspect.getsource(AIOSQLiteChannelLayer._receive_single_from_db), end="")
 
 def test_verified_source_hash_matches_installed_original():
     if importlib.util.find_spec("channels_lite") is None:
-        pytest.skip("channels-lite is not installed")
+        skip_or_fail("channels-lite is not installed")
     data = run(
         """
 from django_sqlite_ops.compat import channels_lite as c
@@ -229,7 +223,7 @@ emit(version=st.version, applicable=st.applicable, reason=st.reason)
 """
     )
     if data["version"] != "0.4.0":
-        pytest.skip(f"channels-lite {data['version']} installed; gate is for 0.4.0")
+        skip_or_fail(f"channels-lite {data['version']} installed; gate is for 0.4.0")
     assert data["applicable"], data["reason"]
 
 
@@ -408,7 +402,7 @@ def test_orm_layer_checks_update_count():
     # ORM 판(layers/core.py)은 aupdate() 의 반환값(행 수)을 본다. 패치 대상이 아님을 소스로 고정.
     spec = importlib.util.find_spec("channels_lite")
     if spec is None or spec.origin is None:
-        pytest.skip("channels-lite is not installed")
+        skip_or_fail("channels-lite is not installed")
     source = (Path(spec.origin).parent / "layers" / "core.py").read_text()
     assert "updated = await Event.objects.filter(id=event.id, delivered=False).aupdate(" in source
     assert "if updated:" in source
