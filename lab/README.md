@@ -24,6 +24,8 @@ gh run download <run-id>                    # artifact lab-<선택>-<run-id> = l
 
 ubuntu-latest(amd64)에서 `scripts/lab.sh run <선택>` 을 그대로 돌리고, 성공·실패와 관계없이 `lab/.out/`(pytest 로그·`results-*.jsonl`·콘솔 `lab-run-<선택>.console`)을 artifact 로 올린다. 시작할 때 러너의 아키텍처·Docker·Compose 판과, 고정한 이미지 digest·`python:3.13-slim` 의 플랫폼 목록(`docker buildx imagetools inspect`)을 로그에 찍는다. 타임아웃 45분. 벤치는 공유 러너의 소음이 커서 넣지 않았다. act(`scripts/ci-local.sh`)는 Docker 소켓을 넘기지 않으므로 이 잡은 로컬에서 act 로 돌릴 수 없다 — 로컬에서는 `scripts/lab.sh` 를 쓴다.
 
+첫 실행(run 37790075326, 11 passed)의 결과와 arm64 대조는 [`lab-2026-10-08.md`](../docs/research/lab-2026-10-08.md#amd64-실행-github-actions-25) 에 있다.
+
 필요한 것: Docker(Compose v2.24.4+, `!override` 사용), `uv`. 로그·결과는 `lab/.out/`(git 무시): `run-<시각>.log`, `results-<시각>.jsonl`(시나리오별 결과·소요 시간·핵심 로그 줄), `bench-<시각>.json`.
 
 ## Docker 자원 규칙

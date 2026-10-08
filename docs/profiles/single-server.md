@@ -135,7 +135,7 @@ dbs:
 
 Litestream 은 공식 설치 방법(릴리스 `.deb` + `dpkg`, https://litestream.io/install/linux/)으로 넣고, 같은 릴리스의 `checksums.txt` 와 SHA-256 이 맞을 때만 설치한다. CI 의 `litestream` 잡과 같은 방식이다.
 
-> **종단 검증함**(회귀 랩 P1, [`lab-2026-10-08.md`](../research/lab-2026-10-08.md)). 이 Dockerfile 을 그대로 빌드해(`python:3.13-slim`, linux/arm64) 아래 compose 로 띄우고 첫 배포·`check --deploy`·`sqlite_doctor`·정지·재부팅을 확인했다. 랩은 `requirements.txt` 의 패키지 줄만 작업 트리 wheel 로 바꾼다.
+> **종단 검증함**(회귀 랩 P1, [`lab-2026-10-08.md`](../research/lab-2026-10-08.md)). 이 Dockerfile 을 그대로 빌드해(`python:3.13-slim`, linux/arm64 와 linux/amd64) 아래 compose 로 띄우고 첫 배포·`check --deploy`·`sqlite_doctor`·정지·재부팅을 확인했다. 랩은 `requirements.txt` 의 패키지 줄만 작업 트리 wheel 로 바꾼다.
 
 ```dockerfile
 FROM python:3.13-slim

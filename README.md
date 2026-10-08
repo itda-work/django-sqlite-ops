@@ -15,7 +15,7 @@ PyPI 배포 전이다([D-4·D-9](docs/DECISIONS.md)). 패키지 이름 `django-s
 | [복제 헬스](#복제-헬스) | 구현됨 | [#7](https://github.com/itda-work/django-sqlite-ops/issues/7) |
 | [channels-lite 패치](#channels-lite-패치) | 구현됨 | [#8](https://github.com/itda-work/django-sqlite-ops/issues/8) |
 | [배포 프로필 문서](#배포-프로필) | 구현됨 | [#9](https://github.com/itda-work/django-sqlite-ops/issues/9) |
-| 회귀 랩(Docker 로 실패 경계 L1–L8 재현, 프로필 Dockerfile·compose 종단 검증, PRAGMA 벤치). 수동 실행(`scripts/lab.sh`), 기본 CI 밖 | 구현됨 | [#10](https://github.com/itda-work/django-sqlite-ops/issues/10) · [lab/README.md](lab/README.md) · [결과](docs/research/lab-2026-10-08.md) |
+| 회귀 랩(Docker 로 실패 경계 L1–L8 재현, 프로필 Dockerfile·compose 종단 검증, PRAGMA 벤치). 수동 실행(`scripts/lab.sh`, GitHub Actions `lab.yml`), 기본 CI 밖. arm64·amd64 모두 통과 | 구현됨 | [#10](https://github.com/itda-work/django-sqlite-ops/issues/10) · [lab/README.md](lab/README.md) · [결과](docs/research/lab-2026-10-08.md) |
 | 복원 검증 `sqlite_doctor --restore-test` | 예정(2단계) | [DESIGN §7](docs/DESIGN.md#7-헬스) |
 | VFS 읽기 복제본용 DB 라우터 | 예정(2단계) | [DESIGN §3-2](docs/DESIGN.md#3-2-2단계-이후) |
 
