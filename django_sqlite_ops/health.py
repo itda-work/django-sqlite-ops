@@ -12,6 +12,7 @@ Litestream 은 S3 가 끊겨도 로그·``status``·메트릭에 아무것도 �
 ``overall_status``)에 모은다.
 """
 
+import dataclasses
 import json
 import logging
 import math
@@ -33,6 +34,7 @@ from .boot import litestream
 from .boot.cli import real_path, state_path
 from .boot.decide import Remote, RemoteEmpty, RemoteError, RemoteTxid
 from .database import ENGINE
+from .wal import IN_SYNC, NO_EVIDENCE, PENDING, WalEvidence, compare
 
 __all__ = [
     "BACKLOG",
@@ -51,14 +53,17 @@ __all__ = [
     "Since",
     "alias_status",
     "file_times",
+    "files_went_backwards",
     "get_monitor",
     "health_view",
     "next_backlog_since",
     "next_pending_since",
+    "next_wal_pending_since",
     "overall_status",
     "parse_config",
     "read_boot_state",
     "redact",
+    "wal_evidence",
 ]
 
 SCHEMA_VERSION = 1
@@ -280,11 +285,17 @@ class Since:
 
 @dataclass(frozen=True, slots=True)
 class FileTimes:
-    """DB 변경 시각과 최신 로컬 L0 의 시각(벽시계 mtime). ``ltx_key`` 는 (이름, mtime_ns)."""
+    """DB 변경 시각과 최신 로컬 L0 의 시각(벽시계 mtime). ``ltx_key`` 는 (이름, mtime_ns).
+
+    보조 근거다(WAL 위치로 판정할 수 없을 때만 쓴다). ``db_mtime``·``wal_mtime`` 은 파일 시각
+    역행을 보려고 따로 둔다.
+    """
 
     db_changed_at: float | None
     ltx_at: float | None
     ltx_key: Any = None
+    db_mtime: float | None = None
+    wal_mtime: float | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -308,6 +319,8 @@ class Sample:
     files: FileTimes | None = None
     backlog_since: Since | None = None
     pending_since: Since | None = None
+    wal: WalEvidence | None = None
+    backwards: bool = False
 
 
 def read_boot_state(db_path: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -355,23 +368,62 @@ def read_boot_state(db_path: str) -> tuple[dict[str, Any] | None, str | None]:
 def next_backlog_since(
     prev: Since | None, local: int | None, remote: Remote | None, observed: float, wall: float
 ) -> Since | None:
-    """로컬 TXID 가 원격보다 앞서기 시작한 관측 시점. 앞서 있지 않으면 ``None``.
+    """아직 올라가지 않은 로컬 TXID 를 처음 관측한 시점. 로컬이 앞서 있지 않으면 ``None``.
 
-    앞선 상태가 이어지면 처음 본 시점을 유지하고, 끊기면 지운다. 프로세스 안에서만 추적하므로
-    재시작하면 초기화된다.
+    ``key`` 는 그때의 로컬 TXID 다. 원격이 그 TXID 에 닿으면(올라감) 지금의 로컬 TXID 로 다시
+    센다. 그래서 지속 시간은 "관측한 미업로드 TXID 가 기다린 시간"이다: 쓰기가 계속되어 매 관측
+    순간 로컬이 한 걸음 앞서도 업로드가 따라오면 쌓이지 않고(실측: 30ms 간격 쓰기에서 0.5초마다
+    보면 늘 앞서 있다), 업로드가 쓰기를 못 따라가면 쌓인다. 프로세스 안에서만 추적하므로 재시작하면
+    초기화된다.
     """
-    if type(remote) is RemoteTxid and type(local) is int and local > remote.txid:
-        return prev if prev is not None else Since(observed, wall)
-    return None
+    if not (type(remote) is RemoteTxid and type(local) is int and local > remote.txid):
+        return None
+    if prev is not None and type(prev.key) is int and remote.txid < prev.key:
+        return prev
+    return Since(observed, wall, local)
+
+
+def next_wal_pending_since(
+    prev: Since | None, wal: WalEvidence | None, observed: float, wall: float
+) -> Since | None:
+    """WAL 에 최신 L0 가 담지 않은 커밋이 있음을 처음 관측한 시점. 아니면 ``None``.
+
+    판정의 주 근거다(시계를 쓰지 않는다). 최신 L0 의 WAL 위치가 바뀌면(``wal.key``) 다시 센다:
+    Litestream 이 진행하는 한 바쁜 DB 에서도 지속 시간이 쌓이지 않는다.
+    """
+    if wal is None or wal.state != PENDING:
+        return None
+    key = ("wal", wal.key)
+    if prev is not None and prev.key == key:
+        return prev
+    return Since(observed, wall, key)
+
+
+def files_went_backwards(prev: FileTimes | None, cur: FileTimes | None) -> bool:
+    """DB·WAL·최신 L0 의 mtime 중 하나라도 앞선 관측보다 이르면 참(벽시계 역행 등).
+
+    파일마다 앞뒤 관측 모두에 있을 때만 비교한다(``-wal`` 이 지워졌다 생기는 것은 역행이 아니다).
+    """
+    if prev is None or cur is None:
+        return False
+    pairs = (
+        (prev.db_mtime, cur.db_mtime),
+        (prev.wal_mtime, cur.wal_mtime),
+        (prev.ltx_at, cur.ltx_at),
+    )
+    return any(a is not None and b is not None and b < a for a, b in pairs)
 
 
 def next_pending_since(
     prev: Since | None, files: FileTimes | None, observed: float, wall: float
 ) -> Since | None:
-    """DB 파일이 최신 로컬 L0 보다 새로워진 것을 처음 관측한 시점. 아니면 ``None``.
+    """(보조) DB 파일이 최신 로컬 L0 보다 새로워진 것을 처음 관측한 시점. 아니면 ``None``.
 
-    DB 연결 없이 복제 프로세스의 정지를 보는 근거다. Litestream 은 DB 변경을 L0 로 기록하므로
-    (``monitor-interval`` 기본 1초) 살아 있으면 곧 더 새 L0 가 생긴다. 최신 L0 가 바뀌면(이름·
+    WAL 위치로 판정할 수 없을 때만 쓴다. **파일 시각의 순서는 그 커밋이 L0 에 들어갔다는 증거가
+    아니다**(L0 는 복사를 시작할 때 WAL 범위를 정하고 끝날 때 mtime 이 찍힌다 — review-2 재현).
+    그래서 이 근거는 backlog 쪽으로만 쓰고, 아니라고 해서 ``in_sync`` 로 단정하지 않는다.
+    Litestream 은 DB 변경을 L0 로 기록하므로(``monitor-interval`` 기본 1초) 살아 있으면 곧 더 새
+    L0 가 생긴다. 최신 L0 가 바뀌면(이름·
     mtime) 새로 센다: 쓰기가 계속되는 DB 에서 매 관측 순간 DB 가 조금 더 새로워도 Litestream 이
     진행하는 한 지속 시간이 쌓이지 않는다. mtime 끼리의 차이는 지속 시간으로 쓰지 않는다(오래된
     유휴 DB 에 첫 쓰기가 오면 차이가 바로 커 보인다).
@@ -388,6 +440,17 @@ def next_pending_since(
     return Since(observed, wall, files.ltx_key)
 
 
+def _wal_fields(wal: WalEvidence | None) -> dict[str, Any] | None:
+    if wal is None:
+        return None
+    return {
+        "evidence": wal.state,
+        "reason": wal.reason,
+        "ltx_wal_end": wal.ltx_end,
+        "wal_commit_end": wal.commit_end,
+    }
+
+
 def _fields(sample: Sample | None, now: float) -> dict[str, Any]:
     if sample is None:
         return {
@@ -400,6 +463,7 @@ def _fields(sample: Sample | None, now: float) -> dict[str, Any]:
             "pending_since": None,
             "db_changed_at": None,
             "ltx_at": None,
+            "wal": None,
             "boot_state": None,
             "boot_state_error": None,
         }
@@ -415,6 +479,7 @@ def _fields(sample: Sample | None, now: float) -> dict[str, Any]:
         "pending_since": _iso(sample.pending_since.wall) if sample.pending_since else None,
         "db_changed_at": _iso(files.db_changed_at) if files else None,
         "ltx_at": _iso(files.ltx_at) if files else None,
+        "wal": _wal_fields(sample.wal),
         "boot_state": sample.boot_state,
         "boot_state_error": sample.boot_state_error,
     }
@@ -492,20 +557,48 @@ def _verdict(
                     f"(BACKLOG_GRACE {grace:g}s)"
                 ),
             )
-    if sample.pending_since is not None and sample.files is not None:
-        pending = sample.observed - sample.pending_since.mono
-        if pending >= grace:
+    wal = sample.wal
+    pending = sample.observed - sample.pending_since.mono if sample.pending_since else None
+    if wal is None or wal.state not in (PENDING, IN_SYNC):
+        # WAL 로는 판정할 수 없다. 파일 시각은 보조 근거라 backlog 쪽으로만 쓴다.
+        why = wal.reason if wal is not None else "no WAL evidence"
+        files = sample.files
+        if sample.backwards:
+            return (
+                UNKNOWN,
+                "file_time_backwards",
+                (
+                    "a DB, -wal or L0 file time moved backwards since the last check (clock "
+                    f"change?) and the -wal gives no evidence ({why})"
+                ),
+            )
+        if pending is not None and pending >= grace:
             return (
                 BACKLOG,
                 "db_not_replicated",
                 (
-                    f"DB changed at {_iso(sample.files.db_changed_at)} but Litestream has not "
-                    f"recorded a new L0 since {_iso(sample.files.ltx_at)} (observed for "
-                    f"{pending:.0f}s, BACKLOG_GRACE {grace:g}s); is the replicate process running? "
-                    "(a write, or a checkpoint when the last connection closed, changes the "
-                    "DB files)"
+                    f"DB files changed at {_iso(files.db_changed_at if files else None)} after "
+                    f"the latest local L0 ({_iso(files.ltx_at if files else None)})"
+                    f" and stayed so for {pending:.0f}s (BACKLOG_GRACE {grace:g}s); is the "
+                    "replicate process running? (file times only; the -wal gives no evidence: "
+                    f"{why})"
                 ),
             )
+        return (
+            UNKNOWN,
+            "no_wal_evidence",
+            f"cannot tell whether every commit is in the latest local L0: {why}",
+        )
+    if wal.state == PENDING and pending is not None and pending >= grace:
+        return (
+            BACKLOG,
+            "db_not_replicated",
+            (
+                f"the -wal has commits after the latest local L0 (L0 ends at WAL byte "
+                f"{wal.ltx_end}) for {pending:.0f}s (BACKLOG_GRACE {grace:g}s); is the "
+                "replicate process running?"
+            ),
+        )
     if remote.txid < sample.local:
         behind = sample.observed - (
             sample.backlog_since.mono if sample.backlog_since else sample.observed
@@ -515,17 +608,20 @@ def _verdict(
             "local_ahead_within_grace",
             (f"local is ahead of the replica for {behind:.0f}s, within BACKLOG_GRACE {grace:g}s"),
         )
-    if sample.pending_since is not None:
-        pending = sample.observed - sample.pending_since.mono
+    if wal.state == PENDING:
         return (
             CAUGHT_UP,
             "db_changed_within_grace",
             (
-                f"the DB changed after the latest local L0 {pending:.0f}s ago, within "
-                f"BACKLOG_GRACE {grace:g}s"
+                f"the -wal has commits after the latest local L0 for {pending or 0:.0f}s, "
+                f"within BACKLOG_GRACE {grace:g}s"
             ),
         )
-    return CAUGHT_UP, "in_sync", "local and replica are at the same TXID"
+    return (
+        CAUGHT_UP,
+        "in_sync",
+        "local and replica are at the same TXID and every -wal commit is in the latest L0",
+    )
 
 
 def alias_status(
@@ -535,8 +631,10 @@ def alias_status(
 
     판정 순서(처음 맞는 것): 조회 전 · 오래된 결과(``REFRESH × 3`` 초과) · 사전 오류 ·
     ``unknown_at_boot`` · 원격 실패 · 원격 빈 목록 · 로컬 메타 없음 · 원격이 앞섬 → ``unknown``.
-    로컬 TXID 가 앞선 지속 시간 ≥ ``grace`` → ``backlog``. DB 가 최신 L0 보다 새로운 상태의
-    지속 시간 ≥ ``grace`` → ``backlog``. 그 밖은 ``caught_up``. 지속 시간은 monotonic 관측
+    로컬 TXID 가 앞선 지속 시간 ≥ ``grace`` → ``backlog``. 그다음 WAL 위치(주 근거)로 판단할 수
+    없으면: 파일 시각 역행 → ``unknown``, 파일 시각(보조)이 grace 이상 L0 보다 새로움 →
+    ``backlog``, 그 밖 → ``unknown``(``caught_up`` 으로 단정하지 않는다). WAL 에 L0 뒤 커밋이
+    grace 이상 남음 → ``backlog``. 그 밖은 ``caught_up``. 지속 시간은 monotonic 관측
     시각(``observed``)끼리의 차이다.
     """
     status, code, reason = _verdict(sample, now, refresh, grace)
@@ -605,7 +703,8 @@ def file_times(db: str, meta: str | None) -> FileTimes:
     grace 를 넘기면 "쓰기가 복제되지 않았다"가 아니라 "DB 가 쓰이는데 Litestream 이 진행하지
     않는다"로 읽는다.
     """
-    times = [t for t in (_mtime(db), _mtime(db + "-wal")) if t is not None]
+    db_mtime, wal_mtime = _mtime(db), _mtime(db + "-wal")
+    times = [t for t in (db_mtime, wal_mtime) if t is not None]
     found = litestream.local_max_ltx(db, meta_path=meta)
     ltx_at = ltx_key = None
     if found is not None:
@@ -614,12 +713,27 @@ def file_times(db: str, meta: str | None) -> FileTimes:
             ltx_at, ltx_key = st.st_mtime, (found[1].name, st.st_mtime_ns)
         except OSError:
             pass
-    return FileTimes(max(times) if times else None, ltx_at, ltx_key)
+    return FileTimes(max(times) if times else None, ltx_at, ltx_key, db_mtime, wal_mtime)
+
+
+def wal_evidence(db: str, meta: str | None) -> WalEvidence:
+    """최신 로컬 L0 의 WAL 위치와 현재 ``-wal`` 의 커밋 위치를 비교한다(``wal.compare``).
+
+    ``key`` 는 (L0 이름, L0 의 WAL 끝, salt) — L0 가 바뀌면 pending 을 다시 센다.
+    """
+    found = litestream.local_max_ltx(db, meta_path=meta)
+    if found is None:
+        return WalEvidence(NO_EVIDENCE, "no readable local L0")
+    rng = litestream.ltx_wal_range(found[1])
+    evidence = compare(db + "-wal", rng)
+    key = None if rng is None else (found[1].name, rng.end, rng.salt1, rng.salt2)
+    return dataclasses.replace(evidence, key=key)
 
 
 Probe = Callable[[AliasConfig, str], Remote]
 LocalProbe = Callable[[str, str | None], int | None]
 FileProbe = Callable[[str, str | None], FileTimes | None]
+WalProbe = Callable[[str, str | None], WalEvidence | None]
 
 
 def _remote(cfg: AliasConfig, db: str) -> Remote:
@@ -641,6 +755,7 @@ class Monitor:
     remote: Probe = _remote
     local: LocalProbe = _local
     files: FileProbe = file_times
+    wal: WalProbe = wal_evidence
     path_of: Callable[[str], tuple[str | None, str | None]] = _db_path
     clock: Callable[[], float] = time.time
     monotonic: Callable[[], float] = time.monotonic
@@ -692,12 +807,20 @@ class Monitor:
         else:
             self._logged.pop(cfg.alias, None)
         local = self.local(real, meta)
+        wal = self.wal(real, meta)
         files = self.files(real, meta)
         observed, wall = self._now()
         backlog = next_backlog_since(
             prev.backlog_since if prev else None, local, remote, observed, wall
         )
-        pending = next_pending_since(prev.pending_since if prev else None, files, observed, wall)
+        prev_pending = prev.pending_since if prev else None
+        backwards = files_went_backwards(prev.files if prev else None, files)
+        if wal is not None and wal.state in (PENDING, IN_SYNC):
+            pending = next_wal_pending_since(prev_pending, wal, observed, wall)
+        elif backwards:
+            pending = prev_pending  # 역행했다고 앞선 미복제 근거를 지우지 않는다
+        else:
+            pending = next_pending_since(prev_pending, files, observed, wall)
         return Sample(
             observed,
             wall,
@@ -709,6 +832,8 @@ class Monitor:
             files=files,
             backlog_since=backlog,
             pending_since=pending,
+            wal=wal,
+            backwards=backwards,
         )
 
     def refresh_once(self) -> None:
