@@ -42,12 +42,12 @@ PID 1 boot → exec → litestream replicate -exec "..."            nats-server
 
 - boot·잠금 상속·`migrate` 위치·PID 1 은 [`single-server` §2](single-server.md#2-구성-요소와-프로세스-트리) 와 같다.
 - **nats-server 는 `litestream -exec` 아래에 두지 않는다.** `-exec` 는 명령 하나만 띄우고, 그 자식이 끝나면 litestream 도 끝난다(`litestream replicate -h`). 브로커는 별도 컨테이너나 systemd·Windows 서비스로 띄운다. 이 패키지는 nats-server 를 감독하지 않는다([DESIGN §3-3](../DESIGN.md)).
-- **종료 순서**: `docker stop` → litestream(PID 1)이 SIGTERM 을 자식(uvicorn 감독 프로세스)에게 넘김 → 감독 프로세스가 워커들을 내림 → litestream 이 마지막 sync 후 종료. Docker 랩에서 gunicorn 워커 구성으로 0.4초, exit 0, 400/400 복제였다(docker D1a). `uvicorn --workers 2` 는 macOS 호스트에서 감독 프로세스가 SIGTERM 을 받아 워커 둘을 내리고 litestream 이 끝나는 것만 확인했다(#9). 컨테이너 실측은 회귀 랩([#10](https://github.com/itda-work/django-sqlite-ops/issues/10), [DESIGN §10](../DESIGN.md))의 몫이다.
+- **종료 순서**: `docker stop` → litestream(PID 1)이 SIGTERM 을 자식(uvicorn 감독 프로세스)에게 넘김 → 감독 프로세스가 워커들을 내림 → litestream 이 마지막 sync 후 종료. Docker 랩에서 gunicorn 워커 구성으로 0.4초, exit 0, 400/400 복제였다(docker D1a). `uvicorn --workers 2` 컨테이너(이 문서의 compose·entrypoint, `WEB_WORKERS=2`)에서 400건을 쓰고 곧바로 `docker stop` 하자 0.5초 만에 exit 0, 복제본 400/400 이었다. 로그 순서: litestream `sending signal to exec process` → 감독 프로세스 `Received SIGTERM, exiting.` → 워커 둘 `Shutting down`·`Finished server process` → `Stopping parent process` → `litestream shut down`(회귀 랩 P2, [`lab-2026-10-08.md`](../research/lab-2026-10-08.md)).
 - 앱이 내려가는 동안 브로커는 떠 있어야 워커의 마지막 메시지가 나간다. compose 는 `depends_on` 의 역순으로 서비스를 내린다(의존하는 `app` 이 `nats` 보다 먼저, [Docker 문서](https://docs.docker.com/compose/how-tos/startup-order/)).
 
 ## 3. 설정 조각
 
-`litestream.yml`, Dockerfile 은 [`single-server` §3](single-server.md#3-설정-조각) 과 같다(Dockerfile 은 #10 랩에서 종단 검증 예정). `requirements.txt` 에 채널 레이어 패키지를 더한다(`channels-nats` 또는 `channels-redis`). 이 패키지의 `[nats]` extra 로 넣어도 된다.
+`litestream.yml`, Dockerfile 은 [`single-server` §3](single-server.md#3-설정-조각) 과 같다(Dockerfile 은 회귀 랩에서 종단 검증함). `requirements.txt` 에 채널 레이어 패키지를 더한다(`channels-nats` 또는 `channels-redis`). 이 패키지의 `[nats]` extra 로 넣어도 된다.
 
 ### `settings.py` — channels-nats (추천)
 
@@ -133,7 +133,7 @@ exec python -m django_sqlite_ops.boot \
 
 ### `compose.yaml` (예)
 
-> **#10 랩에서 종단 검증 예정.** YAML 구문만 검사했다. 두 `settings.py` 조각과 `entrypoint.sh` 의 검증 범위는 [`single-server` §3](single-server.md#3-설정-조각) 표와 같다.
+> **종단 검증함**(회귀 랩 P2): 이 파일 그대로에 이미지 이름·라벨·호스트 포트를 덮고 `WEB_WORKERS=2`·nats 이미지 태그 고정으로 띄웠다. 앱이 워커 2개(서로 다른 PID)로 응답하고, `sqlite_doctor` 가 exit 0·`channels_nats.NatsChannelLayer` OK 였다. 채널 레이어를 런타임에 쓰는 검증(channels-nats 설치·메시지 전달)은 하지 않았다. 두 `settings.py` 조각과 `entrypoint.sh` 의 검증 범위는 [`single-server` §3](single-server.md#3-설정-조각) 표와 같다.
 
 ```yaml
 services:

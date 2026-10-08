@@ -45,7 +45,7 @@ litestream replicate -config /etc/litestream.yml -exec "..."     PID 1, 복제
 - **`migrate` 는 `-exec` 안에서 돈다.** boot 단계에서 `manage.py` 를 부르면 `django.setup()` 중에 빈 DB 파일이 생겨 복원이 건너뛰어질 수 있다([DESIGN §4-1](../DESIGN.md)). `-exec` 안이면 litestream 이 이미 복제를 시작한 뒤라 마이그레이션도 복제된다. 마이그레이션·VACUUM 을 복제 중에 돌려도 원본과 복원본이 일치했다(scenarios S8, 50,294건).
 - **litestream 이 PID 1 이다.** 별도 init(tini 등)이 필요 없었다(docker D1a).
 - **종료 순서**: `docker stop` → PID 1(litestream)에 SIGTERM → litestream 이 자식에게 신호를 넘기고 자식이 끝나기를 기다림 → 마지막 sync → 종료. Docker 랩에서 0.4초 만에 exit 0 으로 내려갔고 400건 중 400건이 복제됐다(docker D1a). `docker kill`(SIGKILL)로 쓰는 도중에 죽여도 응답한 1,600건이 로컬 볼륨과 복제본에 모두 있었고, 같은 볼륨으로 다시 띄우면 이어서 서비스했다(docker D1b).
-  - D1a·D1b 는 **gunicorn(WSGI)** 으로 잰 값이다. uvicorn(ASGI)은 macOS 호스트에서 `litestream replicate -exec "sh -c 'exec uvicorn ...'"` 의 litestream 에 SIGTERM 을 보내 uvicorn 이 정상 종료하고 litestream 이 `litestream shut down` 으로 끝나는 것만 확인했다(#9). 컨테이너에서의 같은 실측(복제 건수 포함)은 회귀 랩([#10](https://github.com/itda-work/django-sqlite-ops/issues/10), [DESIGN §10](../DESIGN.md))의 몫이다.
+  - D1a·D1b 는 **gunicorn(WSGI)** 으로 잰 값이다. **uvicorn(ASGI) 컨테이너**에서도 같았다: 이 문서의 Dockerfile·compose·entrypoint 그대로 400건을 쓰고 곧바로 `docker stop` 하자 0.4초 만에 exit 0 으로 내려갔고 복제본은 400/400(integrity ok)이었다. 로그 순서는 `signal received, litestream shutting down` → `sending signal to exec process` → uvicorn `Shutting down` → `Finished server process` → `litestream shut down` 이다(회귀 랩 P1, [`lab-2026-10-08.md`](../research/lab-2026-10-08.md)).
   - `-exec` 의 자식이 끝나면 litestream 도 끝난다(`litestream replicate -h`). 앱이 죽으면 컨테이너가 내려가고 재시작 정책이 다시 띄운다. 이때 다시 boot 부터 돈다.
 - `stop_grace_period` 는 앱의 graceful 종료 시간보다 넉넉하게 준다. 짧으면 Docker 가 SIGKILL 을 보내 마지막 sync 가 빠질 수 있다(그래도 로컬 볼륨에는 남는다, D1b).
 
@@ -58,8 +58,8 @@ litestream replicate -config /etc/litestream.yml -exec "..."     PID 1, 복제
 | `settings.py`, `urls.py` | 그대로 실행하고, `check --deploy` 에서 `sqlite_ops.*` 경고가 없음(`channels` 를 import 하지 못하게 막은 상태에서도) |
 | `litestream.yml` | 실제 litestream 0.5.17 의 `litestream databases -config` 가 읽음 |
 | `entrypoint.sh` | `bash -n`·`sh -n` 문법 검사 |
-| `compose.yaml` | YAML 구문만 |
-| Dockerfile, `requirements.txt` | 검증 안 함. 컨테이너 종단 검증은 [#10](https://github.com/itda-work/django-sqlite-ops/issues/10) 회귀 랩에서 할 예정 |
+| `compose.yaml` | YAML 구문, 그리고 회귀 랩이 그대로 띄운다(이미지 이름·라벨·호스트 포트만 덮음) |
+| Dockerfile, `requirements.txt` | 회귀 랩(`lab/`, #10)이 이 블록을 그대로 꺼내 빌드하고 띄운다. 다른 점은 패키지를 GitHub 대신 작업 트리 wheel 로 넣는 한 줄뿐이다([lab/README.md](../../lab/README.md)) |
 
 ### `settings.py`
 
@@ -135,7 +135,7 @@ dbs:
 
 Litestream 은 공식 설치 방법(릴리스 `.deb` + `dpkg`, https://litestream.io/install/linux/)으로 넣고, 같은 릴리스의 `checksums.txt` 와 SHA-256 이 맞을 때만 설치한다. CI 의 `litestream` 잡과 같은 방식이다.
 
-> **#10 랩에서 종단 검증 예정.** 이 Dockerfile 은 아직 빌드해 보지 않았다. 설치 단계는 CI 잡의 스크립트를 옮긴 것이다.
+> **종단 검증함**(회귀 랩 P1, [`lab-2026-10-08.md`](../research/lab-2026-10-08.md)). 이 Dockerfile 을 그대로 빌드해(`python:3.13-slim`, linux/arm64) 아래 compose 로 띄우고 첫 배포·`check --deploy`·`sqlite_doctor`·정지·재부팅을 확인했다. 랩은 `requirements.txt` 의 패키지 줄만 작업 트리 wheel 로 바꾼다.
 
 ```dockerfile
 FROM python:3.13-slim
@@ -185,7 +185,7 @@ ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 ```
 
 - `/data` 는 앱 사용자(`app`, uid 10001) 소유다. boot 는 그 안에 잠금·상태 파일·임시 복원 디렉터리를 만들고 격리할 때 rename 하므로, DB 파일뿐 아니라 디렉터리에도 쓰기 권한이 있어야 한다.
-- 이름 있는 빈 볼륨을 `/data` 에 처음 붙이면 Docker 가 이미지의 `/data` 내용을 볼륨으로 복사한다([Docker 문서](https://docs.docker.com/engine/storage/volumes/)). 이때 소유자까지 넘어오는지는 #10 랩에서 확인한다. 바인드 마운트(`./data:/data`)면 호스트 디렉터리의 소유자를 uid 10001 로 맞춘다.
+- 이름 있는 빈 볼륨을 `/data` 에 처음 붙이면 Docker 가 이미지의 `/data` 내용을 볼륨으로 복사한다([Docker 문서](https://docs.docker.com/engine/storage/volumes/)). **소유자도 함께 넘어온다**: 새 볼륨의 `/data` 가 `10001:10001`(권한 755)이었다(회귀 랩 P1·P2, Docker 29.5.2). 바인드 마운트(`./data:/data`)는 복사가 일어나지 않으므로 호스트 디렉터리의 소유자를 uid 10001 로 맞춘다.
 
 `requirements.txt` 예(PyPI 배포 전이라 GitHub 아카이브로 받는다. 이미지에 `git` 이 없어도 된다):
 
@@ -223,7 +223,7 @@ exec python -m django_sqlite_ops.boot \
 
 ### `compose.yaml` (예)
 
-> **#10 랩에서 종단 검증 예정.** YAML 구문만 검사했다.
+> **종단 검증함**(회귀 랩 P1). 이 파일 그대로에 이미지 이름·라벨·호스트 포트(`127.0.0.1` 임의 포트)만 덮어 띄웠다.
 
 ```yaml
 services:
@@ -263,13 +263,13 @@ boot 의 판정·사유 코드·종료 코드는 [README boot CLI](../../README.
 ### 무상태 교체 (볼륨 없음)
 
 - 볼륨이 없어도 이미지의 `/data`(Dockerfile 에서 만들고 앱 사용자 소유로 둔 디렉터리)가 DB 의 부모 디렉터리가 된다. boot 는 없는 부모를 exit 64 로 거부하므로, 이미지를 직접 만들 때도 이 단계를 빼지 않는다.
-- 볼륨 없이 새 컨테이너를 띄우면 boot 는 `fresh` 로 판정해 복제본을 복원한다. Docker 랩에서 새 컨테이너가 2.4초 만에 복원하고 200건 중 200건으로 떴다(docker D1c).
+- 볼륨 없이 새 컨테이너를 띄우면 boot 는 `fresh` 로 판정해 복제본을 복원한다. Docker 랩에서 새 컨테이너가 2.4초 만에 복원하고 200건 중 200건으로 떴다(docker D1c). boot 를 거친 ASGI 구성에서도 새 컨테이너가 `fresh` → 복원으로 200건 그대로 떴고, 이어 쓴 것도 복제됐다(회귀 랩 L1).
 - **정지 후 기동**으로 배포한다: 옛 컨테이너를 멈추고(마지막 sync 를 위해 `docker stop`) 새 컨테이너를 띄운다. 두 컨테이너가 겹치면 둘 다 쓴다(§1).
 - 볼륨이 없으므로 호스트가 죽으면 마지막 sync 이후의 쓰기를 잃는다(약 1초, scenarios RPO). S3 가 끊긴 동안 쌓인 변경도 그 서버 디스크에만 있다(docker D2: 20초 단절 동안 WAL 8.5MB).
 
 ### 옛 볼륨 재부팅이 거부될 때 (`remote_ahead`)
 
-- 볼륨 A 로 쓰다가 다른 볼륨 B 로 이어 쓴 뒤 A 로 다시 부팅하면, 보호가 없을 때는 최신본 150건이 55건으로 덮였다(docker D4, scenarios 함정 B). boot 는 이 경우 복제본이 앞섰다고 보고 거부한다(회귀 랩 L2, [DESIGN §10](../DESIGN.md)).
+- 볼륨 A 로 쓰다가 다른 볼륨 B 로 이어 쓴 뒤 A 로 다시 부팅하면, 보호가 없을 때는 최신본 150건이 55건으로 덮였다(docker D4, scenarios 함정 B). boot 는 이 경우 복제본이 앞섰다고 보고 거부한다(회귀 랩 L2 에서 확인함: exit 2 `remote_ahead`, 복제본 150건·TXID 그대로, [`lab-2026-10-08.md`](../research/lab-2026-10-08.md)).
 - 복제본이 정본이 맞으면 `BOOT_FLAGS="--on-unknown restore"` 로 **한 번** 부팅한다. 로컬은 `<db>.stale-<ts>/` 로 격리되고 복제본이 복원된다. 격리본은 boot 가 지우지 않으므로 확인한 뒤 직접 지운다.
 - 로컬이 정본이라고 판단되면(복제본 쪽이 실수로 쓰인 경우) 자동 판정할 방법이 없다(D-7). 복제본 상태를 조사한 뒤 사람이 정한다.
 

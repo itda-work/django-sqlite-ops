@@ -52,3 +52,7 @@
 - SeaweedFS 는 버킷마다 볼륨을 잡는다. 랩에서는 버킷 하나를 두고 prefix 로 나누며, `-volume.max` 를 올린다.
 - macOS 에는 `timeout` 명령이 없다.
 - aio 계열 채널 레이어는 `await layer.close()` 가 없으면 프로세스가 끝나지 않을 수 있다.
+- S3 가 연결을 **거부**해도 `litestream ltx` 는 바로 실패하지 않고 재시도하며 매달린다(0.5.17, toxiproxy 로 재현함 — boot 는 `--ltx-timeout` 30초 뒤 `remote_error`). 그래서 S3 전체 단절 중 헬스는 `backlog` 가 아니라 `unknown`(`stale`)이다. `backlog` 는 업로드만 끊기고 조회가 될 때 나온다(#10 L8a·L8b).
+- compose 는 어느 서비스도 쓰지 않거나 비활성 프로필 서비스만 쓰는 볼륨을 모델에서 빼고, `down -v` 도 그 볼륨을 지우지 않는다(Compose 5.5.1, 재현함). 랩은 모든 볼륨을 붙인 `volume-holder` 서비스와 `--profile app down -v` 로 지운다. 정리 뒤 `docker volume ls --filter label=io.itda.dso-lab=1` 로 확인한다.
+- `uv build --out-dir D` 는 D 에 `.gitignore` 도 남긴다. `rmdir` 이 실패한다.
+- 이 호스트의 Docker(colima)에는 다른 프로젝트 컨테이너가 돈다. 랩 자원은 `lab/README.md` 의 규칙(프로젝트 이름 `dso-lab*`, 라벨 `io.itda.dso-lab=1`, `down -v` 만)으로만 다룬다.

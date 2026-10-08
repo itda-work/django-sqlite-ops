@@ -222,7 +222,7 @@ django_sqlite_ops/
   | `synchronous` | `NORMAL` | 실측 조건에 포함(같은 문서). WAL 에서 커밋 내구성은 체크포인트 전 전원 손실 시 마지막 트랜잭션이 빠질 수 있다 — 문서에 명시 | 켬 |
   | `busy_timeout` | 5000ms | 실측 조건에 포함(같은 문서). Python `timeout` 기본 5초와 같은 값으로 맞춘다 | 켬 |
   | `foreign_keys` | `ON` | Django sqlite3 백엔드가 이미 켠다 — 생성 함수는 건드리지 않는다 | 해당 없음 |
-  | `temp_store`, `mmap_size`, `cache_size`, `journal_size_limit` | 후보 | **미검증.** 랩 벤치(§10) 뒤에 기본값으로 올릴지 정한다 | 끔 |
+  | `temp_store`, `mmap_size`, `cache_size`, `journal_size_limit` | 후보 | 랩 벤치(§10, 2026-10-08): 개선이 재현된 후보 없음. `cache_size=-65536` 단독은 반복마다 나빠짐(처리량 −8~−12%, p99 +17~+27%, `CONN_MAX_AGE=0`). `journal_size_limit` 의 WAL 효과는 관측 못 함([`lab-2026-10-08.md`](research/lab-2026-10-08.md#pragma-벤치)) | 끔 |
   | `wal_autocheckpoint` | 건드리지 않음 | Litestream 이 체크포인트를 관리한다. 바꾸면 복제와 충돌할 수 있다 [확인 필요] | 끔 |
   | `CONN_MAX_AGE` | 프로필별 | VFS 별칭은 `None` 필수(실측 1,008ms → 1.7ms, WSGI). ASGI 는 미검증 | 2단계(VFS 프로필) |
 
@@ -442,20 +442,25 @@ SQLITE_OPS = {
 
 스파이크 랩(`docs/reference/compose.yaml`, `Dockerfile`, `entrypoint.sh`)을 바탕으로 `lab/` 에 다시 만든다. S3 대체는 SeaweedFS 다(MinIO 는 익명 pull 이 막혀 있었다). 장애 주입은 toxiproxy 로 한다.
 
-| ID | 시나리오 | 기대 |
-|---|---|---|
-| L1 | 볼륨 없이 새 컨테이너 | `fresh` → 복원, 행 수 일치 |
-| L2 | 옛 볼륨으로 재부팅(D4) | `unknown` → 거부(exit 2), 복제본 손상 0 |
-| L3 | 로컬 메타만 삭제 | `unknown` → 거부 (스파이크는 여기서 새 DB 를 버렸다) |
-| L4 | S3 끊김 중 부팅 | `unknown` → 거부 |
-| L5 | 복제되지 않은 로컬 커밋이 있는 상태로 재부팅 | `match` → 진행, 커밋 보존 |
-| L6 | `--on-unknown restore` 진행 중 kill → 재시작 | 반쯤 옮겨진 상태 없음, 재실행으로 완료 |
-| L7 | 복원 실패(S3 객체 손상) | exit 4, 로컬 무변경 |
-| L8 | 헬스: S3 20초 끊김 | `backlog` → 복구 후 `caught_up` |
+구현은 `lab/`(설명 `lab/README.md`), 실행은 `scripts/lab.sh run [L1..L8|P1|P2|all]`·`bench`. 기본 `pytest`·CI 에는 들어가지 않는다(`RUN_LAB=1` 일 때만 수집). 결과: [`docs/research/lab-2026-10-08.md`](research/lab-2026-10-08.md).
 
-- **PRAGMA 벤치**: §6-0 의 후보(`temp_store`, `mmap_size`, `cache_size`, `journal_size_limit`)를 켠 경우와 끈 경우의 처리량·p99·WAL 크기를 잰다. 차이가 재현될 때만 기본값으로 올린다.
-- 랩 자원은 compose 프로젝트명과 라벨로 구분하고, 끝나면 반드시 `down -v` 한다. 같은 호스트에 다른 프로젝트 컨테이너가 있다.
+| ID | 시나리오 | 기대 | 결과(2026-10-08) |
+|---|---|---|---|
+| L1 | 볼륨 없이 새 컨테이너 | `fresh` → 복원, 행 수 일치 | 통과(200/200, 무상태 교체 D1c 포함) |
+| L2 | 옛 볼륨으로 재부팅(D4) | `unknown` → 거부(exit 2), 복제본 손상 0 | 통과(`remote_ahead`, 복제본 TXID·150건 그대로) |
+| L3 | 로컬 메타만 삭제 | `unknown` → 거부 (스파이크는 여기서 새 DB 를 버렸다) | 통과(`no_local_meta`, DB 해시 그대로) |
+| L4 | S3 끊김 중 부팅 | `unknown` → 거부 | 통과(`remote_error`. 연결 거부도 `ltx` 가 매달려 30초 타임아웃에서 거부) |
+| L5 | 복제되지 않은 로컬 커밋이 있는 상태로 재부팅 | `match` → 진행, 커밋 보존 | 통과(65건 보존, 이후 복제) |
+| L6 | `--on-unknown restore` 진행 중 kill → 재시작 | 반쯤 옮겨진 상태 없음, 재실행으로 완료 | 통과(rename 8곳 모두에서 kill, 재실행 완료, 옛 DB·메타 같은 격리 디렉터리) |
+| L7 | 복원 실패(S3 객체 손상) | exit 4, 로컬 무변경 | 통과(새 컨테이너·격리 경로 모두 exit 4, 로컬 해시 그대로) |
+| L8 | 헬스: S3 20초 끊김 | `backlog` → 복구 후 `caught_up` | 조건부: 업로드만 끊기면(L8b) `backlog` → `caught_up`. 조회까지 끊기면(L8a) `unknown`(`stale`) → `caught_up` — §7 표대로 원격 조회 실패는 `unknown` 이 먼저다 |
+
+배포 프로필 종단 검증(P1·P2): 문서의 Dockerfile·compose·entrypoint·settings 를 그대로 띄워 첫 배포·`check --deploy`·`sqlite_doctor`·`docker stop`(uvicorn 워커 1·2: exit 0, 0.4–0.5초, 400/400 복제)·재부팅·빈 볼륨 소유자 복사를 확인했다.
+
+- **PRAGMA 벤치**: §6-0 의 후보(`temp_store`, `mmap_size`, `cache_size`, `journal_size_limit`)를 켠 경우와 끈 경우의 처리량·p99·WAL 크기를 잰다. 차이가 재현될 때만 기본값으로 올린다. 2026-10-08 결과(반복 5): 넷 중 개선이 반복해서 재현된 것은 없고, `cache_size=-65536` 단독은 반복해서 나빠졌다. 기본값은 바꾸지 않는다([`lab-2026-10-08.md`](research/lab-2026-10-08.md#pragma-벤치)).
+- 랩 자원은 compose 프로젝트명(`dso-lab*`)과 라벨(`io.itda.dso-lab=1`)로 구분하고, 끝나면 반드시 `down -v` 한다(실패해도 `trap`). 같은 호스트에 다른 프로젝트 컨테이너가 있다.
 - ASGI(uvicorn) 엔트리포인트로 돌린다. 스파이크는 WSGI(gunicorn)만 검증했다.
+- L6 의 kill 지점은 `lab_hooks/sitecustomize.py` 가 rename 뒤마다 잠들어 맞춘다(패키지 코드는 그대로). L7 은 SeaweedFS filer API 로 LTX 객체 본문을 뒤집는다.
 
 ## 11. 테스트·검증 원칙
 - `sqlite_database()` 출력은 프로필별 스냅샷 테스트로 고정한다. Django 를 막은 상태에서 import 되는지도 본다.
@@ -467,6 +472,9 @@ SQLITE_OPS = {
 ## 12. 미검증·확인 필요
 - ASGI 에서의 `CONN_MAX_AGE` 와 VFS 동작 (미검증)
 - 실제 클라우드 S3·R2·Tigris (미검증. 비용이 들어 마스터 승인 필요)
+- 회귀 랩은 SeaweedFS 4.48 + toxiproxy 2.12.0, colima(linux/arm64) 한 곳에서만 돌았다. amd64·다른 S3 구현은 미검증
+- S3 단절이 `ltx` 타임아웃(30초)보다 길 때 헬스가 `stale` 에서 `remote_error` 로 넘어가는지(L8a 는 20초라 보지 못함), 분 단위 단절에서 Litestream 의 로그 변화 (미검증)
+- `single-server-multiproc` 의 채널 레이어 런타임(channels-nats 메시지 전달)을 컨테이너에서 (미검증. 랩 P2 는 설정 검사·워커 수까지)
 - Windows 에서 boot CLI 의 파일 잠금과 디렉터리 rename 원자성 [확인 필요]. 그때까지 boot 는 `fcntl` 이 없으면 exit 64 로 거부한다
 - channels-nats D2 의 196/200 이 하네스 문제인지 [확인 필요]
 - "같은 이력" 증명 방법(자동 판정의 전제) [확인 필요]
