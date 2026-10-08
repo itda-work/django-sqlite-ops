@@ -23,6 +23,11 @@ jobs:
     name: lab (${{ inputs.scenarios }}, ubuntu-latest)
     runs-on: ubuntu-latest
     timeout-minutes: 45
+    # 미지정 셸은 `bash -e {0}` 이라 pipefail 이 없다. `lab.sh ... | tee` 의 실패를 잡으려면
+    # 명시적 bash(`bash --noprofile --norc -eo pipefail {0}`)가 필요하다.
+    defaults:
+      run:
+        shell: bash
     env:
       SCENARIOS: ${{ inputs.scenarios }}
     steps:
@@ -46,10 +51,17 @@ jobs:
         run: |
           mkdir -p lab/.out
           scripts/lab.sh run "$SCENARIOS" 2>&1 | tee "lab/.out/lab-run-$SCENARIOS.console"
+      # 결과가 없을 때 그 사실이 로그에 남도록 업로드 전에 목록을 찍는다.
+      - name: List results
+        if: always()
+        run: |
+          ls -la lab/.out/ || echo "lab/.out/ 이 없다: 랩이 결과를 쓰기 전에 끝났다"
+      # lab/.out/ 은 숨김 경로라 include-hidden-files 가 없으면 아무것도 올라가지 않는다.
       - name: Upload results
         if: always()
         uses: actions/upload-artifact@v4
         with:
           name: lab-${{ inputs.scenarios }}-${{ github.run_id }}
           path: lab/.out/
+          include-hidden-files: true
           if-no-files-found: warn
