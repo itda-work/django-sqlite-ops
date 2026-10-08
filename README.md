@@ -498,6 +498,8 @@ urlpatterns = [
 | `unknown` | `file_time_backwards` | WAL 근거가 없는데 DB·`-wal`·L0 의 파일 시각이 앞선 관측보다 뒤로 감(시계 변경 등) |
 | `unknown` | `remote_error` · `remote_empty` · `no_local_meta` · `remote_ahead` · `unknown_at_boot` · `path_not_real` · `not_file_db` · `refresh_failed` · `not_checked` · `stale` | 판정할 수 없음: 원격 조회 실패, 복제본이 빈 목록(경로·prefix 오타와 구분되지 않는다), 로컬 메타 없음(`litestream replicate` 가 돌지 않음), **복제본이 로컬보다 앞섬**(다른 기계가 같은 복제본에 쓰는 중일 수 있다), 부팅 상태 파일의 `unknown_at_boot`(boot 가 `--on-unknown keep-local` 로 진행함), 경로 규칙 위반(D-15, 아래), 파일 DB 가 아님, 갱신 중 예외, 아직 첫 조회 전, 마지막 결과가 `REFRESH × 3` 보다 오래됨(갱신 스레드가 멈춤) |
 
+`local_ahead` 의 backlog 시간은 **처음 관측한 미업로드 로컬 TXID 가 원격에 올라가기까지 기다린 시간**이다. 가장 오래된 미업로드 커밋의 엄밀한 나이나 로컬·원격의 총 격차가 아니다.
+
 `code` 는 고정된 값이라 알람 규칙에 쓸 수 있다. 설정이 없거나 틀리면 최상위에 `code`(`not_configured`·`invalid_config`)와 `reason` 이 붙는다.
 
 **WAL 위치 근거** (형식: [SQLite WAL](https://www.sqlite.org/fileformat2.html#walformat), superfly/ltx v0.5.2 `Header`, Litestream 0.5.17 `db.go`):
