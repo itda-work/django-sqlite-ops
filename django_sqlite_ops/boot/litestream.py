@@ -34,6 +34,7 @@ __all__ = [
     "check_version",
     "config_databases",
     "default_meta_path",
+    "local_max_ltx",
     "local_max_txid",
     "parse_databases_json",
     "parse_ltx_json",
@@ -369,20 +370,12 @@ def _read_ltx_range(path: Path) -> tuple[int, int] | None:
     return int.from_bytes(header[16:24], "big"), int.from_bytes(header[24:32], "big")
 
 
-def local_max_txid(
+def local_max_ltx(
     db_path: str | os.PathLike[str], *, meta_path: str | os.PathLike[str] | None = None
-) -> int | None:
-    """로컬 메타의 L0 에서 최신 LTX 파일의 max TXID 를 읽는다. 믿을 수 없으면 ``None``.
+) -> tuple[int, Path] | None:
+    """``local_max_txid()`` 와 같은 후보 하나를 같은 규칙으로 검증해 ``(max TXID, 파일 경로)``.
 
-    후보 고르기는 Litestream 0.5.17 ``DB.MaxLTX()`` 와 같다: ``<meta>/ltx/0/`` 의 파일 이름
-    ``<min>-<max>.ltx`` 중 ``max`` 가 가장 큰 것(같으면 이름순 첫 번째). L0 보존 정리는 가장 새
-    L0 파일을 지우지 않으므로 업로드·압축·종료 뒤에도 남는다(db.go ``EnforceL0RetentionByTime``,
-    실측).
-
-    고른 후보 **하나**를 검증한다. 정규 파일(파일 자체가 링크면 거부, 상위 디렉터리 링크는
-    허용), 읽기 가능, 1 ≤ min ≤ max, LTX 헤더의 매직·flags·page size 가 유효하고 헤더의
-    min/max 가 이름과 같아야 한다. 하나라도 어긋나면 낮은 후보로 내려가지 않고 ``None`` 이다.
-    체크섬·페이지 전체 검증(Litestream ``DB.Pos()`` 의 ``Decoder.Verify()``)은 하지 않는다.
+    헬스(#7)가 그 파일의 mtime 을 DB 변경 시각과 비교하려고 쓴다. 믿을 수 없으면 ``None``.
     """
     try:
         meta = Path(meta_path) if meta_path is not None else default_meta_path(db_path)
@@ -405,7 +398,26 @@ def local_max_txid(
         return None
     if _read_ltx_range(l0 / name) != (lo, hi):
         return None
-    return hi
+    return hi, l0 / name
+
+
+def local_max_txid(
+    db_path: str | os.PathLike[str], *, meta_path: str | os.PathLike[str] | None = None
+) -> int | None:
+    """로컬 메타의 L0 에서 최신 LTX 파일의 max TXID 를 읽는다. 믿을 수 없으면 ``None``.
+
+    후보 고르기는 Litestream 0.5.17 ``DB.MaxLTX()`` 와 같다: ``<meta>/ltx/0/`` 의 파일 이름
+    ``<min>-<max>.ltx`` 중 ``max`` 가 가장 큰 것(같으면 이름순 첫 번째). L0 보존 정리는 가장 새
+    L0 파일을 지우지 않으므로 업로드·압축·종료 뒤에도 남는다(db.go ``EnforceL0RetentionByTime``,
+    실측).
+
+    고른 후보 **하나**를 검증한다. 정규 파일(파일 자체가 링크면 거부, 상위 디렉터리 링크는
+    허용), 읽기 가능, 1 ≤ min ≤ max, LTX 헤더의 매직·flags·page size 가 유효하고 헤더의
+    min/max 가 이름과 같아야 한다. 하나라도 어긋나면 낮은 후보로 내려가지 않고 ``None`` 이다.
+    체크섬·페이지 전체 검증(Litestream ``DB.Pos()`` 의 ``Decoder.Verify()``)은 하지 않는다.
+    """
+    found = local_max_ltx(db_path, meta_path=meta_path)
+    return None if found is None else found[0]
 
 
 # --- restore --------------------------------------------------------------------------

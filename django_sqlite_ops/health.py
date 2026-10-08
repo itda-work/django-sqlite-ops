@@ -13,8 +13,10 @@ Litestream 은 S3 가 끊겨도 로그·``status``·메트릭에 아무것도 �
 """
 
 import json
+import logging
 import math
 import os
+import re
 import stat
 import threading
 import time
@@ -37,20 +39,26 @@ __all__ = [
     "CAUGHT_UP",
     "DEFAULT_BACKLOG_GRACE",
     "DEFAULT_REFRESH",
+    "LOGGER_NAME",
     "SCHEMA_VERSION",
     "STALE_FACTOR",
     "UNKNOWN",
     "AliasConfig",
+    "FileTimes",
     "HealthConfig",
     "Monitor",
     "Sample",
+    "Since",
     "alias_status",
+    "file_times",
     "get_monitor",
     "health_view",
     "next_backlog_since",
+    "next_pending_since",
     "overall_status",
     "parse_config",
     "read_boot_state",
+    "redact",
 ]
 
 SCHEMA_VERSION = 1
@@ -87,10 +95,38 @@ def _one_line(text: object) -> str:
     return line if len(line) <= _MAX_REASON else line[: _MAX_REASON - 1] + "…"
 
 
+# 원문 진단(Litestream stderr, 예외)은 응답에 넣지 않고 이 로거로만 남긴다.
+LOGGER_NAME = "django_sqlite_ops.health"
+_log = logging.getLogger(LOGGER_NAME)
+
+# 가리는 규칙은 여기 한 곳이다(redact()).
+# URL 의 userinfo: scheme://user:pass@host → scheme://***@host
+_URL_USERINFO = re.compile(r"(?i)\b([a-z][a-z0-9+.-]*://)[^/\s@\"'`]+@")
+_SECRET_WORDS = (
+    r"(?:secret|passw(?:or)?d|pwd|token|signature|sig|credential|access[-_]?key|api[-_]?key|auth)"
+)
+# URL 쿼리의 자격 증명류 값: ?X-Amz-Signature=... · &token=...
+_QUERY_SECRET = re.compile(rf"(?i)([?&;][^=&\s]*{_SECRET_WORDS}[^=&\s]*=)[^&\s\"'`]*")
+# key: value · key=value 꼴(YAML·환경 변수 메시지): secret-access-key: abc
+_KV_SECRET = re.compile(
+    rf"(?i)\b([\w.-]*{_SECRET_WORDS}[\w.-]*)(\s*[:=]\s*)(\"[^\"]*\"|'[^']*'|[^\s,;&)\]}}]+)"
+)
+
+
+def redact(text: str) -> str:
+    """로그에 남기기 전에 URL userinfo·자격 증명류 쿼리 값·``key: value`` 비밀값을 가린다.
+
+    완전한 비밀 탐지기가 아니다. 그래서 원문은 응답에 넣지 않고(고정 사유만) 로그에만 남긴다.
+    """
+    text = _URL_USERINFO.sub(r"\1***@", text)
+    text = _QUERY_SECRET.sub(r"\1***", text)
+    return _KV_SECRET.sub(r"\1\2***", text)
+
+
 def _iso(ts: float | None) -> str | None:
     if ts is None:
         return None
-    return datetime.fromtimestamp(ts, UTC).strftime("%Y-%m-%dT%H:%M:%SZ")
+    return datetime.fromtimestamp(ts, UTC).isoformat(timespec="milliseconds").replace("+00:00", "Z")
 
 
 def _hex(txid: int | None) -> str | None:
@@ -129,6 +165,11 @@ def _number(value: Any) -> float | None:
     return float(value)
 
 
+def _absolute(path: str) -> str:
+    """작업 디렉터리를 붙이기만 한다. ``abspath()`` 처럼 ``..`` 를 접으면 D-15 검사를 우회한다."""
+    return path if os.path.isabs(path) else os.path.join(os.getcwd(), path)
+
+
 def _binary(binary: str) -> str:
     """경로 구분자가 든 바이너리는 절대 경로로, PATH 로 찾는 이름은 그대로 둔다."""
     if os.sep in binary or (os.altsep and os.altsep in binary):
@@ -142,7 +183,8 @@ def parse_config(
     """``SQLITE_OPS["HEALTH"]`` 를 검증한다. ``(설정 또는 None, [(메시지, 별칭|None)])``.
 
     오류가 하나라도 있으면 설정은 ``None`` 이다. 시스템 체크 E002 가 같은 오류를 보고한다.
-    상대 경로는 이 프로세스의 작업 디렉터리 기준 절대 경로로 바꾼다.
+    상대 경로는 이 프로세스의 작업 디렉터리를 앞에 붙인다. ``..``·링크는 접지 않는다(D-15 검사는
+    갱신 때 원문으로 한다).
     """
     errors: list[tuple[str, str | None]] = []
     if not isinstance(raw, Mapping):
@@ -204,8 +246,8 @@ def parse_config(
         aliases.append(
             AliasConfig(
                 alias,
-                os.path.abspath(config),
-                os.path.abspath(meta_text) if meta_text is not None else None,
+                _absolute(config),
+                _absolute(meta_text) if meta_text is not None else None,
                 _binary(_path_text(binary)),
             )
         )
@@ -228,21 +270,44 @@ def load_config() -> tuple[HealthConfig | None, list[tuple[str, str | None]]]:
 
 
 @dataclass(frozen=True, slots=True)
+class Since:
+    """어떤 상태를 처음 관측한 시점. ``mono`` 는 지속 시간 계산용, ``wall`` 은 표시용이다."""
+
+    mono: float
+    wall: float
+    key: Any = None
+
+
+@dataclass(frozen=True, slots=True)
+class FileTimes:
+    """DB 변경 시각과 최신 로컬 L0 의 시각(벽시계 mtime). ``ltx_key`` 는 (이름, mtime_ns)."""
+
+    db_changed_at: float | None
+    ltx_at: float | None
+    ltx_key: Any = None
+
+
+@dataclass(frozen=True, slots=True)
 class Sample:
     """한 번의 갱신에서 본 별칭 하나의 사실. 판정은 ``alias_status()`` 가 한다.
 
-    ``checked_at`` 은 UNIX 초(벽시계). ``error`` 는 조회 전에 판정이 끝난 사유(경로 규칙 위반,
-    파일 DB 가 아님, 갱신 중 예외)이고, 있으면 다른 필드와 무관하게 ``unknown`` 이다.
+    ``observed`` 는 monotonic 초(지속 시간 계산), ``checked_at`` 은 UNIX 초(표시용).
+    ``error`` 는 조회 전에 판정이 끝난 사유(경로 규칙 위반, 파일 DB 가 아님, 갱신 중 예외)이고,
+    있으면 다른 필드와 무관하게 ``unknown`` 이다. 응답에 나가므로 고정 문장만 넣는다.
     """
 
+    observed: float
     checked_at: float
     path: str | None = None
     local: int | None = None
     remote: Remote | None = None
     boot_state: dict[str, Any] | None = None
     boot_state_error: str | None = None
+    error_code: str | None = None
     error: str | None = None
-    backlog_since: float | None = None
+    files: FileTimes | None = None
+    backlog_since: Since | None = None
+    pending_since: Since | None = None
 
 
 def read_boot_state(db_path: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -280,23 +345,47 @@ def read_boot_state(db_path: str) -> tuple[dict[str, Any] | None, str | None]:
         value = body.get(key)
         if value is not None and type(value) not in (str, bool):
             return None, f"boot state file has an unexpected format ({key})"
-    return {key: body.get(key) for key in _BOOT_KEYS}, None
+    picked = {key: body.get(key) for key in _BOOT_KEYS}
+    return {k: redact(v) if isinstance(v, str) else v for k, v in picked.items()}, None
 
 
 # --- 판정 (순수 함수) ------------------------------------------------------------------
 
 
 def next_backlog_since(
-    prev: float | None, local: int | None, remote: Remote | None, checked_at: float
-) -> float | None:
-    """로컬이 원격보다 앞서기 시작한 시각. 앞서 있지 않으면 ``None``.
+    prev: Since | None, local: int | None, remote: Remote | None, observed: float, wall: float
+) -> Since | None:
+    """로컬 TXID 가 원격보다 앞서기 시작한 관측 시점. 앞서 있지 않으면 ``None``.
 
-    앞선 상태가 이어지면 처음 본 시각을 유지하고, 끊기면 지운다. 프로세스 안에서만 추적하므로
+    앞선 상태가 이어지면 처음 본 시점을 유지하고, 끊기면 지운다. 프로세스 안에서만 추적하므로
     재시작하면 초기화된다.
     """
     if type(remote) is RemoteTxid and type(local) is int and local > remote.txid:
-        return prev if prev is not None else checked_at
+        return prev if prev is not None else Since(observed, wall)
     return None
+
+
+def next_pending_since(
+    prev: Since | None, files: FileTimes | None, observed: float, wall: float
+) -> Since | None:
+    """DB 파일이 최신 로컬 L0 보다 새로워진 것을 처음 관측한 시점. 아니면 ``None``.
+
+    DB 연결 없이 복제 프로세스의 정지를 보는 근거다. Litestream 은 DB 변경을 L0 로 기록하므로
+    (``monitor-interval`` 기본 1초) 살아 있으면 곧 더 새 L0 가 생긴다. 최신 L0 가 바뀌면(이름·
+    mtime) 새로 센다: 쓰기가 계속되는 DB 에서 매 관측 순간 DB 가 조금 더 새로워도 Litestream 이
+    진행하는 한 지속 시간이 쌓이지 않는다. mtime 끼리의 차이는 지속 시간으로 쓰지 않는다(오래된
+    유휴 DB 에 첫 쓰기가 오면 차이가 바로 커 보인다).
+    """
+    if (
+        files is None
+        or files.db_changed_at is None
+        or files.ltx_at is None
+        or files.db_changed_at <= files.ltx_at
+    ):
+        return None
+    if prev is not None and prev.key == files.ltx_key:
+        return prev
+    return Since(observed, wall, files.ltx_key)
 
 
 def _fields(sample: Sample | None, now: float) -> dict[str, Any]:
@@ -308,82 +397,150 @@ def _fields(sample: Sample | None, now: float) -> dict[str, Any]:
             "checked_at": None,
             "age": None,
             "backlog_since": None,
+            "pending_since": None,
+            "db_changed_at": None,
+            "ltx_at": None,
             "boot_state": None,
             "boot_state_error": None,
         }
     remote = sample.remote.txid if type(sample.remote) is RemoteTxid else None
+    files = sample.files
     return {
         "path": sample.path,
         "local_txid": _hex(sample.local),
         "remote_txid": _hex(remote),
         "checked_at": _iso(sample.checked_at),
-        "age": round(now - sample.checked_at, 3),
-        "backlog_since": _iso(sample.backlog_since),
+        "age": round(now - sample.observed, 3),
+        "backlog_since": _iso(sample.backlog_since.wall) if sample.backlog_since else None,
+        "pending_since": _iso(sample.pending_since.wall) if sample.pending_since else None,
+        "db_changed_at": _iso(files.db_changed_at) if files else None,
+        "ltx_at": _iso(files.ltx_at) if files else None,
         "boot_state": sample.boot_state,
         "boot_state_error": sample.boot_state_error,
     }
 
 
-def _verdict(sample: Sample | None, now: float, refresh: float, grace: float) -> tuple[str, str]:
+def _verdict(
+    sample: Sample | None, now: float, refresh: float, grace: float
+) -> tuple[str, str, str]:
+    """``(상태, 사유 코드, 사유)``. 사유는 고정 문장에 경로·TXID·초만 넣는다(비밀값 없음)."""
     if sample is None:
-        return UNKNOWN, "not checked yet; the first refresh has not finished"
-    age = now - sample.checked_at
-    if age < 0:
-        return UNKNOWN, "the last check is in the future (the clock moved backwards)"
-    if age > refresh * STALE_FACTOR:
-        return UNKNOWN, (
-            f"the last check is {age:.0f}s old (more than {STALE_FACTOR} x REFRESH); "
-            "the refresh thread may be stuck"
+        return UNKNOWN, "not_checked", "not checked yet; the first refresh has not finished"
+    age = now - sample.observed
+    if age < 0 or age > refresh * STALE_FACTOR:
+        return (
+            UNKNOWN,
+            "stale",
+            (
+                f"the last check is {age:.0f}s old (more than {STALE_FACTOR} x REFRESH); "
+                "the refresh thread may be stuck"
+            ),
         )
     if sample.error is not None:
-        return UNKNOWN, sample.error
+        return UNKNOWN, sample.error_code or "error", sample.error
     if sample.boot_state is not None and sample.boot_state.get("unknown_at_boot") is True:
-        return UNKNOWN, (
-            "unknown_at_boot: boot proceeded with --on-unknown keep-local; replication state "
-            "is unknown until the next boot that is not keep-local"
+        return (
+            UNKNOWN,
+            "unknown_at_boot",
+            (
+                "unknown_at_boot: boot proceeded with --on-unknown keep-local; replication state "
+                "is unknown until the next boot that is not keep-local"
+            ),
         )
     remote = sample.remote
     if type(remote) is RemoteError:
-        return UNKNOWN, f"remote lookup failed: {remote.message}"
+        return (
+            UNKNOWN,
+            "remote_error",
+            (f"remote lookup failed (litestream ltx); details are in the {LOGGER_NAME} log"),
+        )
     if type(remote) is RemoteEmpty:
-        return UNKNOWN, (
-            "the replica is empty (or the replica path/prefix is wrong; litestream reports "
-            "both the same way)"
+        return (
+            UNKNOWN,
+            "remote_empty",
+            (
+                "the replica is empty (or the replica path/prefix is wrong; litestream reports "
+                "both the same way)"
+            ),
         )
     if type(remote) is not RemoteTxid:
-        return UNKNOWN, "no remote result"
+        return UNKNOWN, "no_remote", "no remote result"
     if sample.local is None:
-        return UNKNOWN, "no readable local Litestream metadata (is litestream replicate running?)"
+        return (
+            UNKNOWN,
+            "no_local_meta",
+            ("no readable local Litestream metadata (is litestream replicate running?)"),
+        )
     if remote.txid > sample.local:
-        return UNKNOWN, (
-            f"the replica is ahead of local ({remote.txid:016x} > {sample.local:016x}); another "
-            "machine may be writing to the same replica"
+        return (
+            UNKNOWN,
+            "remote_ahead",
+            (
+                f"the replica is ahead of local ({remote.txid:016x} > {sample.local:016x}); "
+                "another machine may be writing to the same replica"
+            ),
         )
-    if remote.txid == sample.local:
-        return CAUGHT_UP, "local and replica are at the same TXID"
-    since = sample.backlog_since if sample.backlog_since is not None else sample.checked_at
-    behind = sample.checked_at - since
-    if behind >= grace:
-        return BACKLOG, (
-            f"local has been ahead of the replica for {behind:.0f}s (BACKLOG_GRACE {grace:g}s)"
+    if remote.txid < sample.local:
+        since = sample.backlog_since.mono if sample.backlog_since else sample.observed
+        behind = sample.observed - since
+        if behind >= grace:
+            return (
+                BACKLOG,
+                "local_ahead",
+                (
+                    f"local has been ahead of the replica for {behind:.0f}s "
+                    f"(BACKLOG_GRACE {grace:g}s)"
+                ),
+            )
+    if sample.pending_since is not None and sample.files is not None:
+        pending = sample.observed - sample.pending_since.mono
+        if pending >= grace:
+            return (
+                BACKLOG,
+                "db_not_replicated",
+                (
+                    f"DB changed at {_iso(sample.files.db_changed_at)} but Litestream has not "
+                    f"recorded a new L0 since {_iso(sample.files.ltx_at)} (observed for "
+                    f"{pending:.0f}s, BACKLOG_GRACE {grace:g}s); is the replicate process running? "
+                    "(a write, or a checkpoint when the last connection closed, changes the "
+                    "DB files)"
+                ),
+            )
+    if remote.txid < sample.local:
+        behind = sample.observed - (
+            sample.backlog_since.mono if sample.backlog_since else sample.observed
         )
-    return CAUGHT_UP, (
-        f"local is ahead of the replica for {behind:.0f}s, within BACKLOG_GRACE {grace:g}s"
-    )
+        return (
+            CAUGHT_UP,
+            "local_ahead_within_grace",
+            (f"local is ahead of the replica for {behind:.0f}s, within BACKLOG_GRACE {grace:g}s"),
+        )
+    if sample.pending_since is not None:
+        pending = sample.observed - sample.pending_since.mono
+        return (
+            CAUGHT_UP,
+            "db_changed_within_grace",
+            (
+                f"the DB changed after the latest local L0 {pending:.0f}s ago, within "
+                f"BACKLOG_GRACE {grace:g}s"
+            ),
+        )
+    return CAUGHT_UP, "in_sync", "local and replica are at the same TXID"
 
 
 def alias_status(
     sample: Sample | None, now: float, *, refresh: float, grace: float
 ) -> dict[str, Any]:
-    """별칭 하나의 상태(응답의 ``databases[alias]``).
+    """별칭 하나의 상태(응답의 ``databases[alias]``). ``now`` 는 monotonic 초다.
 
     판정 순서(처음 맞는 것): 조회 전 · 오래된 결과(``REFRESH × 3`` 초과) · 사전 오류 ·
     ``unknown_at_boot`` · 원격 실패 · 원격 빈 목록 · 로컬 메타 없음 · 원격이 앞섬 → ``unknown``.
-    같으면 ``caught_up``. 로컬이 앞서면 ``backlog_since`` 부터 ``checked_at`` 까지가 ``grace``
-    이상일 때 ``backlog``, 아니면 ``caught_up``.
+    로컬 TXID 가 앞선 지속 시간 ≥ ``grace`` → ``backlog``. DB 가 최신 L0 보다 새로운 상태의
+    지속 시간 ≥ ``grace`` → ``backlog``. 그 밖은 ``caught_up``. 지속 시간은 monotonic 관측
+    시각(``observed``)끼리의 차이다.
     """
-    status, reason = _verdict(sample, now, refresh, grace)
-    return {"status": status, "reason": _one_line(reason), **_fields(sample, now)}
+    status, code, reason = _verdict(sample, now, refresh, grace)
+    return {"status": status, "code": code, "reason": _one_line(reason), **_fields(sample, now)}
 
 
 def overall_status(statuses: Mapping[str, Mapping[str, Any]] | list[str]) -> str:
@@ -406,26 +563,63 @@ def _db_path(alias: str) -> tuple[str | None, str | None]:
         return None, f"{alias!r} is not in DATABASES"
     target = doctor._target(alias, config)
     if target.role != "write":
-        why = f": {target.reason}" if target.reason else ""
-        return None, f"not a writable file database (role {target.role}{why})"
+        return None, f"not a writable file database (role {target.role})"
     if target.path is None:
         return None, "the database path is empty"
     return target.path, None
 
 
-def _check_real(path: str, what: str) -> str | None:
-    """D-15: 실제 경로가 아니면 사유를 돌려준다."""
+def _check_real(path: str, what: str) -> tuple[str | None, str | None]:
+    """D-15: ``(실제 경로, 문제)``. 원문의 ``..``·부모 링크를 접지 않고 boot 의 규칙으로 본다."""
     try:
         real = real_path(path)
     except ValueError as exc:
-        return _one_line(f"{what} is not a real path: {exc}")
+        _log.debug("%s %s rejected: %s", what, path, redact(str(exc)))
+        return None, (
+            f"{what} {path} is not a real path (symlink or '..' in it, or the parent is "
+            "missing); use the real path (D-15)"
+        )
     if os.path.islink(real):
-        return f"{what} {real} is a symbolic link; use the real path (D-15)"
-    return None
+        return None, f"{what} {real} is a symbolic link; use the real path (D-15)"
+    return str(real), None
+
+
+def _mtime(path: str) -> float | None:
+    try:
+        return os.stat(path).st_mtime
+    except (OSError, ValueError):
+        return None
+
+
+def file_times(db: str, meta: str | None) -> FileTimes:
+    """DB 변경 시각 ``max(mtime(DB), mtime(DB-wal))``(있는 것만)과 최신 로컬 L0 파일의 시각.
+
+    ``-shm`` 은 읽기에도 바뀌므로 보지 않는다. ``-wal`` 만 볼 수는 없다: 마지막 연결이 닫히면
+    SQLite 가 체크포인트한 뒤 ``-wal`` 을 지운다(빌드에 따라 남긴다). L0 후보는
+    ``local_max_txid()`` 와 같은 것이다.
+
+    0.5.17 실측(DESIGN §7): Litestream 이 도는 동안에는 앱의 읽기·쓰기·Litestream 의 체크포인트
+    뒤 곧(``monitor-interval`` 1초) 새 L0 가 생겨 DB 가 L0 보다 새로운 상태가 이어지지 않는다.
+    멈춰 있으면 앱의 마지막 연결이 닫힐 때의 체크포인트(읽기만 했어도)가 DB mtime 을 바꾸고,
+    ``replicate -once`` 가 끝날 때도 바뀐다(SIGTERM 종료는 바꾸지 않았다). 그래서 이 근거가
+    grace 를 넘기면 "쓰기가 복제되지 않았다"가 아니라 "DB 가 쓰이는데 Litestream 이 진행하지
+    않는다"로 읽는다.
+    """
+    times = [t for t in (_mtime(db), _mtime(db + "-wal")) if t is not None]
+    found = litestream.local_max_ltx(db, meta_path=meta)
+    ltx_at = ltx_key = None
+    if found is not None:
+        try:
+            st = os.stat(found[1])
+            ltx_at, ltx_key = st.st_mtime, (found[1].name, st.st_mtime_ns)
+        except OSError:
+            pass
+    return FileTimes(max(times) if times else None, ltx_at, ltx_key)
 
 
 Probe = Callable[[AliasConfig, str], Remote]
 LocalProbe = Callable[[str, str | None], int | None]
+FileProbe = Callable[[str, str | None], FileTimes | None]
 
 
 def _remote(cfg: AliasConfig, db: str) -> Remote:
@@ -438,15 +632,21 @@ def _local(db: str, meta: str | None) -> int | None:
 
 @dataclass
 class Monitor:
-    """프로세스당 하나. 데몬 스레드가 ``refresh`` 초마다 ``samples`` 를 갱신한다."""
+    """프로세스당 하나. 데몬 스레드가 ``refresh`` 초마다 ``samples`` 를 갱신한다.
+
+    ``clock`` 은 표시용 벽시계, ``monotonic`` 은 지속 시간(grace·stale·pending)용이다.
+    """
 
     config: HealthConfig
     remote: Probe = _remote
     local: LocalProbe = _local
+    files: FileProbe = file_times
     path_of: Callable[[str], tuple[str | None, str | None]] = _db_path
     clock: Callable[[], float] = time.time
+    monotonic: Callable[[], float] = time.monotonic
     samples: dict[str, Sample] = field(default_factory=dict, init=False)
     refreshes: int = field(default=0, init=False)
+    _logged: dict[str, str] = field(default_factory=dict, init=False)
     _pid: int | None = field(default=None, init=False)
     _thread: threading.Thread | None = field(default=None, init=False)
     _stop: threading.Event = field(default_factory=threading.Event, init=False)
@@ -454,26 +654,62 @@ class Monitor:
 
     # -- 갱신 --
 
+    def _now(self) -> tuple[float, float]:
+        return self.monotonic(), self.clock()
+
+    def _log_once(self, alias: str, message: str) -> None:
+        """원문 진단은 로그로만(가린 뒤). 같은 메시지를 갱신마다 반복하지 않는다."""
+        message = redact(message)
+        if self._logged.get(alias) != message:
+            self._logged[alias] = message
+            _log.warning("health %r: %s", alias, message)
+
     def _sample(self, cfg: AliasConfig, prev: Sample | None) -> Sample:
-        now = self.clock()
+        observed, wall = self._now()
         path, problem = self.path_of(cfg.alias)
         if problem is not None or path is None:
-            return Sample(now, error=problem or "no database path")
-        problem = _check_real(path, "database path")
-        if problem is None and cfg.meta_path is not None:
-            problem = _check_real(cfg.meta_path, "meta_path")
-        boot_state, boot_error = read_boot_state(path)
-        if problem is not None:
             return Sample(
-                now, path=path, boot_state=boot_state, boot_state_error=boot_error, error=problem
+                observed, wall, error_code="not_file_db", error=problem or "no database path"
             )
-        remote = self.remote(cfg, path)
-        local = self.local(path, cfg.meta_path)
-        checked_at = self.clock()
-        since = next_backlog_since(
-            prev.backlog_since if prev is not None else None, local, remote, checked_at
+        real, problem = _check_real(path, "database path")
+        meta = None
+        if problem is None and cfg.meta_path is not None:
+            meta, problem = _check_real(cfg.meta_path, "meta_path")
+        boot_state, boot_error = read_boot_state(real or path)
+        if problem is not None or real is None:
+            return Sample(
+                observed,
+                wall,
+                path=path,
+                boot_state=boot_state,
+                boot_state_error=boot_error,
+                error_code="path_not_real",
+                error=problem,
+            )
+        remote = self.remote(cfg, real)
+        if type(remote) is RemoteError:
+            self._log_once(cfg.alias, f"remote lookup failed: {remote.message}")
+        else:
+            self._logged.pop(cfg.alias, None)
+        local = self.local(real, meta)
+        files = self.files(real, meta)
+        observed, wall = self._now()
+        backlog = next_backlog_since(
+            prev.backlog_since if prev else None, local, remote, observed, wall
         )
-        return Sample(checked_at, path, local, remote, boot_state, boot_error, None, since)
+        pending = next_pending_since(prev.pending_since if prev else None, files, observed, wall)
+        return Sample(
+            observed,
+            wall,
+            real,
+            local,
+            remote,
+            boot_state,
+            boot_error,
+            files=files,
+            backlog_since=backlog,
+            pending_since=pending,
+        )
 
     def refresh_once(self) -> None:
         """모든 별칭을 한 번 갱신한다. 예외는 삼키고 그 별칭을 ``unknown`` 사유로 남긴다."""
@@ -484,11 +720,19 @@ class Monitor:
                 sample = self._sample(cfg, prev)
             except Exception as exc:  # noqa: BLE001 - 스레드가 죽지 않게 사유로 남긴다
                 try:
-                    now = self.clock()
+                    self._log_once(cfg.alias, f"refresh failed: {type(exc).__name__}: {exc}")
                 except Exception:  # noqa: BLE001
-                    now = time.time()
+                    pass
+                try:
+                    observed, wall = self._now()
+                except Exception:  # noqa: BLE001
+                    observed, wall = time.monotonic(), time.time()
                 sample = Sample(
-                    now, error=_one_line(f"refresh failed: {type(exc).__name__}: {exc}")
+                    observed,
+                    wall,
+                    error_code="refresh_failed",
+                    error=f"refresh failed ({type(exc).__name__}); details are in the "
+                    f"{LOGGER_NAME} log",
                 )
             with self._lock:
                 self.samples[cfg.alias] = sample
@@ -517,6 +761,7 @@ class Monitor:
             self._lock = threading.Lock()
             self._stop = threading.Event()
             self.samples = {}
+            self._logged = {}
             self._thread = None
             self._pid = pid
         if self._thread is not None and self._thread.is_alive():
@@ -535,7 +780,8 @@ class Monitor:
     # -- 보고 --
 
     def report(self, now: float | None = None) -> dict[str, Any]:
-        now = self.clock() if now is None else now
+        """``now`` 는 monotonic 초(없으면 지금)."""
+        now = self.monotonic() if now is None else now
         with self._lock:
             samples = dict(self.samples)
         databases = {
@@ -570,22 +816,26 @@ if hasattr(os, "register_at_fork"):
     os.register_at_fork(after_in_child=_reset_lock_after_fork)
 
 
-def get_monitor() -> tuple[Monitor | None, str | None]:
-    """설정으로 만든 프로세스의 ``Monitor`` 를 돌려주고 스레드를 시작한다. ``(모니터, 문제)``."""
+def get_monitor() -> tuple[Monitor | None, str | None, str | None]:
+    """설정으로 만든 프로세스의 ``Monitor`` 를 돌려주고 스레드를 시작한다.
+
+    ``(모니터, 사유 코드, 사유)``. 설정 오류의 원문(설정값이 들어 있다)은 응답에 넣지 않는다.
+    """
     global _monitor
     with _monitor_lock:
         if _monitor is None:
             config, errors = load_config()
             if config is None:
                 if errors:
-                    return None, _one_line(
-                        "invalid SQLITE_OPS['HEALTH'] (see manage.py check, sqlite_ops.E002): "
-                        + errors[0][0]
+                    return (
+                        None,
+                        "invalid_config",
+                        ("invalid SQLITE_OPS['HEALTH']; run manage.py check (sqlite_ops.E002)"),
                     )
-                return None, "SQLITE_OPS['HEALTH'] is not configured"
+                return None, "not_configured", "SQLITE_OPS['HEALTH'] is not configured"
             _monitor = Monitor(config)
         _monitor.ensure_started()
-        return _monitor, None
+        return _monitor, None, None
 
 
 # --- 뷰 --------------------------------------------------------------------------------
@@ -593,24 +843,43 @@ def get_monitor() -> tuple[Monitor | None, str | None]:
 _STRICT_TRUE = frozenset({"1", "true", "yes", "on"})
 
 
+class _AllAliases(set):
+    """모든 별칭을 포함하는 ``_non_atomic_requests``.
+
+    Django 5.2·6.1 의 ``BaseHandler.make_view_atomic()`` 은 ``ATOMIC_REQUESTS`` 가 켜진 별칭마다
+    ``alias not in view._non_atomic_requests`` 일 때만 뷰를 ``atomic(using=alias)`` 로 감싼다
+    (5.2.18·6.1.2 ``django/core/handlers/base.py``). ``transaction.non_atomic_requests(using)`` 은
+    별칭 하나만 넣으므로, 설정에 어떤 별칭이 있든 모두 빠지게 이 집합을 쓴다. 감싸면 뷰 실행 전에
+    연결이 열리고 DB 파일이 생긴다(review-1 재현).
+    """
+
+    def __contains__(self, alias: object) -> bool:
+        return True
+
+
 def health_view(request: HttpRequest) -> JsonResponse:
     """복제 헬스 JSON. HTTP 상태는 항상 200 이다(``?strict=1`` 이면 ``caught_up`` 이 아닐 때 503).
 
     복제가 뒤처졌다고 로드밸런서가 앱을 빼면 서비스까지 멈춘다. 모니터링은 본문의 ``status`` 로
-    알람을 건다. 인증하지 않으므로 내부망에만 노출한다.
+    알람을 건다. 인증하지 않으므로 내부망에만 노출한다. 요청 트랜잭션(``ATOMIC_REQUESTS``)에서
+    모든 별칭이 빠진다.
     """
-    monitor, problem = get_monitor()
+    monitor, code, problem = get_monitor()
     if monitor is None:
         body: dict[str, Any] = {
             "version": SCHEMA_VERSION,
             "status": UNKNOWN,
+            "code": code,
             "reason": problem,
             "databases": {},
         }
     else:
         body = monitor.report()
     strict = request.GET.get("strict", "").lower() in _STRICT_TRUE
-    code = 503 if strict and body["status"] != CAUGHT_UP else 200
-    response = JsonResponse(body, status=code)
+    status = 503 if strict and body["status"] != CAUGHT_UP else 200
+    response = JsonResponse(body, status=status)
     response["Cache-Control"] = "no-store"
     return response
+
+
+health_view._non_atomic_requests = _AllAliases()  # type: ignore[attr-defined]
