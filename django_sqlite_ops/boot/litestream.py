@@ -32,8 +32,10 @@ __all__ = [
     "VERIFIED_VERSIONS",
     "RestoreResult",
     "check_version",
+    "config_databases",
     "default_meta_path",
     "local_max_txid",
+    "parse_databases_json",
     "parse_ltx_json",
     "parse_version",
     "remote_max_txid",
@@ -114,11 +116,12 @@ def _kill(proc: subprocess.Popen) -> None:
         pass
 
 
-def _run(argv: list[str], timeout: float) -> _Run | str:
+def _run(argv: list[str], timeout: float, *, cwd: str | None = None) -> _Run | str:
     """명령을 실행한다. 실행하지 못했거나 시간이 넘으면 사유 문자열을 돌려준다."""
     try:
         proc = subprocess.Popen(
             argv,
+            cwd=cwd,
             stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
@@ -269,6 +272,58 @@ def remote_max_txid(
     if run.rc != 0:
         return RemoteError(_failure("ltx", run))
     return parse_ltx_json(run.stdout)
+
+
+# --- 설정의 DB 목록 -------------------------------------------------------------------
+
+
+def parse_databases_json(stdout: str) -> list[str] | str:
+    """``litestream databases -json`` 의 stdout 에서 DB 경로 목록을 읽는다. 실패면 사유 문자열.
+
+    0.5.17 출력은 ``[{"path": "<절대 경로>", "replica": "<종류>"}, ...]`` 다. Litestream 은
+    경로를 ``filepath.Abs`` 로 바꿔 내보낸다: 상대 경로는 Litestream 의 작업 디렉터리 기준이 되고
+    ``..`` 는 문자열로 접힌다. 링크는 그대로 남는다(실측, ``tests/fixtures/litestream-0.5.17/``).
+    """
+    body = _strip_log_lines(stdout)
+    try:
+        data = json.loads(body)
+    except ValueError as exc:
+        return _one_line(f"cannot parse litestream databases output as JSON: {exc}")
+    if type(data) is not list:
+        return f"unexpected litestream databases output: expected a list, got {type(data).__name__}"
+    paths = []
+    for i, item in enumerate(data):
+        if type(item) is not dict:
+            return f"unexpected litestream databases output: item {i} is not an object"
+        path = item.get("path")
+        if type(path) is not str or not os.path.isabs(path) or "\0" in path:
+            return f"unexpected litestream databases output: item {i} has invalid path"
+        paths.append(path)
+    return paths
+
+
+def config_databases(
+    config: str | os.PathLike[str],
+    *,
+    binary: str = "litestream",
+    timeout: float = DEFAULT_LTX_TIMEOUT,
+    version_timeout: float = DEFAULT_VERSION_TIMEOUT,
+    cwd: str | None = None,
+) -> list[str] | str:
+    """설정 파일의 DB 경로 목록(``litestream databases -json``). 실패면 사유 문자열.
+
+    YAML 을 직접 읽지 않는다. 경로 해석(환경 변수 확장·상대 경로·``..``)을 Litestream 이 하는
+    그대로 본다. 상대 경로는 ``cwd`` 기준으로 풀린다. 설정 파일 없음·깨진 YAML 은 rc 1(실측).
+    """
+    problem = check_version(binary=binary, timeout=version_timeout)
+    if problem is not None:
+        return problem
+    run = _run([binary, "databases", "-config", os.fspath(config), "-json"], timeout, cwd=cwd)
+    if isinstance(run, str):
+        return run
+    if run.rc != 0:
+        return _failure("databases", run)
+    return parse_databases_json(run.stdout)
 
 
 # --- 로컬 TXID ------------------------------------------------------------------------

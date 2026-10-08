@@ -1,6 +1,6 @@
 # Litestream 0.5.17 실측 fixture
 
-`boot/litestream.py` 의 파싱 테스트가 쓰는 실제 출력이다. 각 폴더에 `stdout`·`stderr`·`rc`
+`boot/litestream.py` 의 파싱 테스트(와 `sqlite_doctor` 의 Litestream 설정 대조 테스트)가 쓰는 실제 출력이다. 각 폴더에 `stdout`·`stderr`·`rc`
 가 있다. 랩 디렉터리의 절대 경로는 `$LAB` 으로 바꿔 저장했다.
 
 ## 다시 만드는 법
@@ -39,4 +39,8 @@ tests/fixtures/litestream-0.5.17/make_fixtures.sh .work/issue-3/lab/run-fixtures
 | `ltx_no_l0_all_levels` | 같은 사본, `-level all` | 0 | 최대 `0x19` |
 | `restore_ok_json` | `restore -config ls.yml -json -integrity-check quick -o $LAB/restored.db $LAB/app.db` | 0 | stdout 에 **로그 한 줄 + JSON** 이 섞인다 |
 | `restore_output_exists` | 같은 명령을 한 번 더 | 1 | `Error: cannot restore, output path already exists and is not empty` |
+| `databases_json` | `databases -config dbs.yml -json`, 작업 디렉터리 `$LAB/cwd` | 0 | 링크 경로는 그대로, `real/../dotdot.db` 는 `dotdot.db` 로 접힘, 상대 경로 `relative.db` 는 `$LAB/cwd/relative.db`, `dir:` 항목은 디렉터리가 아니라 **작업 디렉터리** `$LAB/cwd` 로 나온다 |
+| `databases_config_missing` | `databases -config $LAB/nope.yml -json` | 1 | `Error: config file not found: ...` |
+| `databases_bad_yaml` | `databases -config bad.yml -json` | 1 | `Error: yaml: ...` |
+| `databases_empty` | `databases -config empty.yml -json` (`dbs: []`) | 0 | `[]` |
 | `restore_no_backups` | 빈 복제본에서 restore | 1 | `Error: no matching backup files available` |

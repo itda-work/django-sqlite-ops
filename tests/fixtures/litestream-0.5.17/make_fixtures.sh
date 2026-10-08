@@ -63,6 +63,40 @@ printf 'dbs: [\n' >bad.yml
 capture ltx_bad_yaml "$LS" ltx -config bad.yml -level all -json "$LAB/app.db"
 capture restore_no_backups "$LS" restore -config ls.yml -json -o "$LAB/out-empty.db" "$LAB/empty.db"
 
+# databases: 설정의 DB 목록. 경로 해석(링크·'..'·상대 경로·dir:)을 본다. 상대 경로와 dir: 항목은
+# Litestream 의 작업 디렉터리 기준으로 풀리므로 하위 디렉터리에서 돌린다($LAB/cwd 로 저장된다).
+mkdir real cwd dirdb
+ln -s real link
+cat >dbs.yml <<EOF
+dbs:
+  - path: $LAB/app.db
+    replica:
+      type: file
+      path: $LAB/replica
+  - path: $LAB/link/linked.db
+    replica:
+      type: file
+      path: $LAB/replica-linked
+  - path: $LAB/real/../dotdot.db
+    replica:
+      type: file
+      path: $LAB/replica-dotdot
+  - path: relative.db
+    replica:
+      type: file
+      path: $LAB/replica-relative
+  - dir: $LAB/dirdb
+    pattern: "*.db"
+    replica:
+      type: file
+      path: $LAB/replica-dir
+EOF
+(cd cwd && capture databases_json "$LS" databases -config "$LAB/dbs.yml" -json)
+capture databases_config_missing "$LS" databases -config "$LAB/nope.yml" -json
+capture databases_bad_yaml "$LS" databases -config bad.yml -json
+printf 'dbs: []\n' >empty.yml
+capture databases_empty "$LS" databases -config empty.yml -json
+
 # 실제 복제: 쓰기 → 업로드 → 압축·L0 보존 정리 → 종료
 sqlite3 app.db "PRAGMA journal_mode=WAL; CREATE TABLE t(id INTEGER PRIMARY KEY, v TEXT);" >/dev/null
 "$LS" replicate -config ls.yml >replicate.log 2>&1 &
