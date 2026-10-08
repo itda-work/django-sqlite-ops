@@ -24,6 +24,7 @@ from django.db import connections
 
 from .boot import litestream
 from .checks import _TRUE, _is_litestream_vfs, _options, _profile, _role, _uri
+from .compat import channels_lite
 from .database import DEFAULT_PROFILE, ENGINE, recommended
 
 __all__ = [
@@ -621,10 +622,8 @@ _INMEMORY = "channels.layers.InMemoryChannelLayer"
 _NATS = ("channels_nats.NatsChannelLayer", "channels_nats.layer.NatsChannelLayer")
 _REDIS = "channels_redis.core.RedisChannelLayer"
 _REDIS_PUBSUB = "channels_redis.pubsub.RedisPubSubChannelLayer"
-_LITE = (
-    "channels_lite.layers.core.SQLiteChannelLayer",
-    "channels_lite.layers.aio.AIOSQLiteChannelLayer",
-)
+_LITE_AIO = "channels_lite.layers.aio.AIOSQLiteChannelLayer"
+_LITE = ("channels_lite.layers.core.SQLiteChannelLayer", _LITE_AIO)
 
 # DESIGN §8 표의 요약.
 _SUMMARY = {
@@ -802,6 +801,42 @@ def _lite_items(
     return items
 
 
+def _patch_items() -> list[Item]:
+    """channels-lite aio 중복 배달 패치(DESIGN §9)의 상태. aio 레이어도 설정도 없으면 안 본다."""
+    section = "channels"
+    layers = getattr(settings, "CHANNEL_LAYERS", None)
+    aio = []
+    if isinstance(layers, Mapping):
+        aio = [
+            name
+            for name, layer in layers.items()
+            if isinstance(layer, Mapping) and layer.get("BACKEND") == _LITE_AIO
+        ]
+    on = channels_lite.enabled(getattr(settings, "SQLITE_OPS", {}))
+    if not aio and not on:
+        return []
+    st = channels_lite.status()
+    setting = f"SQLITE_OPS['{channels_lite.SETTING}']"
+    if st.applied:
+        level, message = "ok", f"duplicate-delivery patch applied (channels-lite {st.version})"
+    elif on:
+        level, message = "warn", f"{setting} is True but the patch is not applied: {st.reason}"
+    elif st.applicable:
+        level, message = (
+            "warn",
+            f"channels-lite {st.version} aio layer can deliver one message on a general channel "
+            f"to two receivers; set {setting} = True (DESIGN §9)",
+        )
+    else:
+        level, message = "warn", f"duplicate-delivery patch is not available: {st.reason}"
+    expected = f"channels-lite=={channels_lite.VERIFIED_VERSION}"
+    if not aio:
+        if st.applied:
+            message += f"; no {_LITE_AIO} in CHANNEL_LAYERS"
+        return [Item(section, None, "patch", level, st.version, expected, message)]
+    return [Item(section, name, "patch", level, st.version, expected, message) for name in aio]
+
+
 # --- 조립 ------------------------------------------------------------------------------
 
 
@@ -893,6 +928,7 @@ def diagnose(
         items.extend(ls_items)
 
     items.extend(_channel_items(files, replicated, profile))
+    items.extend(_patch_items())
     return items
 
 

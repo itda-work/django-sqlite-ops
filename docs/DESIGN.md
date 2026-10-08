@@ -272,7 +272,7 @@ django_sqlite_ops/
 - **Litestream 설정**(`--litestream-config` 가 있을 때만. 없으면 `ok` "skipped"): `litestream databases -config C -json` 으로 DB 목록을 읽는다(YAML 파서를 넣지 않는다). 버전 검사·타임아웃은 boot 헬퍼(`boot/litestream.py` 의 `config_databases`)를 쓴다. 0.5.17 은 경로를 절대 경로로 내보내며 `..` 는 문자열로 접고 링크는 남긴다. 상대 경로와 `dir:` 항목은 Litestream 작업 디렉터리 기준이 되므로(`dir:` 항목은 작업 디렉터리 자체로 나온다, 실측) 새 임시 디렉터리에서 실행해 그 아래로 풀린 항목을 `warn` 으로 골라낸다. 그래서 `--litestream-config` 와 경로 구분자가 든 `--litestream` 은 실행 전에 호출자 cwd 기준 절대 경로로 바꾼다(PATH 로 찾는 이름은 그대로).
   - 대조는 실제 경로(`realpath`)로 한다(D-15). 설정 경로가 실제 경로가 아니면 `warn` — boot 가 거부할 구성이다.
   - 쓰기 별칭인데 설정에 없음 → `warn`(복제되지 않음). channels-lite 전용 채널 DB(앱 DB 와 다른 실제 파일)는 §8 규칙상 복제에서 빼므로 이 검사에서 제외한다. 앱 DB 와 파일을 공유하면 제외하지 않는다. 설정에 있는데 `DATABASES` 에 없음 → `ok`(정보). 실행·파싱 실패(설정 파일 없음, 깨진 YAML, 바이너리 없음, 검증 안 된 버전) → `error`.
-- **채널 레이어**: `settings.CHANNEL_LAYERS` 를 읽기만 한다(`channels` 를 import 하지 않는다). 백엔드 경로로 종류를 알아보고 §8 표의 의미론을 한 줄로 요약한다. InMemory 는 프로필이 `single-server-multiproc` 이면 `warn`(프로필이 다중 프로세스를 명시하므로). channels_redis pub/sub 은 의미론 미측정이라 `unknown`, 모르는 백엔드도 `unknown`. channels-lite 는 §8 규칙대로 채널 DB 가 앱 DB(`default` 별칭이거나 다른 별칭과 같은 실제 파일)면 `warn`, Litestream 설정이 있고 채널 DB 가 복제 대상이면 `warn`. channels-lite aio 결함 패치(§9)는 #8 에서 다룬다.
+- **채널 레이어**: `settings.CHANNEL_LAYERS` 를 읽기만 한다(`channels` 를 import 하지 않는다). 백엔드 경로로 종류를 알아보고 §8 표의 의미론을 한 줄로 요약한다. InMemory 는 프로필이 `single-server-multiproc` 이면 `warn`(프로필이 다중 프로세스를 명시하므로). channels_redis pub/sub 은 의미론 미측정이라 `unknown`, 모르는 백엔드도 `unknown`. channels-lite 는 §8 규칙대로 채널 DB 가 앱 DB(`default` 별칭이거나 다른 별칭과 같은 실제 파일)면 `warn`, Litestream 설정이 있고 채널 DB 가 복제 대상이면 `warn`. channels-lite aio 레이어를 쓰거나 `PATCH_CHANNELS_LITE_AIO` 가 켜져 있으면 §9 패치 상태를 `patch` 항목으로 낸다(적용됨 `ok`, 꺼짐·게이트 밖·미설치 `warn`). 이 경우에만 channels-lite 를 import 한다(DB 는 열지 않는다).
 - **수준**: `ok` · `warn` · `error` · `unknown`. 판정할 수 없으면 숨기지 않고 `unknown` 으로 적는다.
 - **종료 코드**: 0 문제 없음 · 1 경고 또는 `unknown` · 2 오류. 명령은 0 이 아니면 `SystemExit(code)` 로 끝난다.
 - **사람용 출력**: 섹션(`settings`·`database`·`mount`·`litestream`·`channels`)별 표, 줄 앞에 수준. 마지막 줄 `summary: N warning(s), N error(s), N unknown -> exit N`.
@@ -421,14 +421,19 @@ SQLITE_OPS = {
 마스터 결정(2026-10-07): **상류에 알리지 않는다. 필요하면 우리 라이브러리에서 몽키패치한다.**
 
 - **결함**: `channels_lite.layers.aio.AIOSQLiteChannelLayer._receive_single_from_db` 는 `UPDATE ... SET delivered=1 WHERE id=? AND delivered=0` 다음에 `if conn.total_changes > 0:` 로 선점 성공을 판정한다(0.4.0, commit 72060cc, `aio.py:172`). `total_changes` 는 그 연결이 열린 뒤 누적된 변경 수다. 그래서 풀에서 재사용된 연결이면 UPDATE 가 0행이어도 참이 되고, 경쟁에서 진 수신자도 같은 메시지를 받는다.
-- **검증 상태**: 코드상 확인. 재현은 아직 안 함.
+- **검증 상태**: **재현함**(#8, channels-lite 0.4.0 · aiosqlite 0.22.1 · aiosqlitepool 1.0.0). 레이어 인스턴스 둘(= 프로세스 둘)이 일반 채널 `work` 를 경쟁하고, 송신은 세 번째 인스턴스가 한다. 수신자마다 다른 채널로 먼저 `send` 를 한 번 하면(풀이 그 연결을 다시 주므로 `total_changes > 0`) 메시지 하나가 두 수신자에게 모두 배달된다.
+  - 두 SELECT 뒤에 배리어를 둔 결정적 시나리오(`pool_size=1`): 20/20 라운드 중복.
+  - 계측 없이 `receive()` 두 개를 동시에 돈 시나리오(기본 `pool_size=10`): 20/20 라운드 중복. 실험에서는 50/50.
+  - 대조군: 수신자 연결이 쓰기를 한 적이 없으면 두 시나리오 모두 0/20(그래서 원인은 `total_changes` 다).
+  - 패치 후 같은 시나리오 0/20. 테스트는 `tests/test_compat_channels_lite.py`.
 - **구현 순서**(지키기):
   1. **먼저 재현 테스트를 만든다.** 수신자 둘이 같은 일반 채널(`!` 없는 채널)을 경쟁하고, 같은 연결이 앞서 쓰기를 한 상태를 만든다. 패치 전에 중복 배달이 실패로 드러나야 한다. 재현이 안 되면 패치하지 않고 이 절을 "재현 안 됨"으로 갱신한다.
   2. 패치는 `cursor.rowcount == 1` 로 판정을 바꾸는 최소 교체다. 메서드 하나만 바꾼다.
   3. **버전 게이트**: 설치된 channels-lite 버전이 검증한 범위(`==0.4.0`)일 때만 적용한다. 범위 밖이면 적용하지 않고 `sqlite_doctor` 에 경고로 남긴다.
   4. **명시 적용**: 자동으로 적용하지 않는다. 설정 `SQLITE_OPS = {"PATCH_CHANNELS_LITE_AIO": True}` 이거나 `django_sqlite_ops.compat.channels_lite.apply()` 를 호출할 때만 적용한다. `apply()` 를 두 번 불러도 안전해야 한다(멱등).
   5. 패치 후 같은 재현 테스트가 통과해야 한다.
-- ORM 판(`layers/core.py`)은 `aupdate()` 의 반환값(행 수)을 검사하므로 해당하지 않는다.
+- ORM 판(`layers/core.py`)은 `aupdate()` 의 반환값(행 수)을 검사하므로 해당하지 않는다(0.4.0 `core.py:47-50`, 소스 고정 테스트 있음).
+- **구현**(#8): `django_sqlite_ops/compat/channels_lite.py` 의 `apply()`·`status()`. 게이트는 `importlib.metadata.version("channels-lite") == "0.4.0"` 과 원본 메서드 `inspect.getsource()` 의 SHA-256 이 검증값과 같은지 둘 다 본다. 소스를 읽을 수 없으면 적용하지 않는다. 교체본은 `compat/_channels_lite_aio.py` 이고, 원본과의 차이가 두 줄(UPDATE 결과를 `cursor` 로 받기, 판정)뿐인지 테스트가 원본 소스와 diff 로 확인한다.
 
 ## 10. 회귀 랩 (실패 경계)
 
