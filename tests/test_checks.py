@@ -373,7 +373,7 @@ for alias, row in rows.items():
         conn.close()
     databases[alias] = {
         "ENGINE": "django.db.backends.sqlite3",
-        "NAME": row["name"].format(base=base),
+        "NAME": (Path if row.get("pathlike") else str)(row["name"].format(base=base)),
         "OPTIONS": row["options"],
     }
 # Django 는 default 별칭을 요구한다. sqlite 가 아닌 엔진이라 체크 대상이 아니다
@@ -516,49 +516,198 @@ def test_w002_undeterminable_message():
     assert "journal_mode=WAL" in hint
 
 
-# (NAME, 미리 만들 파일, 기대 체크, 실제 journal_mode 의 앞부분)
+W001, W002, W004 = "sqlite_ops.W001", "sqlite_ops.W002", "sqlite_ops.W004"
+READONLY = "error: attempt to write a readonly database"
+REMEDY = {"transaction_mode": "IMMEDIATE", "init_command": "PRAGMA journal_mode=WAL"}
+
+# 별칭 역할 판별 표 (리뷰 1·2). 행마다:
+#   (NAME, 미리 만들 파일, PathLike 로 줄지,
+#    OPTIONS 없이: (체크, 실제 journal_mode),
+#    W001·W002 안내(REMEDY)를 적용한 뒤: (체크, 실제 journal_mode))
+# 역할을 판정할 수 없으면 W004 만 내고, 안내를 적용해도 W004 는 사라지지 않는다.
 NAME_TABLE = [
     # 메모리 DB: W002 를 건너뛴다
-    (":memory:", None, ["sqlite_ops.W001"], "memory"),
-    ("file::memory:", None, ["sqlite_ops.W001"], "memory"),
-    ("file::memory:?cache=shared", None, ["sqlite_ops.W001"], "memory"),
-    ("file:memdb1?mode=memory&cache=shared", None, ["sqlite_ops.W001"], "memory"),
+    (":memory:", None, False, ([W001], "memory"), ([], "memory")),
+    (":memory:", None, True, ([W001], "memory"), ([], "memory")),
+    ("file::memory:", None, False, ([W001], "memory"), ([], "memory")),
+    ("file::memory:?cache=shared", None, False, ([W001], "memory"), ([], "memory")),
+    ("file:memdb1?mode=memory&cache=shared", None, False, ([W001], "memory"), ([], "memory")),
+    # 퍼센트 인코딩된 :memory: 도 메모리다 (파일명을 디코딩한 뒤 비교)
+    ("file:%3Amemory%3A", None, False, ([W001], "memory"), ([], "memory")),
+    ("file:%3amemory%3a?cache=shared", None, False, ([W001], "memory"), ([], "memory")),
     # 메모리처럼 보이지만 실제로는 파일이다: 검사한다
-    ("file::memory:backup.sqlite3", None, ["sqlite_ops.W001", "sqlite_ops.W002"], "delete"),
+    ("file::memory:backup.sqlite3", None, False, ([W001, W002], "delete"), ([], "wal")),
+    # 인코딩된 구분자는 구분자가 아니다: 파일명이 "q?mode=ro.sqlite3" 인 쓰기 DB
+    ("file:{base}/q%3Fmode%3Dro.sqlite3", None, False, ([W001, W002], "delete"), ([], "wal")),
+    # 프래그먼트 뒤는 쿼리가 아니다
+    (
+        "file:{base}/frag.sqlite3?mode=rwc#?mode=ro",
+        None,
+        False,
+        ([W001, W002], "delete"),
+        ([], "wal"),
+    ),
+    # 읽기 전용: W001·W002 를 건너뛴다
+    ("file:{base}/ro.sqlite3?mode=ro", "ro.sqlite3", False, ([], "delete"), ([], READONLY)),
+    ("file:{base}/key.sqlite3?mo%64e=r%6F", "key.sqlite3", False, ([], "delete"), ([], READONLY)),
+    ("file:{base}/i1.sqlite3?immutable=1", "i1.sqlite3", False, ([], "delete"), ([], "delete")),
+    ("file:{base}/i2.sqlite3?immutable=true", "i2.sqlite3", False, ([], "delete"), ([], "delete")),
+    ("file:{base}/i3.sqlite3?immutable=yes", "i3.sqlite3", False, ([], "delete"), ([], "delete")),
+    ("file:{base}/i4.sqlite3?immutable=On", "i4.sqlite3", False, ([], "delete"), ([], "delete")),
+    # immutable 거짓값은 쓰기 DB 다
+    (
+        "file:{base}/i5.sqlite3?immutable=0",
+        "i5.sqlite3",
+        False,
+        ([W001, W002], "delete"),
+        ([], "wal"),
+    ),
+    (
+        "file:{base}/i6.sqlite3?immutable=OFF",
+        "i6.sqlite3",
+        False,
+        ([W001, W002], "delete"),
+        ([], "wal"),
+    ),
+    # 역할을 판정할 수 없다: W004. SQLite 의 중복·비표준 해석을 흉내 내지 않는다
     (
         "file:{base}/regular.sqlite3?mode=memory&mode=rwc",
         None,
-        ["sqlite_ops.W001", "sqlite_ops.W002"],
-        "delete",
+        False,
+        ([W004], "delete"),
+        ([W004], "wal"),
     ),
-    # 읽기 전용: W001·W002 를 건너뛴다
-    ("file:{base}/ro.sqlite3?mode=ro", "ro.sqlite3", [], "delete"),
-    ("file:{base}/imm.sqlite3?immutable=1", "imm.sqlite3", [], "delete"),
-    # mode 가 둘이면 판정하지 않고 검사한다. SQLite 는 이 URI 를 실제로 읽기 전용으로 열지만
-    # (나중 mode 가 이긴다. 반대 순서 mode=ro&mode=rwc 는 연결 오류), 중복 해석을 단정하지 않는다
+    ("file:memory?mode=memory&mode=memory", None, False, ([W004], "memory"), ([W004], "memory")),
     (
-        "file:{base}/ro2.sqlite3?mode=rwc&mode=ro",
-        "ro2.sqlite3",
-        ["sqlite_ops.W001", "sqlite_ops.W002"],
-        "delete",
+        "file:{base}/d1.sqlite3?mode=rwc&mode=ro",
+        "d1.sqlite3",
+        False,
+        ([W004], "delete"),
+        ([W004], READONLY),
+    ),
+    (
+        "file:{base}/d2.sqlite3?mode=ro&mode=ro",
+        "d2.sqlite3",
+        False,
+        ([W004], "delete"),
+        ([W004], READONLY),
+    ),
+    (
+        "file:{base}/d3.sqlite3?mode=ro&mode=rwc",
+        "d3.sqlite3",
+        False,
+        ([W004], "error: access mode not allowed: rwc"),
+        ([W004], "error: access mode not allowed: rwc"),
+    ),
+    (
+        "file:{base}/d4.sqlite3?mode=ro%00ignored",
+        "d4.sqlite3",
+        False,
+        ([W004], "delete"),
+        ([W004], READONLY),
+    ),
+    (
+        "file:{base}/d5.sqlite3?mode=RO",
+        "d5.sqlite3",
+        False,
+        ([W004], "error: no such access mode: RO"),
+        ([W004], "error: no such access mode: RO"),
+    ),
+    (
+        "file:{base}/d6.sqlite3?immutable=1&immutable=0",
+        "d6.sqlite3",
+        False,
+        ([W004], "delete"),
+        ([W004], "delete"),
+    ),
+    (
+        "file:{base}/d7.sqlite3?immutable=0&immutable=1",
+        "d7.sqlite3",
+        False,
+        ([W004], "delete"),
+        ([W004], "wal"),
+    ),
+    (
+        "file:{base}/d8.sqlite3?immutable=2",
+        "d8.sqlite3",
+        False,
+        ([W004], "delete"),
+        ([W004], "delete"),
+    ),
+    (
+        "file:{base}/d9.sqlite3?vfs=litestream&vfs=unix",
+        "d9.sqlite3",
+        False,
+        ([W004], "delete"),
+        ([W004], "wal"),
     ),
 ]
 
 
-def test_memory_and_readonly_names_match_real_connection(tmp_path):
-    rows = {
-        f"db{i}": {"name": name, "create": create, "options": {}}
-        for i, (name, create, _, _) in enumerate(NAME_TABLE)
-    }
-    result = run_actual(rows, tmp_path)
+def test_alias_roles_match_real_connection(tmp_path):
+    rows = {}
+    for i, (name, create, pathlike, _, _) in enumerate(NAME_TABLE):
+        rows[f"db{i}"] = {"name": name, "create": create, "pathlike": pathlike, "options": {}}
+    plain = run_actual(rows, tmp_path)
+    for row in rows.values():
+        row["create"] = None
+        row["options"] = REMEDY
+    remedied = run_actual(rows, tmp_path)
     got = [
-        (name, create, sorted(result[f"db{i}"]["ids"]), result[f"db{i}"]["actual"])
-        for i, (name, create, _, _) in enumerate(NAME_TABLE)
+        (
+            name,
+            create,
+            pathlike,
+            (sorted(plain[f"db{i}"]["ids"]), plain[f"db{i}"]["actual"]),
+            (sorted(remedied[f"db{i}"]["ids"]), remedied[f"db{i}"]["actual"]),
+        )
+        for i, (name, create, pathlike, _, _) in enumerate(NAME_TABLE)
     ]
     assert got == NAME_TABLE
     # 메모리처럼 보이는 이름이 실제 파일을 만들었다 (검사 대상이어야 하는 이유)
     assert (tmp_path / ":memory:backup.sqlite3").exists()
     assert (tmp_path / "regular.sqlite3").exists()
+    assert (tmp_path / "q?mode=ro.sqlite3").exists()
+
+
+W004_SCRIPT = """
+import django
+from django.conf import settings
+
+settings.configure(
+    INSTALLED_APPS=["django_sqlite_ops"],
+    DATABASES={
+        "default": {
+            "ENGINE": "django.db.backends.sqlite3",
+            "NAME": "file:/srv/app/app.sqlite3?mode=rwc&mode=ro",
+        }
+    },
+)
+django.setup()
+
+from django.core.checks import run_checks
+
+for deploy in (False, True):
+    for m in run_checks(include_deployment_checks=deploy):
+        if m.id.startswith("sqlite_ops."):
+            print(deploy, m.id, m.obj, m.level, "|", m.msg, "|", m.hint)
+"""
+
+
+def test_w004_message_and_deploy_only():
+    result = subprocess.run(
+        [sys.executable, "-c", W004_SCRIPT],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    (line,) = result.stdout.splitlines()
+    head, msg, hint = line.split(" | ")
+    assert head == "True sqlite_ops.W004 default 30"
+    assert "cannot determine" in msg.lower() and "mode" in msg
+    assert "once" in hint and "DESIGN §6-1" in hint
 
 
 def test_readonly_alias_breaks_with_wal_remediation(tmp_path):

@@ -4,10 +4,11 @@
 설정(직접 쓴 dict, dj-lite 결과)도 같은 기준으로 검사한다.
 """
 
+import os
 import re
 from collections.abc import Mapping
 from typing import Any
-from urllib.parse import parse_qs
+from urllib.parse import unquote
 
 from django.conf import settings
 from django.core import checks
@@ -69,41 +70,71 @@ def _options(config: Mapping[str, Any]) -> Mapping[str, Any]:
 
 
 def _uri(name: Any) -> tuple[str, dict[str, list[str]]] | None:
-    """``file:`` URI 면 (파일명 부분, 쿼리)를, 아니면 ``None`` 을 돌려준다."""
+    """``file:`` URI 면 (파일명, 쿼리)를, 아니면 ``None`` 을 돌려준다.
+
+    SQLite 처럼 파일명은 첫 ``?``·``#`` 앞, 쿼리는 ``?`` 뒤 ``#`` 앞이다. 구분자로 먼저 나눈 뒤
+    파일명과 쿼리 키·값을 퍼센트 디코딩한다(인코딩된 ``%3F`` 를 구분자로 보지 않는다).
+    """
+    if isinstance(name, os.PathLike):
+        name = os.fspath(name)
     if not isinstance(name, str) or not name.startswith("file:"):
         return None
     rest = name[len("file:") :].split("#", 1)[0]
-    path, _, query = rest.partition("?")
-    return path, parse_qs(query, keep_blank_values=True)
+    path, _, raw_query = rest.partition("?")
+    query: dict[str, list[str]] = {}
+    for part in raw_query.split("&"):
+        if part:
+            key, _, value = part.partition("=")
+            query.setdefault(unquote(key), []).append(unquote(value))
+    return unquote(path), query
 
 
-def _single(query: Mapping[str, list[str]], key: str) -> str | None:
-    """쿼리 키가 정확히 한 번 있을 때만 그 값을 돌려준다. 중복이면 판정하지 않는다."""
-    values = query.get(key, [])
-    return values[0] if len(values) == 1 else None
+# SQLite 가 받는 값 (https://www.sqlite.org/uri.html, sqlite3_uri_boolean). 그 밖은 판정하지 않는다.
+_MODES = frozenset({"ro", "rw", "rwc", "memory"})
+_TRUE = frozenset({"1", "yes", "true", "on"})
+_FALSE = frozenset({"0", "no", "false", "off"})
+_ROLE_KEYS = ("mode", "immutable", "vfs")
 
 
-def _is_memory_db(name: Any) -> bool:
+def _role(name: Any) -> tuple[str, str | None]:
+    """별칭의 역할과, 판정할 수 없을 때 그 이유를 돌려준다.
+
+    역할: ``"write"`` · ``"memory"`` · ``"read-only"`` · ``"vfs"`` · ``"unknown"``.
+    역할을 정하는 쿼리 키(``mode``·``immutable``·``vfs``)가 겹치거나 SQLite 표준 표기가 아니면
+    ``"unknown"`` 이다. SQLite 의 중복·비표준 해석을 흉내 내지 않는다.
+    """
+    if isinstance(name, os.PathLike):
+        name = os.fspath(name)
     if name == ":memory:":
-        return True
+        return "memory", None
     uri = _uri(name)
     if uri is None:
-        return False
+        return "write", None
     path, query = uri
-    return path == ":memory:" or _single(query, "mode") == "memory"
-
-
-def _is_read_only(name: Any) -> bool:
-    uri = _uri(name)
-    if uri is None:
-        return False
-    _, query = uri
-    return _single(query, "mode") == "ro" or _single(query, "immutable") == "1"
+    for key in _ROLE_KEYS:
+        if len(query.get(key, [])) > 1:
+            return "unknown", f"query key {key!r} is given more than once"
+    mode = query.get("mode", [None])[0]
+    if mode is not None and mode not in _MODES:
+        return "unknown", f"mode={mode!r} is not one of {', '.join(sorted(_MODES))}"
+    immutable = query.get("immutable", [None])[0]
+    if immutable is not None and immutable.lower() not in _TRUE | _FALSE:
+        return (
+            "unknown",
+            f"immutable={immutable!r} is not a boolean (1/0, yes/no, true/false, on/off)",
+        )
+    if path == ":memory:" or mode == "memory":
+        return "memory", None
+    if mode == "ro" or (immutable is not None and immutable.lower() in _TRUE):
+        return "read-only", None
+    if query.get("vfs") == ["litestream"]:
+        return "vfs", None
+    return "write", None
 
 
 def _is_litestream_vfs(name: Any) -> bool:
     uri = _uri(name)
-    return uri is not None and _single(uri[1], "vfs") == "litestream"
+    return uri is not None and uri[1].get("vfs") == ["litestream"]
 
 
 def _strip_comments(statement: str) -> str:
@@ -206,7 +237,8 @@ def check_settings(app_configs=None, **kwargs):
 
 
 def check_deploy_settings(app_configs=None, **kwargs):
-    """``check --deploy`` 에서만 도는 체크: W001(transaction_mode), W002(journal_mode)."""
+    """``check --deploy`` 에서만 도는 체크: W001(transaction_mode), W002(journal_mode),
+    W004(별칭 역할을 판정할 수 없음)."""
     profile, error = _profile()
     if error:
         return []  # E001 은 check_settings 가 낸다
@@ -215,8 +247,23 @@ def check_deploy_settings(app_configs=None, **kwargs):
     want_journal = str(rec["pragmas"]["journal_mode"]).upper()
     messages = []
     for alias, config in _sqlite_aliases():
-        name = config.get("NAME")
-        if _is_read_only(name) or _is_litestream_vfs(name):
+        role, reason = _role(config.get("NAME"))
+        if role == "unknown":
+            # 역할을 모르면 쓰기 권고를 내지 않는다. 따르면 연결이 깨질 수 있다(mode=ro 에 WAL)
+            messages.append(
+                checks.Warning(
+                    f"Cannot determine the role of database {alias!r} (write, read-only, "
+                    f"memory or Litestream VFS) from its NAME: {reason}.",
+                    hint=(
+                        "Give each URI query key (mode, immutable, vfs) once, in standard form: "
+                        "mode=ro|rw|rwc|memory, immutable=1|0, vfs=<name> (DESIGN §6-1)."
+                    ),
+                    obj=alias,
+                    id="sqlite_ops.W004",
+                )
+            )
+            continue
+        if role in ("read-only", "vfs"):
             # 쓰기 권고가 의미 없거나, 따르면 연결이 깨진다(mode=ro 에 journal_mode=WAL)
             continue
         options = _options(config)
@@ -234,7 +281,7 @@ def check_deploy_settings(app_configs=None, **kwargs):
                     id="sqlite_ops.W001",
                 )
             )
-        if _is_memory_db(name):
+        if role == "memory":
             continue
         journal, undetermined = _journal_mode(options.get("init_command"))
         if undetermined is not None:
