@@ -764,4 +764,6 @@ scripts/ci-local.sh litestream      # 실제 litestream 바이너리 + channels-
 
 scripts/lab.sh run all              # 회귀 랩 L1–L8·프로필 종단 검증 (Docker, 약 8분, 끝나면 down -v)
 scripts/lab.sh bench                # PRAGMA 벤치 (lab/README.md)
+
+gh workflow run lab.yml -f scenarios=all   # 회귀 랩을 GitHub 러너(amd64)에서 수동 실행. 결과는 artifact (벤치 제외)
 ```

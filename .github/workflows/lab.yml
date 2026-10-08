@@ -1,0 +1,55 @@
+# 회귀 랩(lab/README.md)을 GitHub 러너(amd64)에서 돈다(#25). 수동 실행 전용이다.
+# 기본 CI(push/PR)에는 넣지 않는다(이미지 빌드·SeaweedFS 기동 포함 8분 이상, Docker 필요).
+# act(scripts/ci-local.sh)는 Docker 소켓을 넘기지 않으므로 이 워크플로는 act 대상이 아니다.
+# PRAGMA 벤치는 공유 러너의 소음이 커서 여기서 돌리지 않는다.
+#
+#   gh workflow run lab.yml -f scenarios=all
+name: Lab
+
+on:
+  workflow_dispatch:
+    inputs:
+      scenarios:
+        description: "scripts/lab.sh run 의 선택(all 또는 pytest -k 로 좁힐 시나리오)"
+        type: choice
+        default: all
+        options: [all, P1, P2, L1, L2, L3, L4, L5, L6, L7, L8]
+
+permissions:
+  contents: read
+
+jobs:
+  lab:
+    name: lab (${{ inputs.scenarios }}, ubuntu-latest)
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      SCENARIOS: ${{ inputs.scenarios }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Environment
+        run: |
+          uname -m
+          docker version
+          docker compose version
+          docker buildx version
+      # 고정한 이미지 digest 와 문서 Dockerfile 의 베이스가 러너 아키텍처를 포함하는지 로그에 남긴다.
+      - name: Image platforms
+        run: |
+          images="$(grep -hoE 'image: [^ ]+@sha256:[0-9a-f]{64}' lab/*.yaml | sed 's/^image: //' | sort -u)"
+          for image in $images python:3.13-slim; do
+            echo "== $image"
+            docker buildx imagetools inspect "$image"
+          done
+      - name: Run lab
+        run: |
+          mkdir -p lab/.out
+          scripts/lab.sh run "$SCENARIOS" 2>&1 | tee "lab/.out/lab-run-$SCENARIOS.console"
+      - name: Upload results
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: lab-${{ inputs.scenarios }}-${{ github.run_id }}
+          path: lab/.out/
+          if-no-files-found: warn
