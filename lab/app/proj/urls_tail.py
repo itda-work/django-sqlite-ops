@@ -8,4 +8,6 @@ urlpatterns += [  # noqa: F821
     path("lab/read/<int:pk>", lab_views.read),  # noqa: F821
     path("lab/sorted", lab_views.sorted_page),  # noqa: F821
     path("lab/stats", lab_views.stats),  # noqa: F821
+    path("lab/probe", lab_views.probe),  # noqa: F821
+    path("lab/ping", lab_views.ping),  # noqa: F821
 ]

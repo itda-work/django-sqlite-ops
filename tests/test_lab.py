@@ -282,3 +282,72 @@ def test_l8a_clearly_young_stale_fails():
     timeline[3] = (timeline[3][0], "unknown", "stale", 5.0)
     problems = c.full_outage_problems(timeline, refresh=2)
     assert any("age 5.0 < 6" in p for p in problems), problems
+
+
+# --- PRAGMA 벤치 집계(#26, lab/_benchstat.py) ------------------------------------------------
+
+
+def _benchstat():
+    spec = importlib.util.spec_from_file_location("lab_benchstat", ROOT / "lab" / "_benchstat.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _run(cma, variant, rep, rps, **extra):
+    return {"cma": cma, "variant": variant, "rep": rep, "phases": {"mixed": {"rps": rps, **extra}}}
+
+
+def test_bench_pairs_within_rep_and_cma():
+    b = _benchstat()
+    runs = [
+        _run("0", "baseline", 1, 100.0),
+        _run("0", "baseline", 2, 200.0),
+        _run("none", "baseline", 1, 50.0),
+        _run("0", "cache_size", 2, 180.0),
+        _run("0", "cache_size", 1, 90.0),
+        _run("none", "cache_size", 1, 60.0),
+    ]
+    assert b.paired_deltas(runs, "0", "cache_size", "mixed", "rps") == [-10.0, -10.0]
+    assert b.paired_deltas(runs, "none", "cache_size", "mixed", "rps") == [20.0]
+
+
+def test_bench_reproduced_needs_every_rep_same_direction_over_threshold():
+    b = _benchstat()
+    assert b.reproduced([-6.0, -5.0, -9.1], 3)
+    assert b.reproduced([5.0, 7.0], 2)
+    assert not b.reproduced([-6.0, -4.9, -9.1], 3)  # 하나가 5% 미만
+    assert not b.reproduced([-6.0, 6.0], 2)  # 방향이 갈림
+    assert not b.reproduced([-6.0, -7.0], 3)  # 짝이 빠진 반복이 있음
+    assert not b.reproduced([], 0)
+
+
+def test_bench_metric_reads_nested_keys_and_skips_missing():
+    b = _benchstat()
+    run = _run("0", "baseline", 1, 10.0, server={"conn_per_db_request": 1.0}, svc={"p50_ms": None})
+    assert b.metric(run, "mixed", "server.conn_per_db_request") == 1.0
+    assert b.metric(run, "mixed", "svc.p50_ms") is None
+    assert b.metric(run, "write", "rps") is None
+    assert b.metric(run, "mixed", "server.missing") is None
+
+
+def test_bench_summary_marks_only_paired_metrics():
+    b = _benchstat()
+    runs = [
+        _run("0", "baseline", 1, 100.0, p50_ms=2.0, errors=0),
+        _run("0", "mmap_size", 1, 94.0, p50_ms=3.0, errors=1),
+    ]
+    s = b.summarize(
+        runs,
+        cmas=["0"],
+        variants=["baseline", "mmap_size"],
+        phases=["mixed"],
+        metrics=["rps", "p50_ms"],
+        paired=["rps"],
+        reps=1,
+    )["0"]["mixed"]
+    assert s["mmap_size"]["rps"]["delta_pct_per_rep"] == [-6.0]
+    assert s["mmap_size"]["rps"]["reproduced"] is True
+    assert "reproduced" not in s["baseline"]["rps"]
+    assert "delta_pct_per_rep" not in s["mmap_size"]["p50_ms"]
+    assert s["mmap_size"]["errors"] == 1

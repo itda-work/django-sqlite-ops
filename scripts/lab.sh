@@ -3,7 +3,7 @@
 #
 #   scripts/lab.sh up                 # 이미지 빌드 + SeaweedFS·toxiproxy 기동(남겨 둔다)
 #   scripts/lab.sh run [L1..L8|P1|P2|all]   # 시나리오(끝나면 down -v)
-#   scripts/lab.sh bench              # PRAGMA 벤치(끝나면 down -v)
+#   scripts/lab.sh bench [pytest 인자]   # PRAGMA 벤치(끝나면 down -v)
 #   scripts/lab.sh down               # 이 랩의 컨테이너·볼륨·네트워크만 지운다
 #
 # 프로젝트 이름은 LAB_PROJECT(기본 dso-lab, 또는 dso-lab-<suffix>)다. 같은 호스트의 다른
@@ -94,7 +94,7 @@ case "$cmd" in
     trap down EXIT
     build
     stamp="$(date +%Y%m%d-%H%M%S)"
-    pytest_lab -m bench 2>&1 | tee "$OUT/bench-$stamp.log"
+    pytest_lab -m bench "$@" 2>&1 | tee "$OUT/bench-$stamp.log"
     ;;
   down)
     down

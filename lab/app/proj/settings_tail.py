@@ -9,6 +9,8 @@ ALLOWED_HOSTS = ["*"]
 ROOT_URLCONF = "proj.urls"
 USE_TZ = True
 INSTALLED_APPS += ["notes"]  # noqa: F821
+# 벤치 계측(#26): 뷰 처리 시간 헤더. 문서 조각에 MIDDLEWARE 가 생기면 그 앞에 붙는다.
+MIDDLEWARE = ["notes.middleware.timing", *globals().get("MIDDLEWARE", [])]
 
 # 헬스 주기·grace 를 랩 시간에 맞게 줄인다(L8). 기본은 15초·60초.
 _health = SQLITE_OPS["HEALTH"]  # noqa: F821
@@ -28,9 +30,18 @@ if os.environ.get("LAB_PRAGMAS"):
         pragmas=json.loads(os.environ["LAB_PRAGMAS"]),
     )
 
+# PRAGMA 벤치(#26): CONN_MAX_AGE 축. "none" 이면 None(연결 유지), 숫자면 그 초.
+if os.environ.get("LAB_CONN_MAX_AGE"):
+    _cma = os.environ["LAB_CONN_MAX_AGE"]
+    DATABASES["default"]["CONN_MAX_AGE"] = None if _cma == "none" else int(_cma)  # noqa: F821
+
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
     "handlers": {"console": {"class": "logging.StreamHandler"}},
-    "loggers": {"django_sqlite_ops": {"handlers": ["console"], "level": "WARNING"}},
+    "loggers": {
+        "django_sqlite_ops": {"handlers": ["console"], "level": "WARNING"},
+        # 벤치(#26): 500 의 원인을 컨테이너 로그에 남긴다(DEBUG=False 면 기본으로 안 찍힌다).
+        "django.request": {"handlers": ["console"], "level": "ERROR"},
+    },
 }
