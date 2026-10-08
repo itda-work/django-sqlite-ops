@@ -7,7 +7,7 @@ Docker 로 Litestream·boot·헬스의 실패 경계(L1–L8, [DESIGN §10](../d
 ```bash
 scripts/lab.sh run all        # L1–L8, P1·P2 (약 8분). 끝나면 성공·실패와 관계없이 down -v
 scripts/lab.sh run L6         # pytest -k 로 좁힌다 (L1..L8, P1, P2)
-scripts/lab.sh bench          # PRAGMA 벤치 (기본 반복 5 × 변형 6, 약 25분)
+scripts/lab.sh bench          # PRAGMA 벤치 + 포화 측정 (약 50분). pytest 인자를 넘길 수 있다(-k saturation)
 scripts/lab.sh up             # 이미지 빌드 + SeaweedFS·toxiproxy 만 띄워 둔다(디버깅용)
 scripts/lab.sh down           # 이 랩의 자원만 지우고 남은 것을 보여 준다(비어 있어야 한다)
 ```
@@ -90,11 +90,32 @@ L6 의 훅은 `LAB_RENAME_DELAY` 가 있을 때만 `os.rename` 뒤에 한 줄(`[
 
 ## PRAGMA 벤치
 
-변형: 기준(권장 설정만), `temp_store=MEMORY`, `mmap_size=256MiB`, `cache_size=-65536`(64MiB), `journal_size_limit=64MiB`, 모두. 변형마다 새 볼륨·새 prefix 로 `--init-new` 부팅, `lab_seed` 로 같은 시드의 행 10만 개를 채우고, 5초 쉰 뒤 부하를 건다. Litestream 은 프로필 그대로 복제한다. 반복 r 마다 모든 변형을 돌고 순서를 r 만큼 회전한다(시간에 따른 호스트 부하 변화를 고르게 나눈다).
+`lab/test_bench.py` 의 두 테스트다(#10, #26 에서 재설계). 결과는 [`bench-2026-10-08.md`](../docs/research/bench-2026-10-08.md)(#26)와 [`lab-2026-10-08.md`](../docs/research/lab-2026-10-08.md#pragma-벤치)(#10).
 
-부하 발생기는 표준 라이브러리 Python(`lab_tools/loadgen.py`)이다. 같은 compose 네트워크의 별도 컨테이너에서 keep-alive 연결 16개로 닫힌 루프를 돈다. 요청 비율은 읽기(`/lab/read/<id>`) 70%, 정렬(인덱스 없는 열, 임시 B-트리) 10%, 쓰기(1행) 20%. 고른 이유: 이미지를 더 받지 않고, 요청 종류별 지연을 그대로 모으며, 1초마다 `/lab/stats` 로 `-wal` 크기를 표본할 수 있다. 병목이 앱·부하 발생기·호스트 중 어디인지와 부하 발생기의 여유는 재지 않았다(미검증). 그래서 벤치는 같은 조건에서 변형끼리의 상대 비교로만 읽는다.
+**`test_pragma_bench`** — 후보 PRAGMA 변형을 `CONN_MAX_AGE` 두 값(`0`, `None`)에서 기준(권장 설정만)과 비교한다. 기본 변형은 기준·`mmap_size=256MiB`·`cache_size=-65536`(64MiB)·`journal_size_limit=64MiB` 이고 `temp_store`·'넷 다'는 `LAB_BENCH_VARIANTS` 로 켠다. 실행마다 새 볼륨·새 prefix 로 `--init-new` 부팅 → `lab_seed` 로 같은 시드의 행 10만 개 → 5초 쉼 → 씨앗 뒤 표본 → 두 부하 단계(각 3초 워밍업 + 20초):
 
-판정: 같은 반복의 기준과 짝지어 차이(%)를 내고, **모든 반복에서 같은 방향으로 5% 이상**일 때만 '재현'으로 본다. `database.py` 기본값은 이 결과로 바꾸지 않는다(제안만).
+- `mixed`: 읽기(`/lab/read/<id>`) 70%, 정렬(인덱스 없는 열, 임시 B-트리) 10%, 1행 쓰기 20%. 작은 쓰기라 WAL 이 씨앗 크기에서 자라지 않는다.
+- `write`: 읽기 30%, 쓰기 70%(요청당 50행). 측정 중에 WAL 이 자라고 Litestream 체크포인트가 계속 일어난다.
+
+반복 r 마다 모든 (CMA, 변형) 조합을 돌고 순서를 r 만큼 회전한다(시간에 따른 호스트 부하 변화를 고르게 나눈다). 반복이 끝나면 랩 스택을 `down -v` 로 내리고 다시 띄운다(볼륨 풀 40개를 다시 쓴다). Litestream 은 프로필 그대로 복제한다.
+
+**`test_saturation`** — 기준 설정에서 `rawping`(Django 앞 ASGI 래퍼가 바로 답함)·`ping`(DB 없는 Django 뷰) 동시 16·48 과 `mixed` 동시 4·16·48 을 잰다. 부하 발생기의 한계와 처리량 곡선(병목 위치)을 본다.
+
+**계측**(랩 앱에만 있고 패키지 코드는 그대로다)
+
+| 무엇 | 어디서 | 쓰임 |
+|---|---|---|
+| `connection_created` 횟수, DB 요청 수, 열린 DB fd 수, fd 한도 | `notes/metrics.py`, `/lab/probe`(DB 를 열지 않음) | 연결 재사용 여부(DB 요청당 연결 생성), 연결 누적 |
+| `-wal` 크기와 헤더의 체크포인트 순번 | `/lab/probe`, 0.5초마다 | WAL 시작·최대·끝, 재시작 횟수(순번 차이), 줄어든 횟수 |
+| `X-Lab-Svc-Us` | 첫 미들웨어 `notes.middleware.timing` | 요청 스레드 안의 뷰 처리 시간 |
+| `X-Lab-App-Us` | `proj/asgi.py` 래퍼 | 요청을 받은 때부터 응답 시작까지(스레드 배정·대기 포함) |
+| 서버 CPU, 발생기 CPU | `time.process_time` 차이 / 경과 시간 | 어느 쪽이 CPU 한계인지 |
+
+부하 발생기는 표준 라이브러리 Python(`lab_tools/loadgen.py`)이다. 같은 compose 네트워크의 별도 컨테이너에서 keep-alive 연결로 닫힌 루프를 돈다. 이미지를 더 받지 않고 요청 종류별 지연·서버 헤더를 그대로 모은다. #26 실측에서 이 발생기는 `rawping` 으로 10,000 req/s 이상을 냈고 혼합 부하(약 500 req/s)에서는 CPU 0.1 코어 미만이었다 — 이 랩의 한계는 앱 프로세스 CPU 다.
+
+판정: 같은 반복·같은 CMA·같은 단계의 기준과 짝지어 차이(%)를 내고, **모든 반복에서 같은 방향으로 5% 이상**일 때만 '재현'으로 본다(`_benchstat.py`, Docker 없이 `tests/test_lab.py` 가 검사). `CONN_MAX_AGE=None` 의 500 은 결과로 기록만 하고 실패로 보지 않는다(ASGI 에서 fd 가 쌓여 나는 것을 #26 에서 재현). `database.py` 기본값은 이 결과로 바꾸지 않는다(제안만).
+
+환경 변수: `LAB_BENCH_REPS`(5), `LAB_BENCH_DURATION`(20), `LAB_BENCH_ROWS`(100000), `LAB_BENCH_CONCURRENCY`(16), `LAB_BENCH_VARIANTS`, `LAB_BENCH_CMA`(`0,none`), `LAB_BENCH_WRITE_SHARE`(0.7), `LAB_BENCH_WRITE_ROWS`(50), `LAB_BENCH_SAT_REPS`(2), `LAB_BENCH_SAT_DURATION`(10), `LAB_BENCH_SAT_LEVELS`(`4,16,48`). 결과: `lab/.out/bench-<시각>.json`, `saturation-<시각>.json`.
 
 ## 파일
 
@@ -107,11 +128,12 @@ lab/
 ├── multiproc-override.yaml P2 추가분
 ├── _lab.py                 compose·toxiproxy·조사 도구
 ├── _checks.py              L6·L8a 판정(순수 함수, tests/test_lab.py 가 Docker 없이 검사)
+├── _benchstat.py           벤치 집계·재현 판정(순수 함수, 같은 테스트가 검사)
 ├── conftest.py             RUN_LAB 게이트, 결과 기록
 ├── test_scenarios.py       P1·P2, L1–L8
-├── test_bench.py           PRAGMA 벤치
+├── test_bench.py           PRAGMA 벤치, 포화 측정
 └── app/                    랩 Django 프로젝트(문서 조각 밖의 것)
-    ├── manage.py, proj/asgi.py, proj/*_tail.py, notes/
+    ├── manage.py, proj/asgi.py(벤치 계측 래퍼), proj/*_tail.py, notes/(뷰·계측)
     ├── lab_tools/          inspect_data.py, replica.py, s3_objects.py, loadgen.py
     └── lab_hooks/          sitecustomize.py (L6)
 ```
