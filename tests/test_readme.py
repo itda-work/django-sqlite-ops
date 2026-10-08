@@ -8,6 +8,7 @@ import sys
 from pathlib import Path
 
 import pytest
+from _litestream import needs_litestream
 
 from django_sqlite_ops.boot import cli
 from django_sqlite_ops.database import recommended, sqlite_database
@@ -174,3 +175,77 @@ def test_readme_boot_exit_codes_match_code():
         cli.EXIT_EXEC,
     }
     assert shown == {str(c) for c in codes}
+
+
+# --- 빠른 시작: settings·litestream.yml·entrypoint 가 한 흐름으로 맞물리는지 ---------------
+
+QUICK_START = README.split("## 빠른 시작", 1)[1].split("\n## ", 1)[0]
+QUICK_PYTHON = re.findall(r"^```python\n(.*?)^```", QUICK_START, flags=re.S | re.M)
+QUICK_YAML = re.findall(r"^```yaml\n(.*?)^```", QUICK_START, flags=re.S | re.M)
+QUICK_SHELL = re.findall(r"^```bash\n(.*?)^```", QUICK_START, flags=re.S | re.M)
+SHELL_BLOCKS = re.findall(r"^ *```bash\n(.*?)^ *```", README, flags=re.S | re.M)
+QUICK_DB = "/data/app.sqlite3"
+QUICK_CONFIG = "/etc/litestream.yml"
+
+
+def _quick_settings() -> dict:
+    namespace: dict = {}
+    exec(next(b for b in QUICK_PYTHON if "SQLITE_OPS" in b), namespace)
+    return namespace
+
+
+def test_quick_start_has_every_piece():
+    assert any("SQLITE_OPS" in b for b in QUICK_PYTHON)
+    assert any("health_view" in b for b in QUICK_PYTHON)
+    assert len(QUICK_YAML) == 1
+    assert any(b.startswith("#!/bin/sh\n") for b in QUICK_SHELL)
+    assert "check --deploy" in QUICK_START
+    assert "sqlite_doctor" in QUICK_START
+
+
+def test_quick_start_uses_one_real_path():
+    # settings 의 NAME, health 의 litestream_config, boot 의 --db·--config 가 같은 값이다 (D-15)
+    settings = _quick_settings()
+    assert settings["DATABASES"]["default"]["NAME"] == QUICK_DB
+    assert settings["SQLITE_OPS"]["HEALTH"]["DATABASES"]["default"] == {
+        "litestream_config": QUICK_CONFIG
+    }
+    entrypoint = next(b for b in QUICK_SHELL if b.startswith("#!/bin/sh\n"))
+    assert f"--db {QUICK_DB}" in entrypoint
+    assert f"--config {QUICK_CONFIG}" in entrypoint
+    assert f"-- litestream replicate -config {QUICK_CONFIG}" in entrypoint
+    # 한 번만 쓰는 옵션은 굳히지 않고 BOOT_FLAGS 로만 넘긴다
+    for flag in ("--init-new", "--adopt-existing", "--on-unknown"):
+        assert flag not in entrypoint.split("set -eu", 1)[1]
+    assert QUICK_YAML[0].startswith(f"# {QUICK_CONFIG}\n")
+
+
+def test_quick_start_litestream_yml_parses():
+    yaml = pytest.importorskip("yaml")
+    dbs = yaml.safe_load(QUICK_YAML[0])["dbs"]
+    assert [db["path"] for db in dbs] == [QUICK_DB]
+
+
+@needs_litestream
+def test_quick_start_litestream_yml_is_read_by_litestream(tmp_path, litestream_binary):
+    config = tmp_path / "litestream.yml"
+    config.write_text(QUICK_YAML[0], encoding="utf-8")
+    result = subprocess.run(
+        [litestream_binary, "databases", "-config", str(config), "-json"],
+        capture_output=True,
+        text=True,
+        timeout=30,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert [db["path"] for db in json.loads(result.stdout)] == [QUICK_DB]
+
+
+@pytest.mark.parametrize("shell", ["bash", "sh"])
+@pytest.mark.parametrize("index", range(len(SHELL_BLOCKS)))
+def test_readme_shell_block_syntax(index, shell, tmp_path):
+    script = tmp_path / "block.sh"
+    # 자리 표시(`[boot 옵션]`)는 문법 검사에서 낱말로 바꾼다
+    script.write_text(SHELL_BLOCKS[index].replace("[boot 옵션]", "OPTIONS"), encoding="utf-8")
+    result = subprocess.run([shell, "-n", str(script)], capture_output=True, text=True, check=False)
+    assert result.returncode == 0, result.stderr

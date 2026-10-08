@@ -291,7 +291,7 @@ boot 의 판정·사유 코드·종료 코드는 [README boot CLI](../../README.
 - **S3 가 끊겨도 Litestream 은 아무 말이 없다.** 20초 단절 동안 WARN/ERROR 로그 0줄, `litestream status` rc 0, `sync_error_count` 변화 0(docker D3). 헬스 본문 `status` 로 알람을 건다. 서비스 자체는 계속 돈다(docker D2: 단절 중 쓰기 600건 에러 0, 복구 후 약 22초에 따라잡음).
 - **`endpoint` 에 `http://` 를 빠뜨리지 않는다**(§3 litestream.yml).
 - **`--init-new`·`--adopt-existing`·`--on-unknown` 은 한 번만.** `BOOT_FLAGS` 를 비우는 것까지가 절차다.
-- **실제 경로.** `/data` 가 심볼릭 링크면 boot 가 exit 64 로 거부한다. settings 의 `NAME`, boot 의 `--db`, `litestream.yml` 의 `path` 를 같은 실제 경로로 쓴다(D-15).
+- **실제 경로.** `/data` 가 심볼릭 링크면 boot 가 exit 64 로 거부한다. settings 의 `NAME`, boot 의 `--db`, `litestream.yml` 의 `path` 를 같은 실제 경로로 쓴다([README 경로 규칙](../../README.md#경로-규칙), D-15).
 - **`<db>.boot.lock` 을 지우지 않는다.** 지우면 다음 boot 가 새 파일을 잠가 이중 실행을 막지 못한다.
 - **스파이크 엔트리포인트를 쓰지 않는다.** `docs/reference/entrypoint.sh` 의 `restore -if-db-not-exists` 는 0바이트 DB 파일이 있으면 rc 0 으로 복원을 건너뛰고(재현함, DESIGN §4-1), 옛 볼륨을 막지 못한다. boot 가 이 자리를 대신한다.
 - **워커는 1개.** `InMemoryChannelLayer` 는 프로세스 밖으로 메시지를 보내지 않는다. `sqlite_doctor` 는 프로필이 `single-server-multiproc` 일 때만 이를 경고하므로, `single-server` 로 두고 워커를 늘리면 경고 없이 깨진다. `WEB_CONCURRENCY` 를 조심한다(§3).
