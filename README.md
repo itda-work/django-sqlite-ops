@@ -549,7 +549,7 @@ channels-lite 의 aio 레이어(`channels_lite.layers.aio.AIOSQLiteChannelLayer`
 
 #### 무엇을 고치나
 
-일반 채널(이름에 `!` 가 없는 채널, 예: 워커가 나눠 받는 작업 채널)을 수신자 둘 이상이 경쟁할 때, **한 메시지가 두 수신자에게 모두 배달된다.** 수신자는 `UPDATE ... SET delivered=1 WHERE id=? AND delivered=0` 로 메시지를 선점하는데, 성공 여부를 이번 UPDATE 의 행 수가 아니라 연결이 열린 뒤 누적된 변경 수(`total_changes`)로 판정하기 때문이다. 풀에서 다시 받은 연결이 앞서 한 번이라도 쓰기(`send`·`group_add` 등)를 했으면 경쟁에서 진 수신자도 성공으로 판정한다. 기본 `pool_size=10` 에서도 재현된다(#8, 재현율 20/20).
+일반 채널(이름에 `!` 가 없는 채널, 예: 워커가 나눠 받는 작업 채널)을 수신자 둘 이상이 경쟁할 때, **한 메시지가 두 수신자에게 모두 배달된다.** 수신자는 `UPDATE ... SET delivered=1 WHERE id=? AND delivered=0` 로 메시지를 선점하는데, 성공 여부를 이번 UPDATE 의 행 수가 아니라 연결이 열린 뒤 누적된 변경 수(`total_changes`)로 판정하기 때문이다. 풀에서 다시 받은 연결이 앞서 한 번이라도 쓰기(`send`·`group_add` 등)를 했으면 경쟁에서 진 수신자도 성공으로 판정한다. 별도 프로세스 둘에서도, 한 프로세스 안의 독립 레이어 둘에서도 재현되고 기본 `pool_size=10` 에서도 일어난다(#8). 두 수신자의 조회가 겹칠 때만 생기므로 빈도는 부하와 스케줄에 달려 있다.
 
 패치는 메서드 하나(`_receive_single_from_db`)만 바꾼다. 원본을 그대로 옮기고 판정만 UPDATE 커서의 `rowcount == 1` 로 바꾼다. ORM 판(`channels_lite.layers.core.SQLiteChannelLayer`)은 `aupdate()` 의 행 수로 판정하므로 해당하지 않는다.
 

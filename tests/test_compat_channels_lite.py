@@ -21,16 +21,25 @@ from _channels_lite import needs_channels_lite_aio, skip_or_fail
 
 ROOT = Path(__file__).resolve().parent.parent
 
-# 수신자 둘(레이어 인스턴스 둘 = 프로세스 둘)이 같은 일반 채널 하나를 경쟁한다. 송신자는 따로다.
+# 수신자 둘이 같은 일반 채널 하나를 경쟁한다. 송신자는 따로다. 두 가지 배치로 돈다.
+# - 한 프로세스의 독립 레이어·풀 둘(REPRO_SCRIPT): 자식 인터프리터 하나, 이벤트 루프 하나에서 레이어
+#   인스턴스 둘(풀도 각자)을 함께 돌린다. DB 경쟁은 실제지만 프로세스 간 스케줄링은 보지 않는다.
+# - 별도 프로세스 둘(MULTIPROC_SCRIPT): spawn 한 수신 프로세스 둘, 각 pool_size=1.
+# 공통 조건:
 # - prior: 수신자마다 다른 채널로 먼저 send 한다. 풀이 그 연결을 다시 주므로 total_changes > 0.
 # - barrier: 두 수신자가 SELECT 를 마친 뒤에야 UPDATE 로 넘어간다(대상 메서드는 그대로 두고
 #   연결 프록시에서 기다린다). 그래서 두 수신자가 늘 같은 행을 두고 경쟁하며, 결과가 결정적이다.
-# - natural: 계측 없이 공개 API receive() 두 개를 동시에 돌린다(기본 pool_size).
+#   결함 존재와 수정 전 실패는 이 시나리오로만 단언한다.
+# - natural: 계측 없이 공개 API receive() 두 개를 동시에 돌린다(기본 pool_size). 두 SELECT 가
+#   겹칠지는 스케줄에 달려 있으므로 패치 전 중복 횟수는 단언하지 않는다. 먼저 받은 수신자를 넉넉한
+#   제한시간 안에 기다린 뒤 정지 메시지를 보낸다. 남은 수신자는 중복이면 작업 메시지를, 아니면 정지
+#   메시지를 받고 끝난다(짧은 타임아웃으로 "안 받음"을 판정하지 않는다).
 REPRO_SCRIPT = """
 import asyncio
 import contextlib
 import json
 import os
+import sqlite3
 import sys
 
 import django
@@ -51,6 +60,10 @@ django.setup()
 from django.core.management import call_command
 
 call_command("migrate", database="channels", verbosity=0)
+# channels-lite 의 init_command 는 busy_timeout 보다 journal_mode=WAL 을 먼저 실행한다. 첫 연결 둘이
+# 동시에 WAL 로 바꾸려 하면 한쪽이 "database is locked" 로 실패하므로 미리 바꿔 둔다(시나리오 준비).
+with contextlib.closing(sqlite3.connect(settings.DATABASES["channels"]["NAME"])) as conn:
+    assert conn.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
 
 from channels_lite.layers import ChannelEmpty
 from channels_lite.layers.aio import AIOSQLiteChannelLayer
@@ -60,6 +73,10 @@ from django_sqlite_ops.compat import channels_lite
 if patch == "apply":
     assert channels_lite.apply()
 assert channels_lite.status().applied == (patch != "none"), channels_lite.status()
+
+# 실패 대신 멈춤을 막는 상한일 뿐 판정에 쓰지 않는다
+LIMIT = 30
+STOP = {"type": "stop"}
 
 
 class GatedConnection:
@@ -91,6 +108,12 @@ def layer(barrier=None):
     return result
 
 
+async def send(message):
+    sender = layer()
+    await sender.send("work", message)
+    await sender.close()
+
+
 async def pull(receiver):
     try:
         return (await receiver._receive_single_from_db("work"))[1]
@@ -98,11 +121,14 @@ async def pull(receiver):
         return None
 
 
-async def receive(receiver):
-    try:
-        return await asyncio.wait_for(receiver.receive("work"), 0.5)
-    except TimeoutError:
-        return None
+async def compete(receivers):
+    tasks = [asyncio.create_task(r.receive("work")) for r in receivers]
+    done, _ = await asyncio.wait(tasks, timeout=LIMIT, return_when=asyncio.FIRST_COMPLETED)
+    assert done, f"no receiver got the message within {LIMIT}s"
+    await send(STOP)
+    _, pending = await asyncio.wait(tasks, timeout=LIMIT)
+    assert not pending, f"a receiver did not finish within {LIMIT}s"
+    return [t.result() for t in tasks]
 
 
 async def main():
@@ -113,17 +139,16 @@ async def main():
         if prior:
             for i, receiver in enumerate(receivers):
                 await receiver.send(f"warmup.r{i}", {"type": "warmup"})
-        sender = layer()
-        await sender.send("work", {"type": "job", "n": n})
-        await sender.close()
+        job = {"type": "job", "n": n}
+        await send(job)
         if mode == "barrier":
             got = await asyncio.gather(*(pull(r) for r in receivers))
         else:
-            got = await asyncio.gather(*(receive(r) for r in receivers))
-        delivered = [m for m in got if m is not None]
-        assert all(m == {"type": "job", "n": n} for m in delivered), got
-        assert delivered, "message was lost"
-        duplicated += len(delivered) > 1
+            got = await compete(receivers)
+        jobs = [m for m in got if m is not None and m != STOP]
+        assert all(m == job for m in jobs), got
+        assert jobs, f"message was lost: {got}"
+        duplicated += len(jobs) > 1
         await receivers[0].flush()
         for receiver in receivers:
             await receiver.close()
@@ -133,19 +158,142 @@ async def main():
 asyncio.run(main())
 """
 
+# 별도 프로세스 둘. 리뷰(review-1)의 실험을 옮겼다. 부모가 송신하고 라운드마다 두 수신 프로세스를
+# 동시에 출발시키며, 수신자는 SELECT 뒤 프로세스 간 배리어에서 서로를 기다린다.
+MULTIPROC_SCRIPT = """
+import asyncio
+import contextlib
+import json
+import multiprocessing
+import os
+import sqlite3
+import sys
+
+import django
+from django.conf import settings
+
+directory, patch, prior, rounds = sys.argv[1:5]
+prior, rounds = prior == "1", int(rounds)
+settings.configure(
+    INSTALLED_APPS=["channels_lite", "django_sqlite_ops"],
+    USE_TZ=True,
+    DATABASES={
+        alias: {"ENGINE": "django.db.backends.sqlite3", "NAME": os.path.join(directory, name)}
+        for alias, name in (("default", "app.db"), ("channels", "ch.db"))
+    },
+    SQLITE_OPS={"PATCH_CHANNELS_LITE_AIO": patch == "setting"},
+)
+django.setup()
+
+from channels_lite.layers import ChannelEmpty
+from channels_lite.layers.aio import AIOSQLiteChannelLayer
+
+from django_sqlite_ops.compat import channels_lite
+
+# spawn 한 자식도 이 파일을 다시 실행하므로 패치는 프로세스마다 같은 방식으로 적용된다
+if patch == "apply":
+    assert channels_lite.apply()
+assert channels_lite.status().applied == (patch != "none"), channels_lite.status()
+
+# 실패 대신 멈춤을 막는 상한일 뿐 판정에 쓰지 않는다
+LIMIT = 30
+
+
+class GatedConnection:
+    def __init__(self, conn, barrier):
+        self._conn, self._barrier = conn, barrier
+
+    def __getattr__(self, name):
+        return getattr(self._conn, name)
+
+    async def execute(self, sql, *args):
+        cursor = await self._conn.execute(sql, *args)
+        if "SELECT id, data FROM channels_lite_event" in sql:
+            await asyncio.to_thread(self._barrier.wait, LIMIT)
+        return cursor
+
+
+def worker(index, pipe, barrier):
+    async def run():
+        for _ in range(rounds):
+            receiver = AIOSQLiteChannelLayer(database="channels", pool_size=1)
+            if prior:
+                await receiver.send(f"warmup.r{index}", {"type": "warmup"})
+            connection = receiver.connection
+
+            @contextlib.asynccontextmanager
+            async def gated():
+                async with connection() as conn:
+                    yield GatedConnection(conn, barrier)
+
+            receiver.connection = gated
+            pipe.send(("ready", os.getpid()))
+            await asyncio.to_thread(pipe.recv)
+            try:
+                got = (await receiver._receive_single_from_db("work"))[1]
+            except ChannelEmpty:
+                got = None
+            pipe.send(got)
+            await receiver.close()
+
+    asyncio.run(run())
+
+
+def recv(pipe):
+    assert pipe.poll(LIMIT), f"receiver did not answer within {LIMIT}s"
+    return pipe.recv()
+
+
+async def parent(pipes):
+    sender = AIOSQLiteChannelLayer(database="channels")
+    duplicated, pids = 0, set()
+    for n in range(rounds):
+        for pipe in pipes:
+            _, pid = recv(pipe)
+            pids.add(pid)
+        job = {"type": "job", "n": n}
+        await sender.send("work", job)
+        for pipe in pipes:
+            pipe.send("go")
+        got = [recv(pipe) for pipe in pipes]
+        jobs = [m for m in got if m is not None]
+        assert all(m == job for m in jobs), got
+        assert jobs, f"message was lost: {got}"
+        duplicated += len(jobs) > 1
+    await sender.close()
+    assert len(pids) == 2 and os.getpid() not in pids, pids
+    print(json.dumps({"rounds": rounds, "duplicated": duplicated, "pids": sorted(pids)}))
+
+
+if __name__ == "__main__":
+    from django.core.management import call_command
+
+    call_command("migrate", database="channels", verbosity=0)
+    # 수신 프로세스 둘의 첫 연결이 동시에 WAL 로 바꾸다 잠기지 않게 미리 바꾼다(REPRO_SCRIPT 참고)
+    with contextlib.closing(sqlite3.connect(settings.DATABASES["channels"]["NAME"])) as conn:
+        assert conn.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
+    context = multiprocessing.get_context("spawn")
+    barrier = context.Barrier(2)
+    pipes = [context.Pipe() for _ in range(2)]
+    procs = [
+        # daemon: 부모가 실패해도 기다리는 자식 때문에 종료가 막히지 않게 한다
+        context.Process(target=worker, args=(i, child, barrier), daemon=True)
+        for i, (_, child) in enumerate(pipes)
+    ]
+    for proc in procs:
+        proc.start()
+    asyncio.run(parent([mine for mine, _ in pipes]))
+    for proc in procs:
+        proc.join(LIMIT)
+        assert proc.exitcode == 0, proc.exitcode
+"""
+
 ROUNDS = 20
 
 
-def repro(directory: Path, *, patch: str, prior: bool, mode: str, rounds: int = ROUNDS) -> int:
-    """중복 배달된 라운드 수."""
+def _result(argv: list[str], rounds: int) -> int:
     result = subprocess.run(
-        [sys.executable, "-c", REPRO_SCRIPT, str(directory), patch, "1" if prior else "0", mode]
-        + [str(rounds)],
-        cwd=ROOT,
-        capture_output=True,
-        text=True,
-        check=False,
-        timeout=120,
+        argv, cwd=ROOT, capture_output=True, text=True, check=False, timeout=120
     )
     assert result.returncode == 0, result.stderr
     data = json.loads(result.stdout.strip().splitlines()[-1])
@@ -153,28 +301,66 @@ def repro(directory: Path, *, patch: str, prior: bool, mode: str, rounds: int = 
     return data["duplicated"]
 
 
-# --- 재현 --------------------------------------------------------------------------------
+def repro(directory: Path, *, patch: str, prior: bool, mode: str, rounds: int = ROUNDS) -> int:
+    """한 프로세스의 독립 레이어·풀 둘. 중복 배달된 라운드 수."""
+    argv = [sys.executable, "-c", REPRO_SCRIPT, str(directory), patch, "1" if prior else "0"]
+    return _result(argv + [mode, str(rounds)], rounds)
+
+
+def repro_multiproc(directory: Path, *, patch: str, prior: bool, rounds: int = ROUNDS) -> int:
+    """별도 프로세스 둘. spawn 은 주 모듈을 파일에서 다시 읽으므로 스크립트를 파일로 둔다."""
+    script = directory / "multiproc.py"
+    script.write_text(MULTIPROC_SCRIPT)
+    argv = [sys.executable, str(script), str(directory), patch, "1" if prior else "0"]
+    return _result(argv + [str(rounds)], rounds)
+
+
+# --- 재현: 결함 존재와 수정 전 실패는 배리어 시나리오로만 단언한다 ---------------------------
 
 
 @needs_channels_lite_aio
-@pytest.mark.parametrize("mode", ["barrier", "natural"])
-def test_unpatched_reused_connection_duplicates_delivery(tmp_path, mode):
+def test_unpatched_reused_connection_duplicates_delivery(tmp_path):
     # 결함이 상류에 그대로 있다는 기록. 상류가 고치면 실패해 게이트를 다시 볼 때를 알린다.
-    assert repro(tmp_path, patch="none", prior=True, mode=mode) == ROUNDS
+    assert repro(tmp_path, patch="none", prior=True, mode="barrier") == ROUNDS
 
 
 @needs_channels_lite_aio
-@pytest.mark.parametrize("mode", ["barrier", "natural"])
-def test_unpatched_fresh_connection_delivers_once(tmp_path, mode):
+def test_unpatched_reused_connection_duplicates_delivery_across_processes(tmp_path):
+    duplicated = repro_multiproc(tmp_path, patch="none", prior=True)
+    print(f"multiproc unpatched: duplicated {duplicated}/{ROUNDS}")
+    assert duplicated > 0
+
+
+@needs_channels_lite_aio
+def test_unpatched_fresh_connection_delivers_once(tmp_path):
     # 대조군: 수신자 연결이 쓰기를 한 적이 없으면(total_changes == 0) 패치 없이도 한 번만 배달된다.
-    assert repro(tmp_path, patch="none", prior=False, mode=mode) == 0
+    assert repro(tmp_path, patch="none", prior=False, mode="barrier") == 0
+
+
+@needs_channels_lite_aio
+def test_unpatched_fresh_connection_delivers_once_across_processes(tmp_path):
+    assert repro_multiproc(tmp_path, patch="none", prior=False) == 0
+
+
+@needs_channels_lite_aio
+def test_unpatched_public_api_race_is_observed_only(tmp_path):
+    # 공개 API 경쟁에서 원본의 중복 횟수는 스케줄에 달려 있어 단언하지 않는다. 유실·멈춤만 본다.
+    duplicated = repro(tmp_path, patch="none", prior=True, mode="natural")
+    print(f"natural unpatched: duplicated {duplicated}/{ROUNDS}")
 
 
 @needs_channels_lite_aio
 @pytest.mark.parametrize("patch", ["apply", "setting"])
 @pytest.mark.parametrize("mode", ["barrier", "natural"])
 def test_competing_receivers_get_message_once(tmp_path, patch, mode):
+    # 라운드마다 작업 메시지를 정확히 한 수신자만 받는다(스크립트가 유실을 따로 단언한다)
     assert repro(tmp_path, patch=patch, prior=True, mode=mode) == 0
+
+
+@needs_channels_lite_aio
+@pytest.mark.parametrize("patch", ["apply", "setting"])
+def test_competing_processes_get_message_once(tmp_path, patch):
+    assert repro_multiproc(tmp_path, patch=patch, prior=True) == 0
 
 
 # --- 교체본이 원본과 판정만 다른지 ---------------------------------------------------------
