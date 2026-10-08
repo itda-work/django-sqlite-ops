@@ -10,7 +10,7 @@ Django 에서 SQLite 를 운영 DB 로 안전하게 쓰게 하는 **운영 도�
 | boot CLI (복원 판정·복원·잠금) | 구현됨 | [#2](https://github.com/itda-work/django-sqlite-ops/issues/2) · [#3](https://github.com/itda-work/django-sqlite-ops/issues/3) · [#4](https://github.com/itda-work/django-sqlite-ops/issues/4) |
 | 시스템 체크 | 구현됨 | [#5](https://github.com/itda-work/django-sqlite-ops/issues/5) |
 | `sqlite_doctor` 관리 명령 | 구현됨 | [#6](https://github.com/itda-work/django-sqlite-ops/issues/6) |
-| 복제 헬스 | 예정 | [#7](https://github.com/itda-work/django-sqlite-ops/issues/7) |
+| 복제 헬스 | 구현됨 | [#7](https://github.com/itda-work/django-sqlite-ops/issues/7) |
 | 배포 프로필 문서 | 예정 | [#9](https://github.com/itda-work/django-sqlite-ops/issues/9) |
 | channels-lite 패치 | 예정 | [#8](https://github.com/itda-work/django-sqlite-ops/issues/8) |
 
@@ -307,6 +307,7 @@ python manage.py check --deploy   # W001·W002·W004 는 --deploy 일 때만 나
 | ID | 조건 | 언제 | 고치는 법 |
 |---|---|---|---|
 | `sqlite_ops.E001` | `SQLITE_OPS` 가 dict 가 아니거나 `PROFILE` 이 알 수 없는 이름 | 항상 | `PROFILE` 을 `"single-server"`·`"single-server-multiproc"` 중 하나로. 이 오류가 있으면 다른 체크는 돌지 않는다 |
+| `sqlite_ops.E002` | `SQLITE_OPS["HEALTH"]` 가 잘못됨: dict 가 아님, 모르는 키, `DATABASES` 가 비었거나 `DATABASES` 에 없는·sqlite3 가 아닌 별칭, `litestream_config` 없음, `REFRESH` 가 양수가 아님, `BACKLOG_GRACE` 가 음수 등. `HEALTH` 가 없으면 검사하지 않는다 | 항상 | [복제 헬스](#복제-헬스)의 설정 형식대로 고친다 |
 | `sqlite_ops.W001` | `OPTIONS["transaction_mode"]` 가 `IMMEDIATE` 가 아님(없음 포함, 대소문자 무시) | `--deploy` | `sqlite_database()` 를 쓰거나 `"transaction_mode": "IMMEDIATE"` 를 넣는다 |
 | `sqlite_ops.W002` | `OPTIONS["init_command"]` 에서 `journal_mode` 가 `WAL` 로 설정되지 않음, 또는 `journal_mode` 를 언급하는 문장의 형식을 판정할 수 없음 | `--deploy` | `sqlite_database()` 를 쓰거나 `init_command` 에 `PRAGMA journal_mode=WAL` 을 넣는다 |
 | `sqlite_ops.W003` | 이름이 Litestream VFS(`vfs=litestream` 이 든 `file:` URI)인 별칭의 `CONN_MAX_AGE` 가 `None` 이 아님, `ASGI_APPLICATION` 미설정(WSGI) | 항상 | 그 별칭에 `"CONN_MAX_AGE": None`. WSGI 실측에서 요청당 1,008ms → 1.7ms |
@@ -412,7 +413,86 @@ summary: 1 warning(s), 0 error(s), 0 unknown -> exit 1
 
 ### 복제 헬스
 
-예정. 복제 상태를 `caught_up / backlog / unknown` 으로 보고한다. [#7](https://github.com/itda-work/django-sqlite-ops/issues/7)
+"지금 복제가 따라오는가"를 `caught_up / backlog / unknown` 으로 보고하는 JSON 엔드포인트다. Litestream 은 S3 가 끊겨도 로그·`status`·메트릭에 아무것도 남기지 않으므로(실측 D3), 헬스는 Litestream 의 자기 보고 대신 **로컬 메타의 최대 TXID 와 복제본의 최대 TXID 를 직접 비교**한다. **DB 연결을 열지 않는다.** 로컬 TXID 는 메타 파일(`.<db>-litestream/ltx/0/`)에서, 원격은 `litestream ltx -level all -json` 으로 읽는다.
+
+```python
+# settings.py
+from django_sqlite_ops.database import sqlite_database
+
+INSTALLED_APPS = ["django_sqlite_ops"]
+
+DATABASES = {"default": sqlite_database("/srv/app/app.sqlite3")}
+
+SQLITE_OPS = {
+    "HEALTH": {
+        "DATABASES": {
+            # 별칭마다 Litestream 설정 파일. meta_path(설정에 meta-path 를 바꿨을 때)와
+            # litestream(바이너리, 기본 PATH 의 litestream)은 선택이다.
+            "default": {"litestream_config": "/etc/litestream.yml"},
+        },
+        "REFRESH": 15,  # 초, 원격 조회 주기 (기본 15)
+        "BACKLOG_GRACE": 60,  # 초, 로컬이 앞선 상태를 backlog 로 볼 때까지 (기본 60)
+    },
+}
+```
+
+```python
+# urls.py
+from django.urls import path
+
+from django_sqlite_ops.health import health_view
+
+urlpatterns = [
+    path("internal/sqlite-health", health_view),
+]
+```
+
+응답 예(`GET /internal/sqlite-health`):
+
+```json
+{
+  "version": 1,
+  "status": "caught_up",
+  "refresh": 15.0,
+  "backlog_grace": 60.0,
+  "databases": {
+    "default": {
+      "status": "caught_up",
+      "reason": "local and replica are at the same TXID",
+      "path": "/srv/app/app.sqlite3",
+      "local_txid": "00000000000004d2",
+      "remote_txid": "00000000000004d2",
+      "checked_at": "2026-10-08T01:02:18Z",
+      "age": 3.2,
+      "backlog_since": null,
+      "boot_state": {"state": "match", "action": "proceed", "reason_code": "local_current",
+                     "reason": "...", "unknown_at_boot": false,
+                     "litestream_version": "0.5.17", "at": "2026-10-08T01:02:03Z"},
+      "boot_state_error": null
+    }
+  }
+}
+```
+
+| 상태 | 뜻 |
+|---|---|
+| `caught_up` | 로컬 TXID == 복제본 TXID. 또는 로컬이 앞서 있지만 그 상태가 `BACKLOG_GRACE` 보다 짧음(정상 업로드 지연). 이때 `backlog_since` 가 함께 나온다 |
+| `backlog` | 로컬이 복제본보다 앞선 상태가 `BACKLOG_GRACE` 이상 지속됨. 업로드가 막혔을 수 있다(S3 끊김, 자격 증명 만료) |
+| `unknown` | 판정할 수 없음: 원격 조회 실패, 복제본이 빈 목록(경로·prefix 오타와 구분되지 않는다), 로컬 메타 없음(`litestream replicate` 가 돌지 않음), **복제본이 로컬보다 앞섬**(다른 기계가 같은 복제본에 쓰는 중일 수 있다), 부팅 상태 파일의 `unknown_at_boot`(boot 가 `--on-unknown keep-local` 로 진행함), 경로 규칙 위반(D-15, 아래), 파일 DB 가 아님, 아직 첫 조회 전, 마지막 결과가 `REFRESH × 3` 보다 오래됨(갱신 스레드가 멈춤) |
+
+- **전체 `status` 는 별칭 중 가장 나쁜 것**이다(`unknown` > `backlog` > `caught_up`). `unknown` 이 가장 나쁜 이유: 복제가 따라오는지조차 말할 수 없다는 뜻이라, 뒤처진 것을 아는 `backlog` 보다 더 큰 문제를 감출 수 있다.
+- **요청마다 S3 를 부르지 않는다.** 프로세스마다 데몬 스레드 하나가 `REFRESH` 초마다 조회하고 뷰는 마지막 결과를 읽기만 한다. 스레드는 **첫 헬스 요청 때** 시작하므로 배포 직후 첫 응답은 `unknown`("not checked yet")이다. 관리 명령·마이그레이션에서는 스레드가 돌지 않는다. gunicorn `--preload` 처럼 포크하는 서버에서도 워커마다 PID 를 보고 다시 시작한다.
+- **"로컬이 앞서기 시작한 시각"(`backlog_since`)은 프로세스 메모리에만 있다.** 앱을 재시작하면 초기화되어, 재시작 직후에는 오래된 backlog 도 `BACKLOG_GRACE` 동안 `caught_up` 으로 보인다. 워커마다 따로 추적하므로 워커별 응답이 몇 초 다를 수 있다.
+- **"마지막 업로드 시각"은 쓰지 않는다.** 쓰기가 없는 정상 DB 도 업로드 시각은 오래되기 때문이다.
+- 부팅 상태 파일 `<db>.boot-state.json`([boot CLI](#boot-cli)가 씀)을 `boot_state` 로 보여 준다. 파일이 없거나 형식이 틀리면 `boot_state_error` 에 그 사실만 적고 상태는 바꾸지 않는다(boot 를 쓰지 않는 배포도 있다). `unknown_at_boot` 가 참이면 다음 정상 부팅까지 `unknown` 이다.
+- DB 경로는 Django 가 실제로 여는 경로(`OPTIONS["database"]` 포함, [`sqlite_doctor`](#sqlite_doctor)와 같은 방식)다. **boot 와 같은 실제 경로 규칙(D-15)**을 따른다: 부모 경로에 심볼릭 링크·`..` 가 있거나 DB 파일 자체가 링크면 그 별칭은 `unknown` 이다. `meta_path` 도 같다. Litestream 설정의 `dbs[].path` 도 같은 실제 경로여야 한다.
+- 설정이 잘못되면 `manage.py check` 가 `sqlite_ops.E002` 를 내고, 뷰는 `unknown` 과 사유를 돌려준다.
+
+**HTTP 상태는 항상 200 이다.** 헬스 엔드포인트를 로드밸런서의 헬스 체크로 쓰면, 복제가 뒤처지거나 S3 가 끊겼다는 이유로 앱이 서비스에서 빠진다. 복제 지연은 데이터 손실 위험이지 요청을 못 받는 상태가 아니므로 앱을 내리면 안 된다. 모니터링은 **본문의 `status`** 로 알람을 건다(`backlog` 나 `unknown` 이 몇 분 이어지면 경보). HTTP 코드로만 판정할 수 있는 모니터를 쓴다면 `?strict=1` 을 붙인다. 그러면 `caught_up` 이 아닐 때 503 이다. **로드밸런서 헬스 체크에는 `strict` 를 쓰지 않는다.**
+
+**인증하지 않는다. 내부망에만 노출한다.** 응답에는 DB 파일 경로, TXID, 부팅 상태(사유 한 줄 포함), 조회 실패 메시지(Litestream stderr 한 줄 — 버킷 이름·endpoint 가 보일 수 있다)가 들어간다. Litestream 설정 파일의 내용(자격 증명)은 넣지 않는다. 공개 URL 에 붙여야 한다면 웹 서버에서 IP 로 막거나 자체 인증 뷰로 감싼다.
+
+헬스는 "지금 복제가 따라오는가"만 말한다. 복제본으로 실제 복구할 수 있는지는 주기적인 복원 검증으로 따로 본다(예정).
 
 ### 배포 프로필
 

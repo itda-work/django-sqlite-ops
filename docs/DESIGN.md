@@ -237,6 +237,7 @@ django_sqlite_ops/
 | ID | 조건 | 수준 |
 |---|---|---|
 | `sqlite_ops.E001` | `SQLITE_OPS` 가 dict 가 아니거나 `PROFILE` 이 알 수 없는 이름. 이때는 이 오류 하나만 내고 다른 체크는 건너뛴다 | Error (항상) |
+| `sqlite_ops.E002` | `SQLITE_OPS["HEALTH"]`(§7)가 잘못됨: dict 가 아님, 모르는 키, `DATABASES` 가 비었거나 `DATABASES` 에 없는·sqlite3 가 아닌 별칭, 별칭 항목이 dict 가 아님·`litestream_config` 없음·`meta_path`/`litestream` 이 빈 값, `REFRESH` 가 양수 아님, `BACKLOG_GRACE` 가 음수(숫자가 아니거나 bool·무한대 포함). `HEALTH` 가 없으면 검사하지 않는다. 검증은 `health.parse_config()` 한 곳이고 뷰도 같은 결과를 쓴다. `obj` 는 해당 별칭(설정 전체 문제면 없음) | Error (항상, ASGI 포함) |
 | `sqlite_ops.W001` | sqlite3 별칭의 `OPTIONS.transaction_mode` 가 `IMMEDIATE` 가 아님(없음 포함, 대소문자 무시). 읽기 전용·VFS 별칭은 건너뛴다 | Warning (`--deploy` 일 때만) |
 | `sqlite_ops.W002` | `init_command` 에서 `journal_mode` 가 `WAL` 로 설정되지 않음, 또는 판정할 수 없음. Django 처럼 `;` 로 나눈 문장마다 SQL 주석을 지우고 보며, 마지막으로 확정된 설정값을 쓴다. 대소문자·공백·인용 식별자(`"…"`·`` `…` ``·`[…]`)·`main.` 접두는 인정하고 다른 스키마는 세지 않는다. `journal_mode` 를 언급하지만 형식을 확정할 수 없는 문장이 하나라도 있으면 판정할 수 없다고 경고한다. 메모리 DB·읽기 전용·VFS 별칭은 건너뛴다 | Warning (`--deploy`) |
 | `sqlite_ops.W003` | 이름이 Litestream VFS(`vfs=litestream` 이 든 `file:` URI)인 별칭의 `CONN_MAX_AGE` 가 `None` 이 아님(키 없음 = Django 기본 0 포함), 그리고 `ASGI_APPLICATION` 미설정(WSGI 로 판단). ASGI 는 미검증이라 내지 않는다(교차 리뷰) | Warning (항상) |
@@ -298,10 +299,44 @@ django_sqlite_ops/
 
 ## 7. 헬스
 
-- `caught_up`: 원격 최대 TXID == 로컬 최대 TXID
-- `backlog`: 로컬 TXID 가 원격보다 앞서 있고, 그 상태가 `SQLITE_OPS_BACKLOG_GRACE`(기본 60초)보다 오래 지속됨
-- `unknown`: 원격 조회 실패, 메타를 읽을 수 없음, 부팅 때 `keep-local` 로 진행함(부팅 상태 파일의 `unknown_at_boot`)(`keep-local` 은 부팅 시 원격 조회가 성공했을 때만 통하므로 — D-12 — 이 표시는 원격이 비었거나 앞섰거나 로컬 메타가 없던 부팅을 뜻한다)
-- **부팅 상태 파일** `<db>.boot-state.json`: boot 가 exec 직전에 임시 파일 + rename 으로 원자적으로 쓴다(거부·실패한 부팅은 쓰지 않으므로 앞선 성공 부팅의 내용이 남는다). 헬스(#7)가 읽는다.
+구현은 `django_sqlite_ops/health.py`. 사용자가 `health_view` 를 `urls.py` 에 붙인다. **헬스는 DB 연결을 열지 않는다**: 로컬 TXID 는 메타 파일(`local_max_txid()`), 원격은 `litestream ltx`(`remote_max_txid()`)로 읽는다(§4-3 의 두 함수를 그대로 쓴다).
+
+**설정**
+```python
+SQLITE_OPS = {
+    "HEALTH": {
+        # 별칭마다 litestream_config 필수, meta_path·litestream(바이너리) 선택
+        "DATABASES": {"default": {"litestream_config": "/etc/litestream.yml"}},
+        "REFRESH": 15,  # 초, 원격 조회 주기
+        "BACKLOG_GRACE": 60,  # 초
+    },
+}
+```
+- 별칭의 DB 경로는 Django 실효 경로다(`OPTIONS["database"]` 포함, doctor 와 같이 `get_connection_params()` 로 읽고 연결하지 않는다). 쓰기 파일 DB 가 아니면(메모리·읽기 전용·VFS·판정 불가) 그 별칭은 `unknown`.
+- D-15 실제 경로 규칙을 boot 의 `real_path()` 로 그대로 검사한다(부모에 링크·`..` 없음). DB 파일 자체가 링크여도, `meta_path` 가 규칙을 어겨도 `unknown`(사유 포함). 이때 원격 조회를 하지 않는다.
+- 상대 경로(`litestream_config`·`meta_path`·경로 구분자가 든 `litestream`)는 설정을 읽을 때 프로세스 작업 디렉터리 기준 절대 경로로 바꾼다.
+- 설정이 잘못되면 시스템 체크 `sqlite_ops.E002`(§6-1). 뷰는 스레드를 시작하지 않고 `unknown` 과 사유를 돌려준다. `HEALTH` 가 없으면 체크하지 않고, 뷰는 `unknown`("not configured")이다.
+
+**상태 (별칭마다)** — 판정은 순수 함수 `alias_status(sample, now, refresh, grace)`. 위에서부터 처음 맞는 것:
+
+| 조건 | 상태 |
+|---|---|
+| 아직 첫 조회 전 | `unknown` |
+| 마지막 결과의 나이 < 0(시계 역행) 또는 > `REFRESH × 3`(갱신 스레드 멈춤 — 원격 조회가 타임아웃까지 매달린 경우 포함) | `unknown` |
+| 조회 전에 정해진 사유: 경로 규칙 위반, 파일 DB 아님, 갱신 중 예외 | `unknown` |
+| 부팅 상태 파일의 `unknown_at_boot` 가 참 | `unknown` |
+| 원격 조회 실패(`RemoteError`) | `unknown` |
+| 원격 빈 목록(`RemoteEmpty`) — 경로·prefix 오타와 구분되지 않는다 | `unknown` |
+| 로컬 메타 없음(`None`) | `unknown` |
+| **원격 > 로컬** — 다른 기계가 같은 복제본에 쓰는 중일 수 있다(사유에 그렇게 적는다) | `unknown` |
+| 원격 == 로컬 | `caught_up` |
+| 로컬 > 원격, 앞선 지속 시간(`checked_at − backlog_since`) ≥ `BACKLOG_GRACE` | `backlog` |
+| 로컬 > 원격, 그보다 짧음 | `caught_up`(`backlog_since` 함께 표시) |
+
+- "로컬이 앞서기 시작한 시각"(`backlog_since`)은 `next_backlog_since(prev, local, remote, checked_at)` 로 갱신마다 계산해 프로세스 메모리에 둔다. 앞선 상태가 이어지면 처음 본 시각을 유지하고, 끊기면(같아짐·조회 실패 포함) 지운다. **재시작하면 초기화된다**(재시작 직후 오래된 backlog 가 `BACKLOG_GRACE` 동안 `caught_up` 으로 보인다. README 에 적음). 지속 시간은 관측 시각(`checked_at`) 기준이라 판정은 최대 `REFRESH` 늦다.
+- 시각은 벽시계(UNIX 초)다. 응답에 ISO 8601 UTC 로 보인다.
+- **전체 상태 = 별칭 중 가장 나쁜 것**(`unknown` > `backlog` > `caught_up`). `unknown` 은 "따라오는지 말할 수 없음"이라 뒤처진 것을 아는 `backlog` 보다 더 큰 문제(S3 장애·다른 기계의 쓰기·설정 오류)를 감출 수 있으므로 가장 나쁘게 본다. 별칭이 없으면 `unknown`.
+- **부팅 상태 파일** `<db>.boot-state.json`: boot 가 exec 직전에 임시 파일 + rename 으로 원자적으로 쓴다(거부·실패한 부팅은 쓰지 않으므로 앞선 성공 부팅의 내용이 남는다). 헬스가 읽어 `boot_state` 로 보인다(아래 키만 옮긴다, 64 KiB 상한, 정규 파일만, 링크 따라가지 않음). 파일이 없거나 형식이 틀리면 `boot_state_error` 에 그 사실만 적고 상태는 바꾸지 않는다(boot 를 쓰지 않는 배포도 있다).
   ```json
   {
     "version": 1,
@@ -314,11 +349,22 @@ django_sqlite_ops/
     "at": "2026-10-08T01:02:03Z"
   }
   ```
-  `unknown_at_boot` 는 `action` 이 `keep_local` 일 때만 참이다. `litestream_version` 은 읽지 못하면 `null`, `at` 은 UTC.
+  `unknown_at_boot` 는 `action` 이 `keep_local` 일 때만 참이다(`keep-local` 은 부팅 시 원격 조회가 성공했을 때만 통하므로 — D-12 — 이 표시는 원격이 비었거나 앞섰거나 로컬 메타가 없던 부팅을 뜻한다). `litestream_version` 은 읽지 못하면 `null`, `at` 은 UTC.
 - **"마지막 업로드 시각"은 지연 지표로 쓰지 않는다.** 쓰기가 없는 정상 DB 도 업로드 시각은 오래되기 때문이다.
-- **원격 조회 비용**: 요청마다 S3 를 부르지 않는다. 백그라운드 스레드나 캐시로 N초(기본 15초)마다 갱신한다. 정확한 방식은 구현 단계에서 정한다.
+
+**갱신 방식**
+- 요청마다 S3 를 부르지 않는다. 프로세스당 `Monitor` 하나의 데몬 스레드(`sqlite-ops-health`)가 `REFRESH` 초마다 별칭을 차례로 조회하고(`refresh_once()`), 뷰는 마지막 결과를 읽기만 한다. 요청은 `litestream` 을 기다리지 않는다.
+- 스레드는 **첫 헬스 요청 때** 시작한다. `ready()` 에서 시작하지 않으므로 관리 명령·테스트·마이그레이션에서는 돌지 않는다. 그래서 첫 응답은 `unknown`(첫 조회 전)이다.
+- 스레드 안의 예외는 삼키고 그 별칭을 `unknown`(사유)으로 기록한다. 스레드는 죽지 않는다.
+- 포크 서버(gunicorn `--preload`)에서 스레드는 자식에 복제되지 않는다. 요청마다 PID 를 보고 바뀌었으면 결과·잠금을 버리고 스레드를 다시 시작한다. 모듈 잠금은 `os.register_at_fork` 로 자식에서 새로 만든다.
+- 원격 조회는 별칭마다 `litestream version`(검증 버전 확인)과 `ltx` 두 번의 subprocess 다(타임아웃 10초·30초, §4-3). 조회가 매달리면 결과가 `REFRESH × 3` 보다 오래되어 `unknown` 이 된다.
+
+**응답**: `{"version": 1, "status", "refresh", "backlog_grace", "databases": {alias: {status, reason, path, local_txid, remote_txid, checked_at, age, backlog_since, boot_state, boot_state_error}}}`. TXID 는 Litestream 과 같은 16자리 16진수 문자열. `Cache-Control: no-store`.
+- **HTTP 상태는 항상 200 이다.** 복제가 뒤처졌다고 로드밸런서가 앱을 빼면 안 된다(복제 지연은 데이터 손실 위험이지 요청 처리 불가가 아니다). 모니터링은 본문의 `status` 로 알람을 건다. `?strict=1` 이면 `caught_up` 이 아닐 때 503(HTTP 코드만 보는 모니터용, 로드밸런서에는 쓰지 않는다).
+- 인증하지 않는다. 응답에는 DB 경로·TXID·부팅 상태·조회 실패 메시지(Litestream stderr 한 줄)가 들어가므로 내부망에만 노출한다. 설정 파일 내용(비밀값)은 넣지 않는다.
 - 헬스는 "지금 복제가 따라오는가"만 말한다. "복구할 수 있는가"는 별도의 주기적 복원 검증(`sqlite_doctor --restore-test`, 2단계)으로 본다.
 - D3 실측: 끊김 동안 Litestream 의 로그와 메트릭에 아무것도 보이지 않았다. 그래서 헬스는 Litestream 의 자기 보고에 기대지 않고, TXID 비교로 직접 계산한다.
+- 테스트(`tests/test_health.py`): 순수 함수 표(grace 경계, 원격 앞섬, 빈 목록, 메타 없음, `unknown_at_boot`, 오래된 결과), 가짜 조회 함수로 스레드(주기 갱신·예외 내구·PID 변경 재시작·첫 요청 전 미시작), 서브프로세스 Django 의 뷰(JSON 스키마, 200/strict 503, 연결이 열리지 않고 DB 파일이 생기지 않음), 실제 Litestream `file://` 복제본(`replicate -once` 로 caught_up, 같은 DB 를 다른 복제본으로만 보내 로컬을 앞세워 grace 뒤 backlog, 없는 복제본 경로 → 빈 목록 unknown, 설정 파일 없음 → 조회 실패 unknown). S3 끊김(L8)은 랩(#10) 몫이다.
 
 ## 8. 배포 프로필과 채널 레이어
 
