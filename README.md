@@ -615,7 +615,7 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 
 - aio 레이어에는 channels-lite 의 `[aio]` extra(aiosqlite·aiosqlitepool·msgspec)가 필요하다. 이 패키지의 `[channels-lite]` extra 는 channels-lite 만 설치한다: `pip install "channels-lite[aio]==0.4.0"`.
 - 패치는 프로세스마다 적용된다. 워커·ASGI 서버 프로세스가 모두 같은 설정을 읽어야 한다.
-- 새 채널 DB 에 여러 프로세스가 동시에 처음 붙으면 `database is locked` 로 실패할 수 있다. channels-lite 의 기본 `init_command` 가 `PRAGMA journal_mode=WAL` 을 `busy_timeout` 보다 먼저 실행하기 때문이다(0.4.0 `channels_lite/layers/aio.py:50-58`, 코드상 확인 + 테스트 준비에서 재현, #8). 배포 때 `migrate` 직후 채널 DB 를 미리 `PRAGMA journal_mode=WAL` 로 바꿔 둔다. 이 패치가 고치는 문제는 아니다.
+- 새 DB 에 여러 연결이 동시에 처음 `journal_mode=WAL` 로 바꾸면 그중 일부가 `database is locked` 로 실패할 수 있다(원인 미확정 — `busy_timeout` 을 먼저 걸어도 재현됨, 리뷰 대조 실험). channels-lite 는 연결마다 기본 `init_command` 로 `PRAGMA journal_mode=WAL` 을 실행하므로(0.4.0 `channels_lite/layers/aio.py:50-58`), 새 채널 DB 에 여러 프로세스가 동시에 처음 붙을 때 생긴다(테스트 준비에서 재현, #8). 배포 때 `migrate` 직후 채널 DB 를 미리 `PRAGMA journal_mode=WAL` 로 바꿔 둔다. 이 패치가 고치는 문제는 아니다.
 
 ## 문제 해결
 

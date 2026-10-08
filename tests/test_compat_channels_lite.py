@@ -60,8 +60,9 @@ django.setup()
 from django.core.management import call_command
 
 call_command("migrate", database="channels", verbosity=0)
-# channels-lite 의 init_command 는 busy_timeout 보다 journal_mode=WAL 을 먼저 실행한다. 첫 연결 둘이
-# 동시에 WAL 로 바꾸려 하면 한쪽이 "database is locked" 로 실패하므로 미리 바꿔 둔다(시나리오 준비).
+# 새 DB 에 여러 연결이 동시에 처음 journal_mode=WAL 로 바꾸면 그중 일부가 "database is locked" 로
+# 실패할 수 있다(원인 미확정 — busy_timeout 을 먼저 걸어도 재현됨, 리뷰 대조 실험). 그래서 시나리오
+# 준비로 미리 바꿔 둔다.
 with contextlib.closing(sqlite3.connect(settings.DATABASES["channels"]["NAME"])) as conn:
     assert conn.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
 
@@ -269,7 +270,9 @@ if __name__ == "__main__":
     from django.core.management import call_command
 
     call_command("migrate", database="channels", verbosity=0)
-    # 수신 프로세스 둘의 첫 연결이 동시에 WAL 로 바꾸다 잠기지 않게 미리 바꾼다(REPRO_SCRIPT 참고)
+    # 새 DB 에 여러 연결이 동시에 처음 journal_mode=WAL 로 바꾸면 일부가 "database is locked" 로
+    # 실패할 수 있다(원인 미확정 — busy_timeout 을 먼저 걸어도 재현됨, 리뷰 대조 실험).
+    # 그래서 미리 바꿔 둔다.
     with contextlib.closing(sqlite3.connect(settings.DATABASES["channels"]["NAME"])) as conn:
         assert conn.execute("PRAGMA journal_mode=WAL").fetchone() == ("wal",)
     context = multiprocessing.get_context("spawn")

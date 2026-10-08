@@ -428,7 +428,7 @@ SQLITE_OPS = {
   - **별도 프로세스 둘**: spawn 한 수신 프로세스 둘(각 `pool_size=1`), SELECT 뒤 프로세스 간 배리어, 송신은 부모 프로세스. 20/20 라운드 중복(리뷰 실험, 회귀 테스트로 옮김).
   - 대조군: 수신자 연결이 쓰기를 한 적이 없으면 배리어 시나리오 두 배치 모두 0/20(그래서 원인은 `total_changes` 다).
   - 패치 후 모든 시나리오 0/20. 테스트는 `tests/test_compat_channels_lite.py`.
-- **함정(패치 범위 밖)**: 새 채널 DB 에 여러 프로세스가 동시에 처음 붙으면 channels-lite 의 기본 `init_command` 가 `journal_mode=WAL` 을 `busy_timeout` 보다 먼저 실행해 `database is locked` 가 날 수 있다(0.4.0 `aio.py:50-58`, 코드상 확인 + 테스트 준비에서 재현). 배포 때(`migrate` 직후) 채널 DB 를 미리 `PRAGMA journal_mode=WAL` 로 바꿔 둔다. 코드로는 다루지 않는다(#8).
+- **함정(패치 범위 밖)**: 새 DB 에 여러 연결이 동시에 처음 `journal_mode=WAL` 로 바꾸면 그중 일부가 `database is locked` 로 실패할 수 있다(원인 미확정 — `busy_timeout` 을 먼저 걸어도 재현됨, 리뷰 대조 실험). channels-lite 는 연결마다 기본 `init_command` 로 WAL 을 실행하므로(0.4.0 `aio.py:50-58`) 새 채널 DB 에 여러 프로세스가 동시에 처음 붙을 때 생긴다(테스트 준비에서 재현). 배포 때(`migrate` 직후) 채널 DB 를 미리 `PRAGMA journal_mode=WAL` 로 바꿔 둔다. 코드로는 다루지 않는다(#8).
 - **구현 순서**(지키기):
   1. **먼저 재현 테스트를 만든다.** 수신자 둘이 같은 일반 채널(`!` 없는 채널)을 경쟁하고, 같은 연결이 앞서 쓰기를 한 상태를 만든다. 패치 전에 중복 배달이 실패로 드러나야 한다. 재현이 안 되면 패치하지 않고 이 절을 "재현 안 됨"으로 갱신한다.
   2. 패치는 `cursor.rowcount == 1` 로 판정을 바꾸는 최소 교체다. 메서드 하나만 바꾼다.
