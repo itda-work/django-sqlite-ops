@@ -472,7 +472,7 @@ SQLITE_OPS = {
 ## 12. 미검증·확인 필요
 - ASGI 에서의 `CONN_MAX_AGE` 와 VFS 동작 (미검증)
 - 실제 클라우드 S3·R2·Tigris (미검증. 비용이 들어 마스터 승인 필요)
-- 회귀 랩은 SeaweedFS 4.48 + toxiproxy 2.12.0, colima(linux/arm64) 한 곳에서만 돌았다. amd64·다른 S3 구현은 미검증
+- 회귀 랩은 SeaweedFS 4.48 + toxiproxy 2.12.0 으로만 돌았다(colima linux/arm64 와 GitHub Actions ubuntu-latest linux/amd64, 둘 다 11/11 통과 — [`lab-2026-10-08.md`](research/lab-2026-10-08.md#amd64-실행-github-actions-25)). 다른 S3 구현은 미검증
 - S3 단절이 `ltx` 타임아웃(30초)보다 길 때 헬스가 `stale` 에서 `remote_error` 로 넘어가는지(L8a 는 20초라 보지 못함), 분 단위 단절에서 Litestream 의 로그 변화 (미검증)
 - `single-server-multiproc` 의 채널 레이어 런타임(channels-nats 메시지 전달)을 컨테이너에서 (미검증. 랩 P2 는 설정 검사·워커 수까지)
 - Windows 에서 boot CLI 의 파일 잠금과 디렉터리 rename 원자성 [확인 필요]. 그때까지 boot 는 `fcntl` 이 없으면 exit 64 로 거부한다
