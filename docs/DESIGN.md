@@ -451,11 +451,11 @@ SQLITE_OPS = {
 | L3 | 로컬 메타만 삭제 | `unknown` → 거부 (스파이크는 여기서 새 DB 를 버렸다) | 통과(`no_local_meta`, DB 해시 그대로) |
 | L4 | S3 끊김 중 부팅 | `unknown` → 거부 | 통과(`remote_error`. 연결 거부도 `ltx` 가 매달려 30초 타임아웃에서 거부) |
 | L5 | 복제되지 않은 로컬 커밋이 있는 상태로 재부팅 | `match` → 진행, 커밋 보존 | 통과(65건 보존, 이후 복제) |
-| L6 | `--on-unknown restore` 진행 중 kill → 재시작 | 반쯤 옮겨진 상태 없음, 재실행으로 완료 | 통과(rename 8곳 모두에서 kill, 재실행 완료, 옛 DB·메타 같은 격리 디렉터리) |
+| L6 | `--on-unknown restore` 진행 중 kill → 재시작 | 반쯤 옮겨진 상태 없음, 재실행으로 완료 | 통과(rename 8곳 모두에서 kill — kill 시 rename 수 = k 확인, 재실행 완료, 템플릿의 DB·사이드카·메타 하위 8항목이 한 격리 디렉터리에 같은 해시, D-14 지점은 격리 2개) |
 | L7 | 복원 실패(S3 객체 손상) | exit 4, 로컬 무변경 | 통과(새 컨테이너·격리 경로 모두 exit 4, 로컬 해시 그대로) |
-| L8 | 헬스: S3 20초 끊김 | `backlog` → 복구 후 `caught_up` | 조건부: 업로드만 끊기면(L8b) `backlog` → `caught_up`. 조회까지 끊기면(L8a) `unknown`(`stale`) → `caught_up` — §7 표대로 원격 조회 실패는 `unknown` 이 먼저다 |
+| L8 | 헬스: S3 20초 끊김 | `backlog` → 복구 후 `caught_up` | 조건부: 업로드만 끊기면(L8b) `backlog` → `caught_up`. 조회까지 끊기면(L8a) 제한 10초(`REFRESH × 3` + 진행 중 조회 + 표본 간격) 안에 `unknown`(`stale`)으로 바뀌어 유지 → `caught_up` — §7 표대로 원격 조회 실패는 `unknown` 이 먼저다 |
 
-배포 프로필 종단 검증(P1·P2): 문서의 Dockerfile·compose·entrypoint·settings 를 그대로 띄워 첫 배포·`check --deploy`·`sqlite_doctor`·`docker stop`(uvicorn 워커 1·2: exit 0, 0.4–0.5초, 400/400 복제)·재부팅·빈 볼륨 소유자 복사를 확인했다.
+배포 프로필 종단 검증(P1·P2): 문서의 Dockerfile·compose·entrypoint·settings 를 그대로 띄워 첫 배포·`check --deploy`·`sqlite_doctor`·`docker stop`(uvicorn 워커 1·2: exit 0, 대표 실행 0.47·0.72초, 400/400 복제)·재부팅·빈 볼륨 소유자 복사를 확인했다.
 
 - **PRAGMA 벤치**: §6-0 의 후보(`temp_store`, `mmap_size`, `cache_size`, `journal_size_limit`)를 켠 경우와 끈 경우의 처리량·p99·WAL 크기를 잰다. 차이가 재현될 때만 기본값으로 올린다. 2026-10-08 결과(반복 5): 넷 중 개선이 반복해서 재현된 것은 없고, `cache_size=-65536` 단독은 반복해서 나빠졌다. 기본값은 바꾸지 않는다([`lab-2026-10-08.md`](research/lab-2026-10-08.md#pragma-벤치)).
 - 랩 자원은 compose 프로젝트명(`dso-lab*`)과 라벨(`io.itda.dso-lab=1`)로 구분하고, 끝나면 반드시 `down -v` 한다(실패해도 `trap`). 같은 호스트에 다른 프로젝트 컨테이너가 있다.

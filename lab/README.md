@@ -65,9 +65,9 @@ P2 는 채널 레이어를 런타임에 쓰지 않는다(channels-nats 를 설�
 | L3 | 정상 종료 뒤 로컬 메타 디렉터리만 삭제 | exit 2 `no_local_meta`, DB 무변경 |
 | L4 | toxiproxy `s3` 끔 / `timeout` toxic(무응답)+`--ltx-timeout 5` | 둘 다 exit 2 `remote_error`, 복구 후 `match` |
 | L5 | S3 를 끊고 25건 → SIGKILL → S3 복구 → 재부팅 | `match`(`local_current`), 65건, 뒤이어 복제본 65건 |
-| L6 | L2 의 옛 볼륨 + `--on-unknown restore`. rename 마다 잠드는 훅(`lab_hooks/sitecustomize.py`)으로 k 번째 rename 직후 SIGKILL, 모든 k 에 대해 → 훅 없이 재실행 | 재실행 성공·150건, `.partial` 없음, 옛 DB(50건)와 메타가 같은 격리 디렉터리 |
+| L6 | L2 의 옛 볼륨 + `--on-unknown restore`. rename 마다 잠드는 훅(`lab_hooks/sitecustomize.py`)으로 k 번째 rename 직후 SIGKILL, 모든 k 에 대해 → 훅 없이 재실행 | kill 직전 훅 로그의 rename 수가 정확히 k. 재실행 성공·150건, `.partial` 없음. kill 전 템플릿의 DB·`-wal`·`-shm`·메타 하위 전부가 **같은 하나의** 격리 디렉터리에 같은 해시로 있고 그 밖에는 manifest 뿐, 템플릿 파일 내용이 그 밖 어디에도 없음. 설치 뒤 kill(D-14)이면 격리 디렉터리 2개, 두 번째는 manifest·복원본 DB(+사이드카)만 (`_checks.quarantine_problems`) |
 | L7 | 복제본의 모든 LTX 객체 가운데 64바이트를 뒤집음(filer API) | 새 컨테이너 exit 4 / 메타 삭제 볼륨 + `--on-unknown restore` exit 4, 로컬 파일 해시 무변경, 격리 없음 |
-| L8a | 쓰기를 계속하며 `s3` 20초 끔(업로드·헬스 조회 모두) | 끊긴 동안 `caught_up` 아님(`unknown`), 복구 뒤 `caught_up`, 쓰기 오류 0 |
+| L8a | 쓰기를 계속하며 `s3` 20초 끔(업로드·헬스 조회 모두) | 경과 시간 기준: `REFRESH × 3` + 진행 중 조회 여유(`REFRESH`) + 표본 간격 + 1초 안에 `unknown`(`stale`/`remote_error`)로 바뀌고 단절이 끝날 때까지 유지. 전환 전 `caught_up` 은 age ≤ `REFRESH × 3`, `stale` 은 age > 그 값(`_checks.full_outage_problems`). 복구 뒤 `caught_up`, 쓰기 오류 0 |
 | L8b | 헬스 조회는 `s3h` 로 두고 업로드 경로 `s3` 만 20초 끔 | `backlog`(`local_ahead`) → 복구 뒤 `caught_up` |
 
 L8 은 `LAB_HEALTH_REFRESH=2`, `LAB_HEALTH_GRACE=10` 으로 줄여 돈다(기본 15·60초면 20초 끊김이 grace 안에 든다).
@@ -78,7 +78,7 @@ L6 의 훅은 `LAB_RENAME_DELAY` 가 있을 때만 `os.rename` 뒤에 한 줄(`[
 
 변형: 기준(권장 설정만), `temp_store=MEMORY`, `mmap_size=256MiB`, `cache_size=-65536`(64MiB), `journal_size_limit=64MiB`, 모두. 변형마다 새 볼륨·새 prefix 로 `--init-new` 부팅, `lab_seed` 로 같은 시드의 행 10만 개를 채우고, 5초 쉰 뒤 부하를 건다. Litestream 은 프로필 그대로 복제한다. 반복 r 마다 모든 변형을 돌고 순서를 r 만큼 회전한다(시간에 따른 호스트 부하 변화를 고르게 나눈다).
 
-부하 발생기는 표준 라이브러리 Python(`lab_tools/loadgen.py`)이다. 같은 compose 네트워크의 별도 컨테이너에서 keep-alive 연결 16개로 닫힌 루프를 돈다. 요청 비율은 읽기(`/lab/read/<id>`) 70%, 정렬(인덱스 없는 열, 임시 B-트리) 10%, 쓰기(1행) 20%. 고른 이유: 이미지를 더 받지 않고, 요청 종류별 지연을 그대로 모으며, 1초마다 `/lab/stats` 로 `-wal` 크기를 표본할 수 있다. 앱(uvicorn 워커 1, 동기 뷰는 스레드 하나에서 돈다)이 병목인지는 결과 문서에 적는다.
+부하 발생기는 표준 라이브러리 Python(`lab_tools/loadgen.py`)이다. 같은 compose 네트워크의 별도 컨테이너에서 keep-alive 연결 16개로 닫힌 루프를 돈다. 요청 비율은 읽기(`/lab/read/<id>`) 70%, 정렬(인덱스 없는 열, 임시 B-트리) 10%, 쓰기(1행) 20%. 고른 이유: 이미지를 더 받지 않고, 요청 종류별 지연을 그대로 모으며, 1초마다 `/lab/stats` 로 `-wal` 크기를 표본할 수 있다. 병목이 앱·부하 발생기·호스트 중 어디인지와 부하 발생기의 여유는 재지 않았다(미검증). 그래서 벤치는 같은 조건에서 변형끼리의 상대 비교로만 읽는다.
 
 판정: 같은 반복의 기준과 짝지어 차이(%)를 내고, **모든 반복에서 같은 방향으로 5% 이상**일 때만 '재현'으로 본다. `database.py` 기본값은 이 결과로 바꾸지 않는다(제안만).
 
@@ -92,6 +92,7 @@ lab/
 ├── profile-override.yaml   P1·P2: 문서 compose 위에 덮는 것
 ├── multiproc-override.yaml P2 추가분
 ├── _lab.py                 compose·toxiproxy·조사 도구
+├── _checks.py              L6·L8a 판정(순수 함수, tests/test_lab.py 가 Docker 없이 검사)
 ├── conftest.py             RUN_LAB 게이트, 결과 기록
 ├── test_scenarios.py       P1·P2, L1–L8
 ├── test_bench.py           PRAGMA 벤치

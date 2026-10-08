@@ -10,6 +10,13 @@ import threading
 import time
 
 import pytest
+from _checks import (
+    full_outage_deadline,
+    full_outage_problems,
+    quarantine_problems,
+    stale_dirs,
+    template_fingerprint,
+)
 from _lab import Stack, boot_lines, decision, http_json, log
 
 META = ".app.sqlite3-litestream"
@@ -72,14 +79,6 @@ def seed_volume(stack: Stack, volume: str, prefix: str, rows: int) -> None:
 
 def db_entry(snapshot: dict) -> dict:
     return snapshot["entries"]["app.sqlite3"]
-
-
-def stale_dirs(snapshot: dict) -> list[str]:
-    return sorted(
-        k
-        for k, v in snapshot["entries"].items()
-        if "/" not in k and ".stale-" in k and v["type"] == "dir"
-    )
 
 
 def key_lines(text: str, *needles: str) -> list[str]:
@@ -354,6 +353,9 @@ def test_L6_kill_during_restore(stack, run_id, rec):
 
     hook = {"LAB_PYTHONPATH": "/app/lab_hooks"}
     flags = "--on-unknown restore"
+    # kill 전 템플릿의 격리 대상(DB·사이드카·메타 하위 전부)과 해시
+    fingerprint = template_fingerprint(stack.inspect_volume(template))
+    rec["template_fingerprint"] = fingerprint
 
     # 먼저 끝까지 돌려 rename 횟수(=kill 지점)를 센다
     probe = Volumes.take()
@@ -365,6 +367,8 @@ def test_L6_kill_during_restore(stack, run_id, rec):
     rec["renames"] = renames
     stack.stop_app()
     assert len(renames) >= 4  # manifest, db, meta, partial→final, install, state ...
+    # 설치(복원본 → DB 경로) rename 뒤에 죽으면 D-14 경로로 한 번 더 격리된다
+    install = next(i for i, ln in enumerate(renames, 1) if ".restore-" in ln.split(" -> ")[0])
 
     points = []
     for k in range(1, len(renames) + 1):
@@ -376,6 +380,8 @@ def test_L6_kill_during_restore(stack, run_id, rec):
             assert time.monotonic() < deadline, stack.logs("labapp")
             time.sleep(0.2)
         stack.kill_app()
+        # kill 이 정말 k 번째 rename 뒤·k+1 번째 전이었는지 로그로 확인한다(sleep 에 기대지 않는다)
+        renamed_before_kill = len(_rename_lines(stack.logs("labapp")))
         killed = stack.inspect_volume(v)
         partials = [e for e in killed["entries"] if e.endswith(".partial") and "/" not in e]
 
@@ -385,25 +391,24 @@ def test_L6_kill_during_restore(stack, run_id, rec):
         rows = count(port)
         stack.stop_app()
         final = stack.inspect_volume(v)
-        stales = stale_dirs(final)
-        old = [s for s in stales if final["entries"].get(f"{s}/app.sqlite3", {}).get("rows") == 50]
+        expected_stales = 2 if k >= install else 1
+        problems = quarantine_problems(final, fingerprint, expected_stales)
         point = {
             "k": k,
             "after": renames[k - 1].split(": ", 1)[1].replace("/data/", ""),
+            "renames_before_kill": renamed_before_kill,
             "partials_after_kill": partials,
             "rerun_decision": decision(logs),
             "rerun_rows": rows,
-            "stale_dirs": stales,
-            "old_db_with_meta": [s for s in old if f"{s}/{META}" in final["entries"]],
-            "leftover_partials": [
-                e for e in final["entries"] if e.endswith(".partial") and "/" not in e
-            ],
+            "stale_dirs": stale_dirs(final),
+            "expected_stales": expected_stales,
+            "problems": problems,
         }
         points.append(point)
         log(f"L6 k={k}: {point}")
+        assert renamed_before_kill == k, point
         assert rows == 150, point
-        assert not point["leftover_partials"], point
-        assert len(old) == 1 and point["old_db_with_meta"] == old, point
+        assert not problems, point
     rec["points"] = points
 
 
@@ -462,10 +467,10 @@ class Writer(threading.Thread):
             time.sleep(self.interval)
 
 
-def _health(port: int) -> tuple[str, str]:
+def _health(port: int) -> tuple[str, str, float | None]:
     body = http_json("GET", port, "/internal/sqlite-health")
     d = body["databases"]["default"]
-    return d["status"], d["code"]
+    return d["status"], d["code"], d["age"]
 
 
 def _wait_health(port: int, want: str, timeout: float) -> list:
@@ -514,7 +519,7 @@ def _l8(stack: Stack, run_id: str, rec: dict, label: str, health_config: str) ->
     rec["outage_timeline"] = timeline
     rec["recovery_timeline"] = after
     rec["writes_ok_errors"] = (writer.ok, writer.errors)
-    rec["outage_statuses"] = sorted({(s, c) for _, s, c in timeline})
+    rec["outage_statuses"] = sorted({(s, c) for _, s, c, _a in timeline})
     final = count(port)
     stack.stop_app()
     rec["replica_after_stop"] = wait_replica_rows(stack, prefix, final)
@@ -524,12 +529,17 @@ def _l8(stack: Stack, run_id: str, rec: dict, label: str, health_config: str) ->
 def test_L8a_health_full_s3_outage(stack, run_id, rec):
     """S3 20초 끊김(업로드와 헬스 조회 모두) → caught_up 아님 → 복구 후 caught_up.
 
-    헬스의 원격 조회도 끊기므로 §7 표대로 ``unknown``(``remote_error``)이 기대값이다.
+    헬스의 원격 조회도 끊기므로 §7 표대로 ``unknown`` 이 기대값이다.
+    조회가 ``ltx`` 타임아웃(30초)까지 매달리면 결과가 오래되어 ``stale``,
+    타임아웃이 끝나면 ``remote_error`` 다.
     """
     _l8(stack, run_id, rec, "l8a", "")
-    # 끊긴 뒤 첫 갱신(REFRESH 2초)부터는 caught_up 이 아니어야 한다
-    assert "caught_up" not in {s for _, s, _ in rec["outage_timeline"][5:]}
-    assert "unknown" in {s for s, _ in rec["outage_statuses"]}, rec["outage_statuses"]
+    # 마지막 관측의 age 가 REFRESH × 3 을 넘으면 stale 이다. 단절 직전에 끝난 조회가 있으면
+    # 전환이 그만큼 늦으므로 경과 시간 기준의 제한(_checks.full_outage_deadline)으로 본다.
+    rec["stale_deadline_s"] = full_outage_deadline(2)
+    problems = full_outage_problems(rec["outage_timeline"], refresh=2)
+    rec["problems"] = problems
+    assert not problems, problems
 
 
 def test_L8b_health_upload_outage(stack, run_id, rec):
