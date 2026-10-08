@@ -12,7 +12,7 @@ Django 에서 SQLite 를 운영 DB 로 안전하게 쓰게 하는 **운영 도�
 | `sqlite_doctor` 관리 명령 | 구현됨 | [#6](https://github.com/itda-work/django-sqlite-ops/issues/6) |
 | 복제 헬스 | 구현됨 | [#7](https://github.com/itda-work/django-sqlite-ops/issues/7) |
 | 배포 프로필 문서 | 예정 | [#9](https://github.com/itda-work/django-sqlite-ops/issues/9) |
-| channels-lite 패치 | 예정 | [#8](https://github.com/itda-work/django-sqlite-ops/issues/8) |
+| channels-lite 패치 | 구현됨 | [#8](https://github.com/itda-work/django-sqlite-ops/issues/8) |
 
 PyPI 배포 전이다. 패키지 이름도 가칭이라 바뀔 수 있다.
 
@@ -371,7 +371,7 @@ python manage.py sqlite_doctor --json          # 모니터링·스크립트용
 - **database** — 별칭마다 Django 가 실제로 여는 경로(`OPTIONS["database"]` 가 있으면 `NAME` 대신 그것. 연결하지 않고 Django 의 연결 매개변수에서 읽는다)를 기준으로 역할(쓰기·읽기 전용·메모리·VFS), 파일 크기, `-wal` 크기(연결 전), 실제 `transaction_mode`·`journal_mode`·`synchronous`·`busy_timeout`·`foreign_keys`·SQLite 버전. [권장값](#기본값)과 다르면 `warn`. 읽기 전용 별칭은 쓰기 권고(`transaction_mode`·`journal_mode`·`synchronous`)를 비교하지 않는다. 메모리 DB 는 "메모리 DB" 로만 적는다. Litestream VFS 별칭과 역할을 판정할 수 없는 별칭(W004, 로컬이 아닌 URI authority 포함)은 연결하지 않고 `unknown`. 연결 실패는 `error`.
 - **mount** — 위의 실제 경로로 DB 파일(없으면 존재하는 상위 디렉터리)의 파일시스템 종류. NFS·SMB/CIFS·AFP·sshfs 같은 네트워크 파일시스템이면 `warn` 이다. SQLite 의 파일 잠금을 믿을 수 없고 WAL 이 동작하지 않는다([SQLite 문서](https://www.sqlite.org/useovernet.html)). 로컬로 확인되지 않은 종류(알 수 없는 FUSE 등)는 `unknown`.
 - **litestream** — `litestream databases -config PATH -json` 으로 설정의 DB 목록을 읽어 실제 경로로 대조한다. 쓰기 별칭이 설정에 없으면 `warn`(복제되지 않음). 단 channels-lite 전용 채널 DB(앱 DB 와 다른 파일)는 복제에서 빼는 것이 규칙이라 이 경고를 내지 않는다. 설정 경로가 실제 경로가 아니면(부모에 링크) `warn` — boot 가 거부하는 구성이다(D-15). 상대 경로·`dir:` 항목은 Litestream 의 작업 디렉터리 기준으로 풀려 대조할 수 없으므로 `warn`. 설정에만 있는 DB 는 `ok`(정보). 설정 파일 없음·깨진 YAML·바이너리 없음은 `error`.
-- **channels** — `CHANNEL_LAYERS` 를 읽기만 한다(`channels` 를 import 하지 않는다). 백엔드별 의미론을 한 줄로 요약한다. `InMemoryChannelLayer` 는 프로필이 `single-server-multiproc` 이면 `warn`. channels-lite 는 채널 DB 가 앱 DB 와 같은 파일이면 `warn`, Litestream 설정의 복제 대상이면 `warn`. 모르는 백엔드(`channels_redis` pub/sub 포함)는 `unknown`.
+- **channels** — `CHANNEL_LAYERS` 를 읽기만 한다(`channels` 를 import 하지 않는다. 예외는 아래 `patch` 항목). 백엔드별 의미론을 한 줄로 요약한다. `InMemoryChannelLayer` 는 프로필이 `single-server-multiproc` 이면 `warn`. channels-lite 는 채널 DB 가 앱 DB 와 같은 파일이면 `warn`, Litestream 설정의 복제 대상이면 `warn`. 모르는 백엔드(`channels_redis` pub/sub 포함)는 `unknown`. `AIOSQLiteChannelLayer` 를 쓰거나 `PATCH_CHANNELS_LITE_AIO` 가 켜져 있으면 [중복 배달 패치](#channels-lite-패치) 상태를 `patch` 항목으로 보여 준다. 이때만 channels-lite 를 import 한다(DB 는 열지 않는다).
 
 출력 예:
 
@@ -545,7 +545,77 @@ LOGGING = {
 
 ### channels-lite 패치
 
-예정. channels-lite aio 중복 배달을 버전 게이트 패치로 막는다. [#8](https://github.com/itda-work/django-sqlite-ops/issues/8)
+channels-lite 의 aio 레이어(`channels_lite.layers.aio.AIOSQLiteChannelLayer`)를 쓸 때 켜는 우리 쪽 호환 패치다. channels-lite 자체는 [추천하지 않는다](docs/DESIGN.md#8-배포-프로필과-채널-레이어). 그래도 aio 레이어를 쓴다면 켠다.
+
+#### 무엇을 고치나
+
+일반 채널(이름에 `!` 가 없는 채널, 예: 워커가 나눠 받는 작업 채널)을 수신자 둘 이상이 경쟁할 때, **한 메시지가 두 수신자에게 모두 배달된다.** 수신자는 `UPDATE ... SET delivered=1 WHERE id=? AND delivered=0` 로 메시지를 선점하는데, 성공 여부를 이번 UPDATE 의 행 수가 아니라 연결이 열린 뒤 누적된 변경 수(`total_changes`)로 판정하기 때문이다. 풀에서 다시 받은 연결이 앞서 한 번이라도 쓰기(`send`·`group_add` 등)를 했으면 경쟁에서 진 수신자도 성공으로 판정한다. 별도 프로세스 둘에서도, 한 프로세스 안의 독립 레이어 둘에서도 재현되고 기본 `pool_size=10` 에서도 일어난다(#8). 두 수신자의 조회가 겹칠 때만 생기므로 빈도는 부하와 스케줄에 달려 있다.
+
+패치는 메서드 하나(`_receive_single_from_db`)만 바꾼다. 원본을 그대로 옮기고 판정만 UPDATE 커서의 `rowcount == 1` 로 바꾼다. ORM 판(`channels_lite.layers.core.SQLiteChannelLayer`)은 `aupdate()` 의 행 수로 판정하므로 해당하지 않는다.
+
+#### 켜기
+
+자동으로 켜지지 않는다. 설정으로 켜면 앱 `ready()` 에서 적용한다.
+
+```python
+# settings.py
+from pathlib import Path
+
+from django_sqlite_ops.database import sqlite_database
+
+BASE_DIR = Path(__file__).resolve().parent.parent
+
+INSTALLED_APPS = ["django_sqlite_ops"]
+
+DATABASES = {
+    "default": sqlite_database(BASE_DIR / "db.sqlite3"),
+    # 채널 DB 는 별도 파일로 두고 Litestream 복제에서 뺀다 (DESIGN §8)
+    "channels": sqlite_database(BASE_DIR / "channels.sqlite3"),
+}
+
+CHANNEL_LAYERS = {
+    "default": {
+        "BACKEND": "channels_lite.layers.aio.AIOSQLiteChannelLayer",
+        "CONFIG": {"database": "channels"},
+    },
+}
+
+SQLITE_OPS = {"PATCH_CHANNELS_LITE_AIO": True}
+```
+
+정확히 `True` 일 때만 켠다(`"true"` 같은 문자열은 무시). `INSTALLED_APPS` 에 `"django_sqlite_ops"` 가 있어야 한다. 앱을 넣지 않는 프로세스라면 채널 레이어를 쓰기 전에 직접 부른다.
+
+```python
+# asgi.py — django.setup() 뒤, 채널 레이어를 쓰기 전에
+from django_sqlite_ops.compat import channels_lite
+
+applied = channels_lite.apply()  # 적용됐으면 True. 두 번 불러도 한 번만 바꾼다
+```
+
+`apply()` 는 DB 를 열지 않는다. channels-lite 가 설치돼 있지 않으면 아무것도 하지 않고 `False` 를 돌려준다. `channels_lite.status()` 로 현재 상태(`applicable`·`applied`·`reason`)를 볼 수 있다.
+
+#### 버전 게이트
+
+설치된 channels-lite 가 **`==0.4.0`** 이고 원본 메서드의 소스가 검증한 0.4.0 소스와 같을 때만 바꾼다. 다른 판이거나, 같은 판이라도 소스가 다르거나, 소스를 읽을 수 없는 배포(`.pyc` 만)면 바꾸지 않는다. 이때 앱은 그대로 뜨고 `sqlite_doctor` 가 사유를 알린다. channels-lite 를 올렸다면 이 패키지가 그 판을 검증할 때까지 doctor 경고가 남는다.
+
+#### doctor 표시
+
+`sqlite_doctor` 의 `channels` 섹션 `patch` 항목(`value` 는 설치된 판, `expected` 는 `channels-lite==0.4.0`):
+
+| 상황 | 수준 | 메시지 |
+|---|---|---|
+| 적용됨 | `ok` | `duplicate-delivery patch applied (channels-lite 0.4.0)` |
+| aio 레이어를 쓰는데 설정이 꺼져 있음 | `warn` | 설정을 켜라는 안내 |
+| 설정이 켜졌지만 적용 안 됨(판·소스 불일치, aio 의존성 없음, channels-lite 없음) | `warn` | `... is True but the patch is not applied: <사유>` |
+| 설정이 꺼졌고 게이트 밖 | `warn` | `duplicate-delivery patch is not available: <사유>` |
+
+doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 경우는 보지 못한다. doctor 경고를 없애려면 설정으로 켠다.
+
+#### 함정
+
+- aio 레이어에는 channels-lite 의 `[aio]` extra(aiosqlite·aiosqlitepool·msgspec)가 필요하다. 이 패키지의 `[channels-lite]` extra 는 channels-lite 만 설치한다: `pip install "channels-lite[aio]==0.4.0"`.
+- 패치는 프로세스마다 적용된다. 워커·ASGI 서버 프로세스가 모두 같은 설정을 읽어야 한다.
+- 새 DB 에 여러 연결이 동시에 처음 `journal_mode=WAL` 로 바꾸면 그중 일부가 `database is locked` 로 실패할 수 있다(원인 미확정 — `busy_timeout` 을 먼저 걸어도 재현됨, 리뷰 대조 실험). channels-lite 는 연결마다 기본 `init_command` 로 `PRAGMA journal_mode=WAL` 을 실행하므로(0.4.0 `channels_lite/layers/aio.py:50-58`), 새 채널 DB 에 여러 프로세스가 동시에 처음 붙을 때 생긴다(테스트 준비에서 재현, #8). 배포 때 `migrate` 직후 채널 DB 를 미리 `PRAGMA journal_mode=WAL` 로 바꿔 둔다. 이 패치가 고치는 문제는 아니다.
 
 ## 문제 해결
 
@@ -564,5 +634,5 @@ uv run --no-sync pytest
 
 scripts/ci-local.sh                 # GitHub Actions CI 를 act 로 로컬 실행 (lint + 전체 매트릭스)
 scripts/ci-local.sh test 3.14 6.1   # 매트릭스 한 칸만
-scripts/ci-local.sh litestream      # 실제 litestream 바이너리로 통합 테스트 (바이너리가 없어 skip 되면 실패)
+scripts/ci-local.sh litestream      # 실제 litestream 바이너리 + channels-lite[aio]==0.4.0 으로 통합 테스트 (둘 중 하나가 없어 skip 되면 실패)
 ```

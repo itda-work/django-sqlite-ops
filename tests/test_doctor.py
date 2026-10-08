@@ -532,6 +532,7 @@ def test_inmemory_warns_under_multiproc_profile(tmp_path):
 
 
 LITE = "channels_lite.layers.aio.AIOSQLiteChannelLayer"
+LITE_ORM = "channels_lite.layers.core.SQLiteChannelLayer"
 
 
 def test_channels_lite_same_file_as_app_warns(tmp_path):
@@ -554,17 +555,23 @@ def test_channels_lite_alias_sharing_file_warns(tmp_path):
     assert item["level"] == "warn" and "default" in item["message"]
 
 
-def test_channels_lite_separate_file_ok(tmp_path):
+@pytest.mark.parametrize("backend", [LITE_ORM, LITE])
+def test_channels_lite_separate_file_ok(tmp_path, backend):
     app = make_db(tmp_path / "app.sqlite3")
     chan = make_db(tmp_path / "channels.sqlite3")
     rc, data = doctor(
         {"default": sqlite_database(app), "channels": sqlite_database(chan)},
-        CHANNEL_LAYERS={"default": {"BACKEND": LITE, "CONFIG": {"database": "channels"}}},
+        CHANNEL_LAYERS={"default": {"BACKEND": backend, "CONFIG": {"database": "channels"}}},
     )
     assert one(data, "channels", "default", "database")["level"] == "ok"
     # Litestream 설정이 없으면 복제 대상 규칙은 보지 않는다
     assert items(data, "channels", "default", "replicated") == []
-    assert rc == 0
+    # aio 판에는 중복 배달 패치 항목(DESIGN §9)이 붙는다. 이 설정에서는 패치가 꺼져 있어 경고다
+    not_ok = [i["key"] for i in data["items"] if i["level"] != "ok"]
+    if backend == LITE:
+        assert not_ok == ["patch"] and rc == 1
+    else:
+        assert not_ok == [] and items(data, "channels", "default", "patch") == [] and rc == 0
 
 
 def test_channels_lite_missing_database_is_unknown(tmp_path):
@@ -801,7 +808,7 @@ def test_dedicated_channel_db_not_expected_in_litestream_config(tmp_path):
         {"default": sqlite_database(app), "channels": sqlite_database(chan)},
         "--litestream-config",
         str(_config(lab, str(app))),
-        CHANNEL_LAYERS={"default": {"BACKEND": LITE, "CONFIG": {"database": "channels"}}},
+        CHANNEL_LAYERS={"default": {"BACKEND": LITE_ORM, "CONFIG": {"database": "channels"}}},
     )
     assert items(data, "litestream", "channels", "replicated") == []
     assert one(data, "channels", "default", "replicated")["level"] == "ok"

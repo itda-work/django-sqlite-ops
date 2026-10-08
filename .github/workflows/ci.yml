@@ -60,6 +60,8 @@ jobs:
 
   # 실제 litestream 바이너리로 boot/litestream 통합 테스트를 돈다. 다른 잡에는 바이너리가
   # 없어 skip 되므로, 여기서는 REQUIRE_LITESTREAM=1 로 바이너리가 없어 skip 되는 경우를 실패로 바꾼다.
+  # channels-lite aio 패치(DESIGN §9) 테스트도 이 잡에서만 돈다. 게이트가 검증한 판으로 고정해
+  # 설치하고, REQUIRE_CHANNELS_LITE=1 로 channels-lite 가 없어 skip 되는 경우를 실패로 바꾼다.
   # 설치는 공식 방법(https://litestream.io/install/linux/)인 릴리스 .deb + dpkg 다. apt 는 쓰지 않는다.
   # .deb 는 같은 릴리스의 checksums.txt 와 SHA-256 이 맞아야 설치한다.
   litestream:
@@ -68,6 +70,7 @@ jobs:
     env:
       LITESTREAM_VERSION: "0.5.17"  # 바꾸면 위 name 도 함께 고친다
       REQUIRE_LITESTREAM: "1"
+      REQUIRE_CHANNELS_LITE: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -99,6 +102,6 @@ jobs:
       - name: Install
         run: |
           uv venv --python 3.14
-          uv pip install -e . "django~=6.1.0" --group dev
+          uv pip install -e . "django~=6.1.0" "channels-lite[aio]==0.4.0" --group dev
       - name: Test
         run: uv run --no-sync pytest -v -rs
