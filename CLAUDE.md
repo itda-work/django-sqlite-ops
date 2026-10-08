@@ -20,6 +20,7 @@
 - **구현**: herdr pane 의 Claude Code 를 **`cc-alt`**(두 번째 계정, `--dangerously-skip-permissions`)로 띄운다. `herdr agent start` 는 `claude` 바이너리를 직접 불러 alias 가 닿지 않으므로, 셸 pane 에서 `herdr pane run <id> "cc-alt --model claude-opus-5-5 --effort medium"` 로 띄운 뒤 `herdr agent rename <id> impl` 로 이름을 붙인다. 이슈가 바뀌면 문맥을 비우기 위해 새로 띄운다(종료는 `herdr agent send-keys impl ctrl+c ctrl+c` — 슬래시 명령은 prompt 로 보내면 실행되지 않는다).
 - **리뷰**: herdr pane 의 Codex — `herdr agent start review --kind codex --pane <id> -- -m gpt-6-astra -c model_reasoning_effort=medium --sandbox workspace-write`(결과 파일을 써야 하므로. 쓰기는 `.work/` 아래만 허용한다고 브리프에 적는다). 지적은 구현자에게 돌려 고친다. 리뷰가 통과하고 CI 가 초록일 때만 병합한다.
 - **README 는 활용 가이드다**(#11). 기능을 추가하는 PR 은 README 의 해당 절(설치·빠른 시작·사용 예·함정)을 함께 갱신한다. 없는 기능은 '예정'으로만 적는다.
+- **실측·테스트 디렉터리는 비우지 말고 매번 새로 만든다.** 꼭 지워야 하면 `rm -rf -- "${D:?}"` 처럼 `:?` 로 빈 값을 막고 와일드카드 없이 디렉터리 하나만 지정한다. `cd X && rm -rf *`, `rm -rf "$D"/*` 는 쓰지 않는다(cwd 가 틀리거나 변수가 비면 저장소나 `/` 를 지운다 — #3·#7 에서 실제로 시도돼 거부함).
 - 브리프와 리뷰 결과는 `.work/issue-<N>/`(git 무시)의 파일로 주고받는다. 긴 지시를 프롬프트에 넣지 않는다.
 
 ## 규약

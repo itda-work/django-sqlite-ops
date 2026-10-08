@@ -29,11 +29,14 @@ __all__ = [
     "DEFAULT_LTX_TIMEOUT",
     "DEFAULT_RESTORE_TIMEOUT",
     "DEFAULT_VERSION_TIMEOUT",
+    "LtxWalRange",
     "VERIFIED_VERSIONS",
     "RestoreResult",
     "check_version",
     "config_databases",
     "default_meta_path",
+    "local_max_ltx",
+    "ltx_wal_range",
     "local_max_txid",
     "parse_databases_json",
     "parse_ltx_json",
@@ -67,6 +70,7 @@ _LTX_NAME_RE = re.compile(r"^([0-9a-f]{16})-([0-9a-f]{16})\.ltx$")
 # LTX 헤더(superfly/ltx v0.5.2 ltx.go — Magic:20, HeaderSize:28, HeaderFlagNoChecksum:175,
 # Header.MarshalBinary:283, IsValidPageSize:399, MaxPageSize:396). 모두 big-endian.
 #   [0:4] "LTX1"  [4:8] flags  [8:12] page size  [16:24] min TXID  [24:32] max TXID
+#   [48:56] WAL offset  [56:64] WAL size  [64:68] WAL salt-1  [68:72] WAL salt-2
 _LTX_MAGIC = b"LTX1"
 _LTX_HEADER_SIZE = 100
 _LTX_FLAG_MASK = 1 << 1  # HeaderFlagNoChecksum 만 정의돼 있다
@@ -335,8 +339,8 @@ def default_meta_path(db_path: str | os.PathLike[str]) -> Path:
     return db.parent / f".{db.name}-litestream"
 
 
-def _read_ltx_range(path: Path) -> tuple[int, int] | None:
-    """LTX 파일 헤더의 (min TXID, max TXID). 정규 파일·헤더 형식이 아니면 ``None``.
+def _read_ltx_header(path: Path) -> bytes | None:
+    """검증한 LTX 헤더 100바이트. 정규 파일·헤더 형식이 아니면 ``None``.
 
     LTX 파일 자체가 심볼릭 링크이면 거부한다. Litestream 은 ``ltx/0`` 안에 파일 링크를 만들지
     않으므로 예상 밖 상태다. 상위 디렉터리(메타 디렉터리·``ltx``·``ltx/0``)의 링크는 허용하고
@@ -366,23 +370,62 @@ def _read_ltx_range(path: Path) -> tuple[int, int] | None:
         return None
     if int.from_bytes(header[8:12], "big") not in _LTX_PAGE_SIZES:
         return None
+    return header
+
+
+def _read_ltx_range(path: Path) -> tuple[int, int] | None:
+    """LTX 파일 헤더의 (min TXID, max TXID). 정규 파일·헤더 형식이 아니면 ``None``."""
+    header = _read_ltx_header(path)
+    if header is None:
+        return None
     return int.from_bytes(header[16:24], "big"), int.from_bytes(header[24:32], "big")
 
 
-def local_max_txid(
+@dataclass(frozen=True, slots=True)
+class LtxWalRange:
+    """L0 파일이 원래 WAL 의 어디까지를 담았는가(superfly/ltx v0.5.2 ``Header``).
+
+    ``offset + size`` 가 그 L0 가 읽은 WAL 의 끝(바이트)이다. Litestream 0.5.17 도 다음 동기화를
+    이 위치와 salt 에서 이어 간다(``db.go`` ``verifyWithExecutor``: ``info.offset =
+    WALOffset + WALSize``). 저널 모드나 압축 파일은 0 이다.
+    """
+
+    page_size: int
+    offset: int
+    size: int
+    salt1: int
+    salt2: int
+
+    @property
+    def end(self) -> int:
+        return self.offset + self.size
+
+
+def ltx_wal_range(path: str | os.PathLike[str]) -> LtxWalRange | None:
+    """LTX 헤더의 WAL 위치 필드. 읽을 수 없거나 WAL 정보가 없으면(``offset`` 0) ``None``.
+
+    필드(``ltx.go`` ``Header.MarshalBinary`` 293–296, big-endian): ``[48:56]`` WALOffset(int64),
+    ``[56:64]`` WALSize(int64), ``[64:68]`` WALSalt1, ``[68:72]`` WALSalt2. ``Header.Validate``
+    (228–241)처럼 음수 금지, salt 가 있으면 offset 이 0 이 아니어야 한다.
+    """
+    header = _read_ltx_header(Path(path))
+    if header is None:
+        return None
+    offset = int.from_bytes(header[48:56], "big", signed=True)
+    size = int.from_bytes(header[56:64], "big", signed=True)
+    salt1 = int.from_bytes(header[64:68], "big")
+    salt2 = int.from_bytes(header[68:72], "big")
+    if offset <= 0 or size < 0:
+        return None
+    return LtxWalRange(int.from_bytes(header[8:12], "big"), offset, size, salt1, salt2)
+
+
+def local_max_ltx(
     db_path: str | os.PathLike[str], *, meta_path: str | os.PathLike[str] | None = None
-) -> int | None:
-    """로컬 메타의 L0 에서 최신 LTX 파일의 max TXID 를 읽는다. 믿을 수 없으면 ``None``.
+) -> tuple[int, Path] | None:
+    """``local_max_txid()`` 와 같은 후보 하나를 같은 규칙으로 검증해 ``(max TXID, 파일 경로)``.
 
-    후보 고르기는 Litestream 0.5.17 ``DB.MaxLTX()`` 와 같다: ``<meta>/ltx/0/`` 의 파일 이름
-    ``<min>-<max>.ltx`` 중 ``max`` 가 가장 큰 것(같으면 이름순 첫 번째). L0 보존 정리는 가장 새
-    L0 파일을 지우지 않으므로 업로드·압축·종료 뒤에도 남는다(db.go ``EnforceL0RetentionByTime``,
-    실측).
-
-    고른 후보 **하나**를 검증한다. 정규 파일(파일 자체가 링크면 거부, 상위 디렉터리 링크는
-    허용), 읽기 가능, 1 ≤ min ≤ max, LTX 헤더의 매직·flags·page size 가 유효하고 헤더의
-    min/max 가 이름과 같아야 한다. 하나라도 어긋나면 낮은 후보로 내려가지 않고 ``None`` 이다.
-    체크섬·페이지 전체 검증(Litestream ``DB.Pos()`` 의 ``Decoder.Verify()``)은 하지 않는다.
+    헬스(#7)가 그 파일의 mtime 을 DB 변경 시각과 비교하려고 쓴다. 믿을 수 없으면 ``None``.
     """
     try:
         meta = Path(meta_path) if meta_path is not None else default_meta_path(db_path)
@@ -405,7 +448,26 @@ def local_max_txid(
         return None
     if _read_ltx_range(l0 / name) != (lo, hi):
         return None
-    return hi
+    return hi, l0 / name
+
+
+def local_max_txid(
+    db_path: str | os.PathLike[str], *, meta_path: str | os.PathLike[str] | None = None
+) -> int | None:
+    """로컬 메타의 L0 에서 최신 LTX 파일의 max TXID 를 읽는다. 믿을 수 없으면 ``None``.
+
+    후보 고르기는 Litestream 0.5.17 ``DB.MaxLTX()`` 와 같다: ``<meta>/ltx/0/`` 의 파일 이름
+    ``<min>-<max>.ltx`` 중 ``max`` 가 가장 큰 것(같으면 이름순 첫 번째). L0 보존 정리는 가장 새
+    L0 파일을 지우지 않으므로 업로드·압축·종료 뒤에도 남는다(db.go ``EnforceL0RetentionByTime``,
+    실측).
+
+    고른 후보 **하나**를 검증한다. 정규 파일(파일 자체가 링크면 거부, 상위 디렉터리 링크는
+    허용), 읽기 가능, 1 ≤ min ≤ max, LTX 헤더의 매직·flags·page size 가 유효하고 헤더의
+    min/max 가 이름과 같아야 한다. 하나라도 어긋나면 낮은 후보로 내려가지 않고 ``None`` 이다.
+    체크섬·페이지 전체 검증(Litestream ``DB.Pos()`` 의 ``Decoder.Verify()``)은 하지 않는다.
+    """
+    found = local_max_ltx(db_path, meta_path=meta_path)
+    return None if found is None else found[0]
 
 
 # --- restore --------------------------------------------------------------------------

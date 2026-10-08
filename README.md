@@ -10,7 +10,7 @@ Django 에서 SQLite 를 운영 DB 로 안전하게 쓰게 하는 **운영 도�
 | boot CLI (복원 판정·복원·잠금) | 구현됨 | [#2](https://github.com/itda-work/django-sqlite-ops/issues/2) · [#3](https://github.com/itda-work/django-sqlite-ops/issues/3) · [#4](https://github.com/itda-work/django-sqlite-ops/issues/4) |
 | 시스템 체크 | 구현됨 | [#5](https://github.com/itda-work/django-sqlite-ops/issues/5) |
 | `sqlite_doctor` 관리 명령 | 구현됨 | [#6](https://github.com/itda-work/django-sqlite-ops/issues/6) |
-| 복제 헬스 | 예정 | [#7](https://github.com/itda-work/django-sqlite-ops/issues/7) |
+| 복제 헬스 | 구현됨 | [#7](https://github.com/itda-work/django-sqlite-ops/issues/7) |
 | 배포 프로필 문서 | 예정 | [#9](https://github.com/itda-work/django-sqlite-ops/issues/9) |
 | channels-lite 패치 | 예정 | [#8](https://github.com/itda-work/django-sqlite-ops/issues/8) |
 
@@ -307,6 +307,7 @@ python manage.py check --deploy   # W001·W002·W004 는 --deploy 일 때만 나
 | ID | 조건 | 언제 | 고치는 법 |
 |---|---|---|---|
 | `sqlite_ops.E001` | `SQLITE_OPS` 가 dict 가 아니거나 `PROFILE` 이 알 수 없는 이름 | 항상 | `PROFILE` 을 `"single-server"`·`"single-server-multiproc"` 중 하나로. 이 오류가 있으면 다른 체크는 돌지 않는다 |
+| `sqlite_ops.E002` | `SQLITE_OPS["HEALTH"]` 가 잘못됨: dict 가 아님, 모르는 키, `DATABASES` 가 비었거나 `DATABASES` 에 없는·sqlite3 가 아닌 별칭, `litestream_config` 없음, `REFRESH` 가 양수가 아님, `BACKLOG_GRACE` 가 음수 등. `HEALTH` 가 없으면 검사하지 않는다 | 항상 | [복제 헬스](#복제-헬스)의 설정 형식대로 고친다 |
 | `sqlite_ops.W001` | `OPTIONS["transaction_mode"]` 가 `IMMEDIATE` 가 아님(없음 포함, 대소문자 무시) | `--deploy` | `sqlite_database()` 를 쓰거나 `"transaction_mode": "IMMEDIATE"` 를 넣는다 |
 | `sqlite_ops.W002` | `OPTIONS["init_command"]` 에서 `journal_mode` 가 `WAL` 로 설정되지 않음, 또는 `journal_mode` 를 언급하는 문장의 형식을 판정할 수 없음 | `--deploy` | `sqlite_database()` 를 쓰거나 `init_command` 에 `PRAGMA journal_mode=WAL` 을 넣는다 |
 | `sqlite_ops.W003` | 이름이 Litestream VFS(`vfs=litestream` 이 든 `file:` URI)인 별칭의 `CONN_MAX_AGE` 가 `None` 이 아님, `ASGI_APPLICATION` 미설정(WSGI) | 항상 | 그 별칭에 `"CONN_MAX_AGE": None`. WSGI 실측에서 요청당 1,008ms → 1.7ms |
@@ -412,7 +413,131 @@ summary: 1 warning(s), 0 error(s), 0 unknown -> exit 1
 
 ### 복제 헬스
 
-예정. 복제 상태를 `caught_up / backlog / unknown` 으로 보고한다. [#7](https://github.com/itda-work/django-sqlite-ops/issues/7)
+"지금 복제가 따라오는가"를 `caught_up / backlog / unknown` 으로 보고하는 JSON 엔드포인트다. Litestream 은 S3 가 끊겨도 로그·`status`·메트릭에 아무것도 남기지 않으므로(실측 D3), 헬스는 Litestream 의 자기 보고 대신 두 가지를 직접 본다.
+
+1. **TXID 비교 (로컬 L0 → 복제본)** — 로컬 메타의 최대 TXID(`.<db>-litestream/ltx/0/`)와 복제본의 최대 TXID(`litestream ltx -level all -json`). 업로드가 막히면(S3 끊김) 로컬이 앞선다.
+2. **WAL 위치 비교 (DB → 로컬 L0)** — 최신 로컬 L0 파일의 헤더에는 그 L0 가 원래 WAL 의 어디까지를 담았는지(WAL 오프셋·크기·salt)가 있다. 현재 `-wal` 파일의 헤더와 프레임 헤더를 읽어(salt·누적 체크섬이 맞는 프레임만) 그 위치 **뒤에 커밋이 있는지** 본다. Litestream 자신도 다음 동기화를 이 위치에서 이어 간다. `litestream replicate` 가 죽거나 멈추면 TXID 는 로컬·원격이 같은 채로 멈춰 1 만으로는 그 뒤의 쓰기가 보이지 않는데, 2 가 그것을 잡는다.
+
+**DB 연결을 열지 않는다.** 모두 파일 읽기(`-wal` 은 읽기 전용으로 열어 헤더만)와 `litestream` 명령으로만 본다.
+
+> **파일 시각은 "그 커밋이 복제본에 들어갔다"의 증거가 아니다.** Litestream 은 L0 를 만들 때 담을 WAL 범위를 먼저 정하고 DB 를 복사한 뒤 파일을 닫는다. 그래서 복사 중에 들어온 커밋은 L0 에 없는데도 L0 의 mtime 은 그 커밋보다 늦다(재현함: 그 상태에서 Litestream 이 멈추면 복원본에 행이 하나 없다). 헬스는 시각이 아니라 WAL 위치로 판정한다. 파일 시각은 WAL 로 판정할 수 없을 때 `backlog` 쪽으로만 쓰는 보조 근거다(아래).
+
+```python
+# settings.py
+from django_sqlite_ops.database import sqlite_database
+
+INSTALLED_APPS = ["django_sqlite_ops"]
+
+DATABASES = {"default": sqlite_database("/srv/app/app.sqlite3")}
+
+SQLITE_OPS = {
+    "HEALTH": {
+        "DATABASES": {
+            # 별칭마다 Litestream 설정 파일. meta_path(설정에 meta-path 를 바꿨을 때)와
+            # litestream(바이너리, 기본 PATH 의 litestream)은 선택이다.
+            "default": {"litestream_config": "/etc/litestream.yml"},
+        },
+        "REFRESH": 15,  # 초, 원격 조회 주기 (기본 15)
+        "BACKLOG_GRACE": 60,  # 초, 로컬이 앞선 상태를 backlog 로 볼 때까지 (기본 60)
+    },
+}
+```
+
+```python
+# urls.py
+from django.urls import path
+
+from django_sqlite_ops.health import health_view
+
+urlpatterns = [
+    path("internal/sqlite-health", health_view),
+]
+```
+
+응답 예(`GET /internal/sqlite-health`):
+
+```json
+{
+  "version": 1,
+  "status": "caught_up",
+  "refresh": 15.0,
+  "backlog_grace": 60.0,
+  "databases": {
+    "default": {
+      "status": "caught_up",
+      "code": "in_sync",
+      "reason": "local and replica are at the same TXID and every -wal commit is in the latest L0",
+      "path": "/srv/app/app.sqlite3",
+      "local_txid": "00000000000004d2",
+      "remote_txid": "00000000000004d2",
+      "checked_at": "2026-10-08T01:02:18.412Z",
+      "age": 3.2,
+      "backlog_since": null,
+      "pending_since": null,
+      "db_changed_at": "2026-10-08T01:02:11.020Z",
+      "ltx_at": "2026-10-08T01:02:11.533Z",
+      "wal": {"evidence": "in_sync", "reason": "every -wal commit is within the latest L0",
+              "ltx_wal_end": 4152, "wal_commit_end": null},
+      "boot_state": {"state": "match", "action": "proceed", "reason_code": "local_current",
+                     "reason": "...", "unknown_at_boot": false,
+                     "litestream_version": "0.5.17", "at": "2026-10-08T01:02:03Z"},
+      "boot_state_error": null
+    }
+  }
+}
+```
+
+| 상태 | `code` | 뜻 |
+|---|---|---|
+| `caught_up` | `in_sync` | 로컬 TXID == 복제본 TXID, 그리고 `-wal` 의 커밋이 모두 최신 L0 범위 안 |
+| `caught_up` | `local_ahead_within_grace` | 로컬 TXID 가 앞서 있지만 아직 올라가지 않은 TXID 가 기다린 시간이 `BACKLOG_GRACE` 보다 짧음(정상 업로드 지연). `backlog_since` 가 함께 나온다 |
+| `caught_up` | `db_changed_within_grace` | `-wal` 에 최신 L0 뒤의 커밋이 있지만 `BACKLOG_GRACE` 보다 짧음(Litestream 이 곧 L0 를 쓴다). `pending_since` 가 함께 나온다 |
+| `backlog` | `local_ahead` | 아직 올라가지 않은 로컬 TXID 가 `BACKLOG_GRACE` 이상 기다림. 업로드가 막혔거나 쓰기를 못 따라간다(S3 끊김, 자격 증명 만료) |
+| `backlog` | `db_not_replicated` | `-wal` 에 최신 L0 뒤의 커밋이 `BACKLOG_GRACE` 이상 남아 있음(또는 WAL 근거가 없을 때 파일 시각이 그만큼 L0 보다 새로움). `litestream replicate` 가 죽었거나 멈췄을 수 있다 |
+| `unknown` | `no_wal_evidence` | `-wal` 로 판정할 수 없음: `-wal` 이 없거나(마지막 연결이 닫혀 지워짐) 비었음, L0 이후 WAL 이 다시 시작됐는데 아직 커밋이 없음 등. **이때는 `caught_up` 으로 단정하지 않는다** |
+| `unknown` | `file_time_backwards` | WAL 근거가 없는데 DB·`-wal`·L0 의 파일 시각이 앞선 관측보다 뒤로 감(시계 변경 등) |
+| `unknown` | `remote_error` · `remote_empty` · `no_local_meta` · `remote_ahead` · `unknown_at_boot` · `path_not_real` · `not_file_db` · `refresh_failed` · `not_checked` · `stale` | 판정할 수 없음: 원격 조회 실패, 복제본이 빈 목록(경로·prefix 오타와 구분되지 않는다), 로컬 메타 없음(`litestream replicate` 가 돌지 않음), **복제본이 로컬보다 앞섬**(다른 기계가 같은 복제본에 쓰는 중일 수 있다), 부팅 상태 파일의 `unknown_at_boot`(boot 가 `--on-unknown keep-local` 로 진행함), 경로 규칙 위반(D-15, 아래), 파일 DB 가 아님, 갱신 중 예외, 아직 첫 조회 전, 마지막 결과가 `REFRESH × 3` 보다 오래됨(갱신 스레드가 멈춤) |
+
+`local_ahead` 의 backlog 시간은 **처음 관측한 미업로드 로컬 TXID 가 원격에 올라가기까지 기다린 시간**이다. 가장 오래된 미업로드 커밋의 엄밀한 나이나 로컬·원격의 총 격차가 아니다.
+
+`code` 는 고정된 값이라 알람 규칙에 쓸 수 있다. 설정이 없거나 틀리면 최상위에 `code`(`not_configured`·`invalid_config`)와 `reason` 이 붙는다.
+
+**WAL 위치 근거** (형식: [SQLite WAL](https://www.sqlite.org/fileformat2.html#walformat), superfly/ltx v0.5.2 `Header`, Litestream 0.5.17 `db.go`):
+- 판정: 현재 `-wal` 의 salt 가 최신 L0 의 salt 와 같으면, L0 끝(`WALOffset + WALSize`) 뒤에 유효한 커밋 프레임이 있으면 pending, 없으면 in_sync. salt 가 다르면(L0 이후 WAL 이 다시 시작됨) 새 salt 의 커밋이 있으면 pending, 없으면 판정할 수 없음.
+- 프레임은 salt 와 누적 체크섬이 맞을 때만 센다(SQLite 의 복구 규칙과 같다). 쓰다 만 프레임은 커밋으로 세지 않는다. L0 끝 뒤의 프레임만, 첫 커밋까지만 읽는다(한 번에 최대 64 MiB).
+- 잠금 없이 읽으므로 읽는 도중 체크포인트가 `-wal` 을 비우거나 다시 시작할 수 있다. 그래서 "L0 뒤 커밋 없음"이라고 답하기 전에 처음 연 `-wal` 이 그대로인지(같은 파일, 같은 크기, 같은 헤더) 다시 보고, 바뀌었으면 한 번만 다시 읽는다. 그래도 바뀌면 판정하지 않는다(`no_wal_evidence`).
+- pending 지속 시간은 처음 관측한 때부터 monotonic 으로 세고, 최신 L0 의 WAL 위치가 바뀌면(Litestream 이 진행 중) 다시 센다. 쓰기가 계속되는 바쁜 DB 도 Litestream 이 살아 있으면 `backlog` 가 되지 않는다(실측: 30ms 간격 쓰기 30초, 0.5초마다 판정, grace 3초에서 모두 `caught_up`).
+- Litestream 이 도는 동안에는 Litestream 이 연결을 쥐고 있어 `-wal` 이 남으므로 이 근거가 늘 있다.
+
+**보조 근거: 파일 시각** — WAL 로 판정할 수 없을 때만 쓴다(주로 Litestream 이 멈춘 뒤 앱의 마지막 연결이 닫혀 `-wal` 이 지워졌을 때).
+- DB 변경 시각 `max(mtime(DB), mtime(DB-wal))` 이 최신 L0 의 mtime 보다 늦은 상태가 `BACKLOG_GRACE` 이상 이어지면 `backlog`(`db_not_replicated`, 사유에 "file times only"). 아니면 **`unknown`(`no_wal_evidence`) — 시각만으로 `caught_up` 이라고 하지 않는다.**
+- Litestream 이 멈춰 있으면 앱의 마지막 연결이 닫힐 때의 체크포인트(읽기만 했어도)와 `replicate -once` 의 종료가 DB mtime 을 바꾼다(실측). 그래서 이 경로의 `db_not_replicated` 는 "DB 가 쓰이는데 Litestream 이 진행하지 않는다"는 뜻이다.
+- 파일 시각이 앞선 관측보다 뒤로 가면(벽시계 역행, 파일 복사) `unknown`(`file_time_backwards`)이고 앞선 근거를 지우지 않는다. 다른 프로세스가 DB 파일을 `touch`·복사·덮어쓰면 이 경로는 틀릴 수 있다.
+- 드문 경우: Litestream 이 도는데 `-wal` 이 TRUNCATE 체크포인트로 0바이트가 되고 그 뒤 쓰기가 없으면(기본 설정에서는 WAL 이 약 500MB 를 넘을 때만) 다음 쓰기까지 `unknown` 이거나, 파일 시각 때문에 grace 뒤 `backlog` 로 보일 수 있다.
+
+- **전체 `status` 는 별칭 중 가장 나쁜 것**이다(`unknown` > `backlog` > `caught_up`). `unknown` 이 가장 나쁜 이유: 복제가 따라오는지조차 말할 수 없다는 뜻이라, 뒤처진 것을 아는 `backlog` 보다 더 큰 문제를 감출 수 있다.
+- **요청마다 S3 를 부르지 않는다.** 프로세스마다 데몬 스레드 하나가 `REFRESH` 초마다 조회하고 뷰는 마지막 결과를 읽기만 한다. 스레드는 **첫 헬스 요청 때** 시작하므로 배포 직후 첫 응답은 `unknown`("not checked yet")이다. 관리 명령·마이그레이션에서는 스레드가 돌지 않는다. gunicorn `--preload` 처럼 포크하는 서버에서도 워커마다 PID 를 보고 다시 시작한다.
+- **지속 시간(`backlog_since`·`pending_since` 부터의 시간, `REFRESH × 3` 판정)은 프로세스 메모리에서 monotonic 시계로 잰다.** 주 근거(TXID·WAL 위치)는 벽시계를 쓰지 않으므로 벽시계가 NTP 로 뒤로 가도 판정이 되돌아가지 않는다. 보조 근거(파일 시각)는 벽시계를 쓰므로 역행을 보면 `unknown` 으로 둔다. 응답의 시각 문자열(UTC, 밀리초)은 표시용 벽시계다. 앱을 재시작하면 추적이 초기화되어, 재시작 직후에는 오래된 backlog 도 `BACKLOG_GRACE` 동안 `caught_up` 으로 보인다. 워커마다 따로 추적하므로 워커별 응답이 몇 초 다를 수 있다.
+- **`ATOMIC_REQUESTS` 를 켠 별칭이 있어도 헬스 요청은 트랜잭션으로 감싸지 않는다.** Django 는 감싸려고 뷰 실행 전에 연결을 연다(그러면 DB 파일이 생길 수 있다). `health_view` 는 모든 별칭에서 빠지도록 표시돼 있다. 헬스 뷰를 다른 데코레이터로 감쌀 때는 `functools.wraps` 로 이 표시(`_non_atomic_requests`)를 옮긴다.
+- **"마지막 업로드 시각"은 쓰지 않는다.** 쓰기가 없는 정상 DB 도 업로드 시각은 오래되기 때문이다.
+- 부팅 상태 파일 `<db>.boot-state.json`([boot CLI](#boot-cli)가 씀)을 `boot_state` 로 보여 준다. 파일이 없거나 형식이 틀리면 `boot_state_error` 에 그 사실만 적고 상태는 바꾸지 않는다(boot 를 쓰지 않는 배포도 있다). `unknown_at_boot` 가 참이면 다음 정상 부팅까지 `unknown` 이다.
+- DB 경로는 Django 가 실제로 여는 경로(`OPTIONS["database"]` 포함, [`sqlite_doctor`](#sqlite_doctor)와 같은 방식)다. **boot 와 같은 실제 경로 규칙(D-15)**을 따른다: 부모 경로에 심볼릭 링크·`..` 가 있거나 DB 파일 자체가 링크면 그 별칭은 `unknown` 이다. `meta_path` 도 같다(`..` 를 접지 않고 쓴 그대로 검사한다. 상대 경로는 작업 디렉터리만 앞에 붙인다). Litestream 설정의 `dbs[].path` 도 같은 실제 경로여야 한다.
+- 설정이 잘못되면 `manage.py check` 가 `sqlite_ops.E002` 를 내고, 뷰는 `unknown` 과 사유를 돌려준다.
+
+**HTTP 상태는 항상 200 이다.** 헬스 엔드포인트를 로드밸런서의 헬스 체크로 쓰면, 복제가 뒤처지거나 S3 가 끊겼다는 이유로 앱이 서비스에서 빠진다. 복제 지연은 데이터 손실 위험이지 요청을 못 받는 상태가 아니므로 앱을 내리면 안 된다. 모니터링은 **본문의 `status`** 로 알람을 건다(`backlog` 나 `unknown` 이 몇 분 이어지면 경보). HTTP 코드로만 판정할 수 있는 모니터를 쓴다면 `?strict=1` 을 붙인다. 그러면 `caught_up` 이 아닐 때 503 이다. **로드밸런서 헬스 체크에는 `strict` 를 쓰지 않는다.**
+
+**인증하지 않는다. 내부망에만 노출한다.** 응답에는 DB 파일 경로, TXID, 파일 시각, 부팅 상태가 들어간다. **사유(`reason`)는 고정 문장에 경로·TXID·초만 넣는다.** Litestream 의 stderr 나 예외 원문은 응답에 넣지 않는다(Litestream 은 설정 오류 메시지에 endpoint 의 `user:password@` 까지 그대로 찍는다 — 재현함). 원문은 로거 `django_sqlite_ops.health` 에 WARNING 으로, 같은 메시지는 한 번만 남는다. 로그에 남기기 전에 URL 의 사용자 정보, 쿼리의 서명·토큰류 값, `secret-access-key: …` 같은 `키: 값` 을 가린다(`health.redact()`). 완전한 비밀 탐지기는 아니므로 로그도 접근을 제한한다. 공개 URL 에 붙여야 한다면 웹 서버에서 IP 로 막거나 자체 인증 뷰로 감싼다.
+
+```python
+# settings.py — 원문 진단 로그를 보려면
+LOGGING = {
+    "version": 1,
+    "handlers": {"console": {"class": "logging.StreamHandler"}},
+    "loggers": {"django_sqlite_ops.health": {"handlers": ["console"], "level": "WARNING"}},
+}
+```
+
+헬스는 "지금 복제가 따라오는가"만 말한다. 복제본으로 실제 복구할 수 있는지는 주기적인 복원 검증으로 따로 본다(예정).
 
 ### 배포 프로필
 

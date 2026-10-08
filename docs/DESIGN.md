@@ -237,6 +237,7 @@ django_sqlite_ops/
 | ID | 조건 | 수준 |
 |---|---|---|
 | `sqlite_ops.E001` | `SQLITE_OPS` 가 dict 가 아니거나 `PROFILE` 이 알 수 없는 이름. 이때는 이 오류 하나만 내고 다른 체크는 건너뛴다 | Error (항상) |
+| `sqlite_ops.E002` | `SQLITE_OPS["HEALTH"]`(§7)가 잘못됨: dict 가 아님, 모르는 키, `DATABASES` 가 비었거나 `DATABASES` 에 없는·sqlite3 가 아닌 별칭, 별칭 항목이 dict 가 아님·`litestream_config` 없음·`meta_path`/`litestream` 이 빈 값, `REFRESH` 가 양수 아님, `BACKLOG_GRACE` 가 음수(숫자가 아니거나 bool·무한대 포함). `HEALTH` 가 없으면 검사하지 않는다. 검증은 `health.parse_config()` 한 곳이고 뷰도 같은 결과를 쓴다. `obj` 는 해당 별칭(설정 전체 문제면 없음) | Error (항상, ASGI 포함) |
 | `sqlite_ops.W001` | sqlite3 별칭의 `OPTIONS.transaction_mode` 가 `IMMEDIATE` 가 아님(없음 포함, 대소문자 무시). 읽기 전용·VFS 별칭은 건너뛴다 | Warning (`--deploy` 일 때만) |
 | `sqlite_ops.W002` | `init_command` 에서 `journal_mode` 가 `WAL` 로 설정되지 않음, 또는 판정할 수 없음. Django 처럼 `;` 로 나눈 문장마다 SQL 주석을 지우고 보며, 마지막으로 확정된 설정값을 쓴다. 대소문자·공백·인용 식별자(`"…"`·`` `…` ``·`[…]`)·`main.` 접두는 인정하고 다른 스키마는 세지 않는다. `journal_mode` 를 언급하지만 형식을 확정할 수 없는 문장이 하나라도 있으면 판정할 수 없다고 경고한다. 메모리 DB·읽기 전용·VFS 별칭은 건너뛴다 | Warning (`--deploy`) |
 | `sqlite_ops.W003` | 이름이 Litestream VFS(`vfs=litestream` 이 든 `file:` URI)인 별칭의 `CONN_MAX_AGE` 가 `None` 이 아님(키 없음 = Django 기본 0 포함), 그리고 `ASGI_APPLICATION` 미설정(WSGI 로 판단). ASGI 는 미검증이라 내지 않는다(교차 리뷰) | Warning (항상) |
@@ -298,10 +299,65 @@ django_sqlite_ops/
 
 ## 7. 헬스
 
-- `caught_up`: 원격 최대 TXID == 로컬 최대 TXID
-- `backlog`: 로컬 TXID 가 원격보다 앞서 있고, 그 상태가 `SQLITE_OPS_BACKLOG_GRACE`(기본 60초)보다 오래 지속됨
-- `unknown`: 원격 조회 실패, 메타를 읽을 수 없음, 부팅 때 `keep-local` 로 진행함(부팅 상태 파일의 `unknown_at_boot`)(`keep-local` 은 부팅 시 원격 조회가 성공했을 때만 통하므로 — D-12 — 이 표시는 원격이 비었거나 앞섰거나 로컬 메타가 없던 부팅을 뜻한다)
-- **부팅 상태 파일** `<db>.boot-state.json`: boot 가 exec 직전에 임시 파일 + rename 으로 원자적으로 쓴다(거부·실패한 부팅은 쓰지 않으므로 앞선 성공 부팅의 내용이 남는다). 헬스(#7)가 읽는다.
+구현은 `django_sqlite_ops/health.py`(판정·스레드·뷰)와 `django_sqlite_ops/wal.py`(WAL 위치, 표준 라이브러리만). 사용자가 `health_view` 를 `urls.py` 에 붙인다. **헬스는 DB 연결을 열지 않는다**: 로컬 TXID 와 L0 의 WAL 위치는 메타 파일(`local_max_ltx()`·`ltx_wal_range()`), 원격은 `litestream ltx`(`remote_max_txid()`), 현재 커밋 위치는 `-wal` 파일을 읽기 전용으로 열어 헤더만 읽는다.
+
+**설정**
+```python
+SQLITE_OPS = {
+    "HEALTH": {
+        # 별칭마다 litestream_config 필수, meta_path·litestream(바이너리) 선택
+        "DATABASES": {"default": {"litestream_config": "/etc/litestream.yml"}},
+        "REFRESH": 15,  # 초, 원격 조회 주기
+        "BACKLOG_GRACE": 60,  # 초
+    },
+}
+```
+- 별칭의 DB 경로는 Django 실효 경로다(`OPTIONS["database"]` 포함, doctor 와 같이 `get_connection_params()` 로 읽고 연결하지 않는다). 쓰기 파일 DB 가 아니면(메모리·읽기 전용·VFS·판정 불가) 그 별칭은 `unknown`.
+- D-15 실제 경로 규칙을 boot 의 `real_path()` 로 그대로 검사한다(부모에 링크·`..` 없음). DB 파일 자체가 링크여도, `meta_path` 가 규칙을 어겨도 `unknown`(사유 포함). 이때 원격 조회를 하지 않는다.
+- 상대 경로(`litestream_config`·`meta_path`·경로 구분자가 든 `litestream`)는 설정을 읽을 때 프로세스 작업 디렉터리를 **앞에 붙이기만** 한다. `abspath()` 처럼 `..` 를 접으면 `link/../meta` 가 링크를 따라간 실제 위치가 아닌 다른 디렉터리로 바뀌어 D-15 검사를 우회한다(review-1 재현). 검사와 조회는 `real_path()` 가 돌려준 경로로 한다.
+- 설정이 잘못되면 시스템 체크 `sqlite_ops.E002`(§6-1). 뷰는 스레드를 시작하지 않고 `unknown`(`code: invalid_config`)과 고정 사유를 돌려준다(설정값을 응답에 옮기지 않는다). `HEALTH` 가 없으면 체크하지 않고, 뷰는 `unknown`(`code: not_configured`)이다.
+
+**상태 (별칭마다)** — 판정은 순수 함수 `alias_status(sample, now, refresh, grace)`(`now` 는 monotonic 초). 위에서부터 처음 맞는 것. `code` 는 응답의 고정 사유 코드다:
+
+| 조건 | 상태 | `code` |
+|---|---|---|
+| 아직 첫 조회 전 | `unknown` | `not_checked` |
+| 마지막 관측의 나이(monotonic) < 0 또는 > `REFRESH × 3`(갱신 스레드 멈춤 — 원격 조회가 타임아웃까지 매달린 경우 포함) | `unknown` | `stale` |
+| 조회 전에 정해진 사유: 경로 규칙 위반 / 파일 DB 아님 / 갱신 중 예외 | `unknown` | `path_not_real` / `not_file_db` / `refresh_failed` |
+| 부팅 상태 파일의 `unknown_at_boot` 가 참 | `unknown` | `unknown_at_boot` |
+| 원격 조회 실패(`RemoteError`) | `unknown` | `remote_error` |
+| 원격 빈 목록(`RemoteEmpty`) — 경로·prefix 오타와 구분되지 않는다 | `unknown` | `remote_empty` |
+| 로컬 메타 없음(`None`) | `unknown` | `no_local_meta` |
+| **원격 > 로컬** — 다른 기계가 같은 복제본에 쓰는 중일 수 있다(사유에 그렇게 적는다) | `unknown` | `remote_ahead` |
+| 로컬 > 원격, 아직 올라가지 않은 로컬 TXID 가 기다린 시간 ≥ `BACKLOG_GRACE` | `backlog` | `local_ahead` |
+| **WAL 근거 없음**(아래) + 보조 파일 시각이 앞선 관측보다 뒤로 감 | `unknown` | `file_time_backwards` |
+| WAL 근거 없음 + 보조 파일 시각상 DB 가 L0 보다 새로운 상태 ≥ `BACKLOG_GRACE` | `backlog` | `db_not_replicated` |
+| WAL 근거 없음 (그 밖 — `caught_up` 으로 단정하지 않는다) | `unknown` | `no_wal_evidence` |
+| WAL 에 L0 뒤 커밋이 있는 상태 ≥ `BACKLOG_GRACE` | `backlog` | `db_not_replicated` |
+| 로컬 > 원격, 그보다 짧음 | `caught_up`(`backlog_since` 표시) | `local_ahead_within_grace` |
+| WAL 에 L0 뒤 커밋이 있고 그보다 짧음 | `caught_up`(`pending_since` 표시) | `db_changed_within_grace` |
+| 그 밖(원격 == 로컬, WAL 커밋이 모두 L0 안) | `caught_up` | `in_sync` |
+
+**DB → 로컬 L0: WAL 위치 근거 (review-2)** — 로컬 L0 는 Litestream 이 쓴다. `replicate` 가 죽거나 멈추면 로컬·원격 TXID 가 같은 채로 멈추므로 TXID 비교만으로는 그 뒤의 쓰기가 보이지 않는다(review-1 재현). 라운드 1 은 이를 파일 시각(`max(mtime(DB), mtime(DB-wal))` > 최신 L0 mtime)으로 봤지만 **파일 시각의 순서는 그 커밋이 L0 에 들어갔다는 증거가 아니다**: Litestream 은 L0 를 만들 때 WAL 페이지 맵(담을 범위)을 먼저 정하고 DB 를 복사한 뒤 파일을 닫으므로, 복사 중 커밋은 L0 밖인데 L0 mtime 은 그보다 늦다(review-2 재현: 8 × 1MiB 행 DB 에서 첫 L0 작성 중 커밋 → 첫 업로드 직후 SIGSTOP → 복원본 8행·원본 9행인데 라운드 1 판정은 `in_sync`, 3/3). 그래서 시계와 무관한 WAL 위치로 판정한다.
+- **L0 가 담은 WAL 위치** — superfly/ltx v0.5.2 `ltx.go` `Header`(188–191)·`MarshalBinary`(293–296), big-endian: `[48:56]` WALOffset(int64), `[56:64]` WALSize(int64), `[64:68]` WALSalt1, `[68:72]` WALSalt2. Litestream 0.5.17 `db.go` `sync()` 는 `rd.pageMap()`(2080)으로 정한 범위를 `WALOffset: info.offset, WALSize: maxOffset - info.offset` 로 헤더에 쓰고(2146–2157) 그 **뒤에** 페이지를 복사한다(`writeLTXFromDB`, 2175). `verifyWithExecutor()`(1682, 1705–1707)는 다음 동기화를 `WALOffset + WALSize` 와 그 salt 에서 이어 간다. 즉 이 값이 "Litestream 이 L0 로 기록한 WAL 의 끝"이다. 실제 0.5.17 L0 에서 이 필드가 채워지고 현재 `-wal` 의 salt·마지막 커밋 끝과 맞는 것을 확인했다(테스트 `test_real_l0_records_wal_position`). 압축 파일(L1+)과 저널 모드는 0 이므로 L0 만 본다. 구현 `boot/litestream.py` `ltx_wal_range()`.
+- **현재 WAL 의 커밋 위치** — [SQLite WAL 형식](https://www.sqlite.org/fileformat2.html#walformat): 헤더 32바이트(`[0:4]` 매직 0x377f0682/3 — 끝 비트가 체크섬 엔디언, `[4:8]` 3007000, `[8:12]` page size, `[16:24]` salt, `[24:32]` 헤더 체크섬), 프레임 헤더 24바이트(`[0:4]` page no, `[4:8]` 커밋 프레임이면 0 이 아님, `[8:16]` salt, `[16:24]` 누적 체크섬). `-wal` 을 `O_RDONLY|O_NOFOLLOW|O_NONBLOCK` 으로 열고 정규 파일만 읽는다. 구현 `wal.compare()`.
+- **체크섬까지 검증한다.** 프레임은 salt 와 누적 체크섬이 맞을 때만 유효하다(SQLite 복구 규칙, Litestream `WALReader.readFrame` 과 같음). salt 만 보면 쓰는 중인 프레임(헤더만 쓰이고 페이지는 덜 쓰임)을 커밋으로 셀 수 있다. 비용은 L0 끝 **뒤의** 프레임만, 첫 커밋 프레임까지만 읽어 줄인다. 체크섬은 L0 끝 바로 앞 프레임 헤더의 체크섬 필드에서 이어 계산한다(Litestream `NewWALReaderWithOffset` 과 같은 방식). 한 번에 64 MiB 를 넘게 읽어야 하면(거대한 트랜잭션이 쓰이는 중) 판정하지 않는다.
+- **판정** — 같은 salt: L0 끝 뒤에 유효한 커밋 프레임 → pending, 없음 → in_sync. 다른 salt(L0 이후 WAL 재시작): 현재 salt 의 커밋 프레임 → pending(새 세대의 커밋을 Litestream 이 아직 L0 로 쓰지 않음), 없음 → 근거 없음(체크포인트·재시작 사이를 Litestream 이 관측했는지 알 수 없다). `-wal` 없음·빈 헤더·헤더 체크섬 틀림·page size 불일치·L0 끝이 프레임 경계가 아님·`-wal` 이 L0 끝보다 짧음·L0 끝 직전 프레임의 salt 가 다름(덮어써짐)·L0 에 WAL 정보 없음 → 근거 없음.
+- **읽는 도중 바뀐 WAL (review-3)** — 헬스는 잠금 없이 `-wal` 을 읽는다. Litestream 은 체크포인트를 막는 읽기 트랜잭션을 쥐고 같은 규칙으로 읽지만, 헬스는 DB 연결을 열지 않으므로 그 보호가 없다. L0 끝 직전 프레임을 읽은 직후 `PRAGMA wal_checkpoint(TRUNCATE)` 가 WAL 을 0바이트로 만들면 꼬리 스캔이 EOF 를 보고 **조회 전부터 있던** 미복제 커밋을 "없음"으로 읽어 `in_sync` 가 됐다(review-3 재현: 원본 2행·복원본 1행). 그래서 `wal.compare()` 는 PENDING 이 아닌 결과를 돌려주기 전에 처음 연 WAL 의 `(st_dev, st_ino)`(fd 와 경로 양쪽)·크기·헤더 32바이트(salt·체크섬 포함)를 다시 확인한다. 하나라도 바뀌었으면 **한 번만** 다시 읽고, 다시 읽어도 바뀌면 `NO_EVIDENCE`("the -wal changed during read")다. PENDING 은 L0 뒤의 유효한 커밋 프레임을 이미 읽었다는 근거라 그대로 돌려준다. 실측: Litestream 지속 실행 + 연속 쓰기(256KiB 트랜잭션, 쉼 없이 20초, 6,730회)에서 0.5초마다 판정해 `unknown` 이 한 번도 나오지 않았다(재시도로 흡수).
+- pending 지속 시간은 `next_wal_pending_since()` 로 처음 관측한 때부터 monotonic 으로 세고, 최신 L0 (이름, WAL 끝, salt)가 바뀌면 다시 센다(Litestream 이 진행 중). 실측: Litestream 지속 실행 + 30ms 간격 쓰기(매번 연결 닫음) 30초, 0.5초마다 판정, grace 3초 → 55회 모두 `caught_up`, 쓰기를 멈춘 뒤 15초 → `in_sync`.
+- Litestream 이 도는 동안에는 Litestream 이 연결을 쥐고 있어 `-wal` 이 남으므로 이 근거가 늘 있다. 드문 예외: TRUNCATE 체크포인트(기본 `truncate-page-n` 121359 페이지 ≈ 500MB 초과 시)로 `-wal` 이 0바이트가 되고 쓰기가 없으면 근거가 없다. 0.5.17 은 그때 새 L0 를 쓰지 않는다(`verifyWithExecutor` 의 `syncedToWALEnd` 분기(1719) → `sync()` 의 "no new wal pages" 건너뜀(2108)).
+
+**보조 근거: 파일 시각** — WAL 근거가 없을 때만 쓴다(주로 Litestream 이 멈춘 뒤 앱의 마지막 연결이 닫혀 `-wal` 이 지워짐. 실측: uv Python 의 SQLite 3.53.1 은 지우고, Command Line Tools Python 의 3.51.0 은 남겼다).
+- `next_pending_since(prev, files, observed, wall)`: `db_changed_at = max(mtime(DB), mtime(DB-wal))`(`-shm` 은 읽기에도 바뀌므로 뺀다)이 최신 L0 의 mtime 보다 늦은 것을 처음 관측한 때부터 센다. 최신 L0 (이름, mtime_ns)가 바뀌면 다시 센다.
+- 이 근거는 **`backlog` 쪽으로만** 쓴다: grace 이상이면 `db_not_replicated`(사유에 "file times only"), 아니면 `no_wal_evidence` 로 `unknown`. 시각만으로 `in_sync` 를 내지 않는다.
+- **파일 시각 역행(review-2 지적 2)**: 벽시계를 쓰는 유일한 판정 경로라, DB·`-wal`·최신 L0 의 mtime 중 하나라도 앞선 관측보다 이르면(`files_went_backwards()`, 파일마다 앞뒤 관측 모두에 있을 때만 비교) `file_time_backwards` 로 `unknown` 이고 앞선 pending 을 지우지 않는다. review-2 재현(`edge.py`: `-once` 뒤 커밋 → `db_not_replicated`, 그다음 DB·WAL mtime 을 L0 보다 120초 이전으로 → 라운드 1 은 `in_sync`)이 이제 `file_time_backwards` → 다음 관측 `no_wal_evidence` 다(테스트 `test_real_file_time_backwards_is_unknown`).
+- 0.5.17 실측(라운드 1): Litestream 이 멈춰 있으면 앱의 마지막 연결이 닫힐 때의 체크포인트(읽기만 해도)와 `replicate -once` 의 종료가 DB mtime 을 바꾼다(SIGTERM 종료는 바꾸지 않았다). 그래서 이 경로의 `db_not_replicated` 는 "DB 가 쓰이는데 Litestream 이 진행하지 않음"이다. 다른 프로세스의 `touch`·복사·덮어쓰기는 이 경로를 틀리게 할 수 있다.
+
+- "아직 올라가지 않은 로컬 TXID 를 처음 관측한 시점"(`backlog_since`)은 `next_backlog_since(prev, local, remote, observed, wall)` 로 갱신마다 계산해 프로세스 메모리에 둔다. 키는 그때의 로컬 TXID 이고, 원격이 그 TXID 에 닿으면 지금의 로컬 TXID 로 다시 센다. 로컬이 앞서 있지 않으면(같아짐·조회 실패 포함) 지운다. 라운드 2 에서 바꿨다: "로컬이 앞선 상태가 이어진 시간"으로 재면 쓰기가 계속되는 DB 는 매 관측 순간 로컬이 한 걸음 앞서 업로드가 따라와도 `backlog` 가 됐다(실측: 30ms 간격 쓰기, 0.5초마다 판정, grace 3초 → 55회 중 49회 `backlog`, 바꾼 뒤 0회). 업로드가 쓰기를 못 따라가면 기다린 시간이 쌓이므로 `backlog` 다. **재시작하면 초기화된다**(재시작 직후 오래된 backlog 가 `BACKLOG_GRACE` 동안 `caught_up` 으로 보인다. README 에 적음). 지속 시간은 관측 시점끼리의 차이라 판정은 최대 `REFRESH` 늦다.
+- 그래서 `local_ahead` 의 backlog 시간은 **처음 관측한 미업로드 로컬 TXID 가 원격에 올라가기까지 기다린 시간**이다. 가장 오래된 미업로드 커밋의 엄밀한 나이나 로컬·원격의 총 격차가 아니다(원격이 그 TXID 에 닿을 때마다 새 관측으로 바뀐다 — review-3 §3).
+- **지속 시간(grace·stale·pending)은 `time.monotonic()` 으로 잰다.** 주 근거(TXID·WAL 위치)의 존재 여부도 시계와 무관하다. 벽시계는 표시용(`checked_at`·`backlog_since`·`pending_since`·`db_changed_at`·`ltx_at`, ISO 8601 UTC 밀리초)으로만 쓴다. 벽시계로 재면 재조회 사이의 역행(1000 → 1060 → 900)이 확인된 backlog 를 정상으로 되돌렸다(review-1 재현). `Since` 는 (monotonic, 벽시계) 쌍이다.
+- **전체 상태 = 별칭 중 가장 나쁜 것**(`unknown` > `backlog` > `caught_up`). `unknown` 은 "따라오는지 말할 수 없음"이라 뒤처진 것을 아는 `backlog` 보다 더 큰 문제(S3 장애·다른 기계의 쓰기·설정 오류)를 감출 수 있으므로 가장 나쁘게 본다. 별칭이 없으면 `unknown`.
+- **부팅 상태 파일** `<db>.boot-state.json`: boot 가 exec 직전에 임시 파일 + rename 으로 원자적으로 쓴다(거부·실패한 부팅은 쓰지 않으므로 앞선 성공 부팅의 내용이 남는다). 헬스가 읽어 `boot_state` 로 보인다(아래 키만 옮긴다, 64 KiB 상한, 정규 파일만, 링크 따라가지 않음). 파일이 없거나 형식이 틀리면 `boot_state_error` 에 그 사실만 적고 상태는 바꾸지 않는다(boot 를 쓰지 않는 배포도 있다).
   ```json
   {
     "version": 1,
@@ -314,11 +370,23 @@ django_sqlite_ops/
     "at": "2026-10-08T01:02:03Z"
   }
   ```
-  `unknown_at_boot` 는 `action` 이 `keep_local` 일 때만 참이다. `litestream_version` 은 읽지 못하면 `null`, `at` 은 UTC.
+  `unknown_at_boot` 는 `action` 이 `keep_local` 일 때만 참이다(`keep-local` 은 부팅 시 원격 조회가 성공했을 때만 통하므로 — D-12 — 이 표시는 원격이 비었거나 앞섰거나 로컬 메타가 없던 부팅을 뜻한다). `litestream_version` 은 읽지 못하면 `null`, `at` 은 UTC.
 - **"마지막 업로드 시각"은 지연 지표로 쓰지 않는다.** 쓰기가 없는 정상 DB 도 업로드 시각은 오래되기 때문이다.
-- **원격 조회 비용**: 요청마다 S3 를 부르지 않는다. 백그라운드 스레드나 캐시로 N초(기본 15초)마다 갱신한다. 정확한 방식은 구현 단계에서 정한다.
+
+**갱신 방식**
+- 요청마다 S3 를 부르지 않는다. 프로세스당 `Monitor` 하나의 데몬 스레드(`sqlite-ops-health`)가 `REFRESH` 초마다 별칭을 차례로 조회하고(`refresh_once()`), 뷰는 마지막 결과를 읽기만 한다. 요청은 `litestream` 을 기다리지 않는다.
+- 스레드는 **첫 헬스 요청 때** 시작한다. `ready()` 에서 시작하지 않으므로 관리 명령·테스트·마이그레이션에서는 돌지 않는다. 그래서 첫 응답은 `unknown`(첫 조회 전)이다.
+- 스레드 안의 예외는 삼키고 그 별칭을 `unknown`(사유)으로 기록한다. 스레드는 죽지 않는다.
+- 포크 서버(gunicorn `--preload`)에서 스레드는 자식에 복제되지 않는다. 요청마다 PID 를 보고 바뀌었으면 결과·잠금을 버리고 스레드를 다시 시작한다. 모듈 잠금은 `os.register_at_fork` 로 자식에서 새로 만든다.
+- 원격 조회는 별칭마다 `litestream version`(검증 버전 확인)과 `ltx` 두 번의 subprocess 다(타임아웃 10초·30초, §4-3). 조회가 매달리면 결과가 `REFRESH × 3` 보다 오래되어 `unknown` 이 된다.
+
+**응답**: `{"version": 1, "status", "refresh", "backlog_grace", "databases": {alias: {status, code, reason, path, local_txid, remote_txid, checked_at, age, backlog_since, pending_since, db_changed_at, ltx_at, wal: {evidence, reason, ltx_wal_end, wal_commit_end}, boot_state, boot_state_error}}}`. 설정이 없거나 틀리면 `{version, status: "unknown", code, reason, databases: {}}`. TXID 는 Litestream 과 같은 16자리 16진수 문자열. `Cache-Control: no-store`.
+- **HTTP 상태는 항상 200 이다.** 복제가 뒤처졌다고 로드밸런서가 앱을 빼면 안 된다(복제 지연은 데이터 손실 위험이지 요청 처리 불가가 아니다). 모니터링은 본문의 `status` 로 알람을 건다. `?strict=1` 이면 `caught_up` 이 아닐 때 503(HTTP 코드만 보는 모니터용, 로드밸런서에는 쓰지 않는다).
+- **`ATOMIC_REQUESTS`**: Django 5.2.18·6.1.2 의 `BaseHandler.make_view_atomic()`(`django/core/handlers/base.py`)은 `ATOMIC_REQUESTS` 가 켜진 별칭마다 `alias not in view._non_atomic_requests` 이면 뷰를 `atomic(using=alias)` 로 감싸고, 그러면 뷰 실행 전에 연결이 열려 DB 파일이 생긴다(review-1 재현). `transaction.non_atomic_requests(using)` 은 별칭 하나만 넣으므로, `health_view._non_atomic_requests` 에 모든 별칭을 포함하는 집합(`__contains__` 가 항상 참인 `set` 하위 클래스)을 둔다. 사용자가 `non_atomic_requests` 를 덧씌워도 `add()` 가 그대로 동작한다.
+- 인증하지 않는다. 응답에는 DB 경로·TXID·파일 시각·부팅 상태가 들어가므로 내부망에만 노출한다. **사유는 고정 문장에 경로·TXID·초만 넣고, subprocess stderr·예외 원문은 응답에 넣지 않는다.** Litestream 은 설정 오류 메시지에 endpoint 의 `user:password@` 를 그대로 찍는다(review-1 재현). 원문은 `logging.getLogger("django_sqlite_ops.health")` 에 WARNING 으로 남기며(별칭마다 같은 메시지는 한 번), 남기기 전에 `redact()` 한 곳의 규칙으로 가린다: URL userinfo, 쿼리의 `secret`·`password`·`token`·`signature`·`credential`·`access-key`·`auth` 류 키의 값, 같은 낱말이 든 `키: 값`·`키=값`. 부팅 상태 파일의 문자열도 같은 규칙을 거친다. 완전한 탐지기가 아니므로 원문을 응답으로 보내지 않는 것이 1차 방어다.
 - 헬스는 "지금 복제가 따라오는가"만 말한다. "복구할 수 있는가"는 별도의 주기적 복원 검증(`sqlite_doctor --restore-test`, 2단계)으로 본다.
-- D3 실측: 끊김 동안 Litestream 의 로그와 메트릭에 아무것도 보이지 않았다. 그래서 헬스는 Litestream 의 자기 보고에 기대지 않고, TXID 비교로 직접 계산한다.
+- D3 실측: 끊김 동안 Litestream 의 로그와 메트릭에 아무것도 보이지 않았다. 그래서 헬스는 Litestream 의 자기 보고에 기대지 않고, TXID 와 WAL 위치 비교로 직접 계산한다.
+- 테스트(`tests/test_health.py`): 순수 함수 표(grace 경계, 원격 앞섬, 빈 목록, 메타 없음, `unknown_at_boot`, 오래된 결과, pending 경계·L0 변경 시 재시작), 가짜 조회 함수로 스레드(주기 갱신·예외 내구·PID 변경 재시작·첫 요청 전 미시작·벽시계 역행), 서브프로세스 Django 의 뷰(JSON 스키마, 200/strict 503, 연결이 열리지 않고 DB 파일이 생기지 않음 — 두 별칭 `ATOMIC_REQUESTS=True` 포함, 자격 증명이 응답·로그에 없음), 실제 Litestream `file://` 복제본(TXID: `replicate -once` 로 caught_up, 다른 복제본으로만 보내 grace 뒤 backlog, 빈 목록·조회 실패 unknown / 파일 시각: `-once` 뒤 커밋 → backlog, `replicate` 지속 실행 중 유휴 caught_up → 종료 → 쓰기 → grace 안 caught_up, 뒤 backlog). S3 끊김(L8)은 랩(#10) 몫이다. 라운드 3: 읽기 사이에 실제 체크포인트·헤더 변경·파일 교체를 끼우는 테스트(테스트에서 `os.pread` 를 감싼다. 운영 코드에 훅 없음) — TRUNCATE 는 `in_sync` 아님, 두 번 다 바뀌면 `changed during read`, 같은 내용으로 교체되면 재시도 뒤 `in_sync`, PENDING 은 유지, review-3 `checkpoint_race.py`(TRUNCATE·RESTART, 실제 Litestream·복원). 라운드 2: `wal.compare()` 를 실제 SQLite 가 쓴 `-wal` 바이트로(같은/다른 salt, 체크섬·salt 가 틀린 프레임, 쓰다 만 프레임, 근거 없음 사례, 링크·FIFO), L0 헤더 필드, 실제 0.5.17 L0 의 WAL 위치, review-2 `race.py`(8 × 1MiB, 3회 중 경쟁 재현 시 `db_not_replicated`, 어느 경우도 `in_sync` 아님)·`edge.py`, 바쁜 DB 의 TXID backlog 오탐.
 
 ## 8. 배포 프로필과 채널 레이어
 

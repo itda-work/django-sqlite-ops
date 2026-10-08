@@ -244,15 +244,31 @@ def _journal_mode(init_command: Any) -> tuple[str | None, str | None]:
     return mode, undetermined
 
 
+def _health_errors() -> list[checks.Error]:
+    """E002: ``SQLITE_OPS["HEALTH"]`` 가 잘못됨. ``HEALTH`` 가 없으면 검사하지 않는다(DESIGN §7)."""
+    from .health import load_config  # health 는 doctor → checks 를 import 한다
+
+    _, errors = load_config()
+    return [
+        checks.Error(
+            message,
+            hint="See README '복제 헬스' and DESIGN §7 for the HEALTH settings.",
+            obj=alias,
+            id="sqlite_ops.E002",
+        )
+        for message, alias in errors
+    ]
+
+
 def check_settings(app_configs=None, **kwargs):
-    """항상 도는 체크: E001(프로필), W003(VFS 별칭의 ``CONN_MAX_AGE``)."""
+    """항상 도는 체크: E001(프로필), E002(헬스 설정), W003(VFS 별칭의 ``CONN_MAX_AGE``)."""
     _, error = _profile()
     if error:
         return [error]
+    messages: list = _health_errors()
     if getattr(settings, "ASGI_APPLICATION", None):
         # ASGI 의 영속 연결은 미검증이다. 보편적으로 강제하지 않는다 (DESIGN §6-1).
-        return []
-    messages = []
+        return messages
     for alias, config in _sqlite_aliases():
         if _is_litestream_vfs(config.get("NAME")) and config.get("CONN_MAX_AGE", 0) is not None:
             messages.append(
