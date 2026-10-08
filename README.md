@@ -4,21 +4,24 @@ Django 에서 SQLite 를 운영 DB 로 안전하게 쓰게 하는 **운영 도�
 
 ## 현재 상태
 
-| 기능 | 상태 | 이슈 |
-|---|---|---|
-| 권장 설정 `sqlite_database()` | 구현됨 | [#1](https://github.com/itda-work/django-sqlite-ops/issues/1) |
-| boot CLI (복원 판정·복원·잠금) | 구현됨 | [#2](https://github.com/itda-work/django-sqlite-ops/issues/2) · [#3](https://github.com/itda-work/django-sqlite-ops/issues/3) · [#4](https://github.com/itda-work/django-sqlite-ops/issues/4) |
-| 시스템 체크 | 구현됨 | [#5](https://github.com/itda-work/django-sqlite-ops/issues/5) |
-| `sqlite_doctor` 관리 명령 | 구현됨 | [#6](https://github.com/itda-work/django-sqlite-ops/issues/6) |
-| 복제 헬스 | 구현됨 | [#7](https://github.com/itda-work/django-sqlite-ops/issues/7) |
-| 배포 프로필 문서 ([single-server](docs/profiles/single-server.md) · [single-server-multiproc](docs/profiles/single-server-multiproc.md)) | 구현됨 | [#9](https://github.com/itda-work/django-sqlite-ops/issues/9) |
-| channels-lite 패치 | 구현됨 | [#8](https://github.com/itda-work/django-sqlite-ops/issues/8) |
+PyPI 배포 전이다([D-4·D-9](docs/DECISIONS.md)). 패키지 이름 `django-sqlite-ops` 도 가칭이라 바뀔 수 있다([D-6](docs/DECISIONS.md)). 설치는 GitHub 에서 한다.
 
-PyPI 배포 전이다. 패키지 이름도 가칭이라 바뀔 수 있다.
+| 기능 | 상태 | 이슈·근거 |
+|---|---|---|
+| [권장 설정](#권장-설정) `sqlite_database()` | 구현됨 | [#1](https://github.com/itda-work/django-sqlite-ops/issues/1) |
+| [시스템 체크](#시스템-체크) | 구현됨 | [#5](https://github.com/itda-work/django-sqlite-ops/issues/5) |
+| [`sqlite_doctor`](#sqlite_doctor) 관리 명령 | 구현됨 | [#6](https://github.com/itda-work/django-sqlite-ops/issues/6) |
+| [boot CLI](#boot-cli) (복원 판정·복원·잠금) | 구현됨 | [#2](https://github.com/itda-work/django-sqlite-ops/issues/2) · [#3](https://github.com/itda-work/django-sqlite-ops/issues/3) · [#4](https://github.com/itda-work/django-sqlite-ops/issues/4) |
+| [복제 헬스](#복제-헬스) | 구현됨 | [#7](https://github.com/itda-work/django-sqlite-ops/issues/7) |
+| [channels-lite 패치](#channels-lite-패치) | 구현됨 | [#8](https://github.com/itda-work/django-sqlite-ops/issues/8) |
+| [배포 프로필 문서](#배포-프로필) | 구현됨 | [#9](https://github.com/itda-work/django-sqlite-ops/issues/9) |
+| 회귀 랩(Docker 로 실패 경계 L1–L8 재현, PRAGMA 벤치) | 예정 | [#10](https://github.com/itda-work/django-sqlite-ops/issues/10) |
+| 복원 검증 `sqlite_doctor --restore-test` | 예정(2단계) | [DESIGN §7](docs/DESIGN.md#7-헬스) |
+| VFS 읽기 복제본용 DB 라우터 | 예정(2단계) | [DESIGN §3-2](docs/DESIGN.md#3-2-2단계-이후) |
 
 ## 설치
 
-요구 버전: Python 3.13+, Django 5.2+, SQLite 3.37+.
+요구 버전: Python 3.13+, Django 5.2+, SQLite 3.37+. boot CLI 는 POSIX(Linux·macOS)와 PATH 의 `litestream` 0.5.17 이 필요하다([boot CLI](#boot-cli)).
 
 ```bash
 uv add git+https://github.com/itda-work/django-sqlite-ops
@@ -26,29 +29,96 @@ uv add git+https://github.com/itda-work/django-sqlite-ops
 pip install git+https://github.com/itda-work/django-sqlite-ops
 ```
 
-`INSTALLED_APPS` 에 `"django_sqlite_ops"` 를 넣는다. 그래야 `manage.py check` 가 [시스템 체크](#시스템-체크)를 돈다. 권장 설정은 `settings.py` 에서 함수 하나만 부른다.
+필수 의존성은 Django 하나다. 채널 레이어는 extra 로 고른다: `[nats]`(channels-nats), `[channels-lite]`(channels-lite 만. aio 레이어에 필요한 의존성은 [channels-lite 패치 '함정'](#channels-lite-패치)).
 
 ## 빠른 시작
 
+컨테이너 한 대에 앱 프로세스 하나(`single-server`)로 배포하는 최소 조합이다. 경로는 컨테이너 기준 `/data/app.sqlite3`·`/etc/litestream.yml` 이다. Dockerfile·compose 까지 포함한 전체 조각과 운영 절차는 [배포 프로필](#배포-프로필) 문서에 있다.
+
+**1. `settings.py`** — 앱 등록, 권장 설정, 헬스 설정.
+
 ```python
 # settings.py
-from pathlib import Path
-
 from django_sqlite_ops.database import sqlite_database
 
-BASE_DIR = Path(__file__).resolve().parent.parent
-
 INSTALLED_APPS = [
-    # ...
-    "django_sqlite_ops",
+    # ... 프로젝트의 앱들
+    "django_sqlite_ops",  # manage.py check 가 시스템 체크를 돈다
 ]
 
 DATABASES = {
-    "default": sqlite_database(BASE_DIR / "app.sqlite3"),
+    # 실제 경로로 쓴다. boot 의 --db, litestream.yml 의 path 와 같은 값 (경로 규칙)
+    "default": sqlite_database("/data/app.sqlite3"),
+}
+
+SQLITE_OPS = {
+    "PROFILE": "single-server",
+    "HEALTH": {"DATABASES": {"default": {"litestream_config": "/etc/litestream.yml"}}},
 }
 ```
 
-결과는 그대로 `DATABASES` 에 들어가는 평범한 dict 다.
+`sqlite_database()` 가 무엇을 켜는지는 [권장 설정](#권장-설정), `SQLITE_OPS["HEALTH"]` 의 다른 키는 [복제 헬스](#복제-헬스).
+
+**2. `urls.py`** — 복제 헬스 엔드포인트. 내부망에만 노출한다([노출 범위](#복제-헬스)).
+
+```python
+# urls.py
+from django.urls import path
+
+from django_sqlite_ops.health import health_view
+
+urlpatterns = [
+    path("internal/sqlite-health", health_view),
+]
+```
+
+**3. `litestream.yml`** — `path` 는 settings 의 `NAME` 과 같은 실제 경로다. endpoint·자격 증명은 [single-server §3](docs/profiles/single-server.md#litestreamyml).
+
+```yaml
+# /etc/litestream.yml
+dbs:
+  - path: /data/app.sqlite3
+    replica:
+      type: s3
+      bucket: my-app-backups
+      path: app                    # 버킷 안 prefix. 오타가 나면 '복제본 없음'과 구분되지 않는다
+      region: us-east-1
+```
+
+**4. `entrypoint.sh`** — boot 가 판정·복원한 뒤 litestream 이 앱을 띄우고 복제한다. `migrate` 는 `-exec` 안에서 돈다([boot CLI](#boot-cli)).
+
+```bash
+#!/bin/sh
+# BOOT_FLAGS: 한 번만 쓰는 boot 옵션(--init-new 등). 평소에는 비워 둔다.
+set -eu
+# shellcheck disable=SC2086 # BOOT_FLAGS 는 단어로 나뉘어야 한다
+exec python -m django_sqlite_ops.boot \
+    --db /data/app.sqlite3 \
+    --config /etc/litestream.yml \
+    ${BOOT_FLAGS:-} \
+    -- litestream replicate -config /etc/litestream.yml \
+       -exec "sh -c 'python manage.py migrate --noinput && exec uvicorn proj.asgi:application --host 0.0.0.0 --port 8000 --workers 1'"
+```
+
+**5. 첫 배포** — 볼륨도 복제본도 비어 있으면 boot 는 거부한다. 생애 첫 배포에만 `BOOT_FLAGS=--init-new` 로 띄우고, 첫 복제를 확인한 뒤 비운다([생애 첫 배포](#생애-첫-배포---init-new-를-한-번-쓰고-끈다)). 이미 운영 중인 DB 를 올린다면 `--adopt-existing` 이다([기존 DB 도입](#기존-db-도입---adopt-existing-을-한-번-쓰고-끈다)).
+
+**6. 확인** — 배포마다 이 순서로 본다.
+
+```bash
+python manage.py check --deploy    # 설정만 본다(DB 를 열지 않음). sqlite_ops.* 가 없어야 한다
+python manage.py sqlite_doctor --litestream-config /etc/litestream.yml   # 실제로 연결해 진단. exit 0
+curl -s http://127.0.0.1:8000/internal/sqlite-health   # 본문 status 가 caught_up
+```
+
+- `check --deploy` 는 빌드 단계·CI 에서도 돌린다([시스템 체크](#시스템-체크)).
+- `sqlite_doctor` 는 DB 에 연결하므로 `init_command` 가 실행된다([주의](#sqlite_doctor)).
+- 헬스의 첫 응답은 `unknown`(`not_checked`)이다. `REFRESH`(기본 15초) 뒤 다시 본다. HTTP 상태는 항상 200 이므로 본문의 `status` 로 판정한다([복제 헬스](#복제-헬스)).
+
+## 활용 가이드
+
+### 권장 설정
+
+`sqlite_database(경로)` 는 그대로 `DATABASES` 에 들어가는 평범한 dict 를 돌려준다. DB 백엔드를 바꾸거나 감싸지 않는다.
 
 ```python
 {
@@ -61,11 +131,7 @@ DATABASES = {
 }
 ```
 
-## 활용 가이드
-
-### 권장 설정
-
-`django_sqlite_ops.database` 는 표준 라이브러리만 import 한다. 그래서 `settings.py` 에서 불러도 Django 를 미리 불러오지 않는다.
+`django_sqlite_ops.database` 는 표준 라이브러리만 import 한다. 그래서 `settings.py` 에서 불러도 Django 를 미리 불러오지 않는다. 경로는 문자열이나 `Path` 로 준다(`BASE_DIR / "app.sqlite3"` 등). 운영에서는 boot·Litestream 과 같은 [실제 경로](#경로-규칙)를 쓴다.
 
 #### 기본값
 
@@ -175,127 +241,6 @@ DATABASES = {
 
 `sqlite_database()` 를 쓰지 않아도 된다. 직접 쓴 dict 나 dj-lite 가 만든 설정도 [시스템 체크](#시스템-체크)가 같은 권장값 표를 기준으로 검사한다. [`sqlite_doctor`](#sqlite_doctor) 도 같은 표로 실제 값을 비교한다.
 
-### boot CLI
-
-컨테이너가 뜰 때 Litestream 복제본과 로컬 DB 를 비교해 **쓸 수 있으면 그대로, 볼륨이 비었으면 복원, 판정할 수 없으면 기동을 거부**한 뒤 다음 명령으로 넘어간다. Django 를 import 하지 않는 독립 CLI 다. `manage.py` 명령은 `django.setup()` 중에 빈 DB 파일을 만들 수 있고, 그러면 복원이 건너뛰어지기 때문이다([DESIGN §4-1](docs/DESIGN.md)).
-
-필요한 것: POSIX(Linux·macOS), PATH 의 `litestream` 0.5.17(검증한 버전만 받는다), DB 마다 복제본이 적힌 Litestream 설정 파일. 설치는 [공식 문서](https://litestream.io/install/)를 따른다.
-
-**경로 규칙**: `--db`·`--meta-path` 는 **실제 경로**로 준다. 부모 경로에 심볼릭 링크·`..`·없는 디렉터리가 있으면 exit 64 이고, 쓸 실제 경로를 안내한다. Litestream 설정의 `dbs[].path` 에도 **같은 실제 경로**를 쓴다. boot 가 이 경로로 Litestream 을 조회·복원하기 때문이다([D-15](docs/DECISIONS.md)).
-
-#### Docker entrypoint
-
-```bash
-#!/bin/sh
-# entrypoint.sh — boot 가 판정·복원한 뒤 litestream 이 앱을 띄우고 복제한다.
-exec python -m django_sqlite_ops.boot \
-    --db /data/app.sqlite3 \
-    --config /etc/litestream.yml \
-    -- litestream replicate -config /etc/litestream.yml \
-       -exec "uvicorn proj.asgi:application --host 0.0.0.0 --port 8000"
-```
-
-`--` 뒤 명령은 boot 가 판정을 통과했을 때 `exec` 로 boot 프로세스를 대체한다. `migrate` 는 그 명령 안에서(예: `-exec "sh -c 'python manage.py migrate && uvicorn ...'"`) 돌린다.
-
-| 옵션 | 기본값 | 뜻 |
-|---|---|---|
-| `--db PATH` | (필수) | SQLite DB 경로. Litestream 설정의 `path` 와 같아야 한다 |
-| `--config PATH` | (필수) | Litestream 설정 파일 |
-| `--on-unknown` | `refuse` | 판정할 수 없을 때: `refuse`(거부) · `restore`(로컬을 격리하고 복원) · `keep-local`(로컬 유지, 헬스에 `unknown_at_boot`) |
-| `--init-new` | 꺼짐 | 생애 첫 배포에서 새 DB 로 시작. 첫 배포 뒤에는 끈다 |
-| `--adopt-existing` | 꺼짐 | 기존 DB 를 처음 Litestream 에 올린다. 도입 배포 뒤에는 끈다 |
-| `--meta-path PATH` | `<db 디렉터리>/.<db 이름>-litestream` | Litestream 설정에 `meta-path` 를 바꿨다면 같은 값을 준다 |
-| `--litestream BIN` | `litestream` | 실행 파일 |
-| `--ltx-timeout S` | `30` | 원격 TXID 조회 제한 시간(초). 넘으면 거부한다 |
-| `--restore-timeout S` | `600` | 복원 제한 시간(초). DB 크기에 맞춰 늘린다 |
-
-#### 무엇을 하나
-
-1. `<db>.boot.lock` 을 잠근다. 이 잠금은 **exec 된 명령에 상속**된다. 그래서 `litestream replicate`(와 그것이 띄운 앱)가 살아 있는 동안 같은 볼륨에서 boot 를 또 돌리면 exit 5 로 막힌다. 다른 머신끼리의 이중 실행은 막지 못한다.
-2. 앞선 부팅이 격리 도중 죽었으면(`<db>.stale-<ts>.partial/`) 그 격리부터 마저 끝낸다.
-3. 로컬 DB·로컬 메타의 TXID·원격 복제본의 TXID 를 보고 판정한다([DESIGN §4-3](docs/DESIGN.md) 규칙표).
-4. 복원이 필요하면 DB 옆 임시 디렉터리(`<db>.restore-…/`)에 먼저 복원하고, 성공했을 때만 로컬을 `<db>.stale-<ts>/` 로 옮긴 뒤 복원본을 제자리에 놓는다. 복원이 실패하면 로컬은 그대로다.
-5. DB 가 있으면 읽기 전용으로 `PRAGMA quick_check` 를 한다. DB 가 없으면(새 DB) 만들지 않는다.
-6. `<db>.boot-state.json` 에 판정 결과를 남기고 명령을 exec 한다.
-
-stderr 의 `[boot] ...` 줄만 보면 무슨 일이 있었는지 알 수 있다.
-
-```text
-[boot] lock: /data/app.sqlite3.boot.lock
-[boot] inputs: local_exists=False local_txid=None remote=txid 25
-[boot] decision: state=fresh action=restore reason_code=restore_from_remote reason=no local db; restore remote txid 25
-[boot] restore: /data/app.sqlite3 -> /data/app.sqlite3.restore-20261008T010203.000001Z-1a2b3c4d/app.sqlite3
-[boot] restore: ok, txid 25
-[boot] install: /data/app.sqlite3
-[boot] integrity: quick_check ok
-[boot] state: /data/app.sqlite3.boot-state.json
-[boot] exec: litestream replicate -config /etc/litestream.yml -exec uvicorn ...
-```
-
-#### 종료 코드
-
-| 코드 | 뜻 | 할 일 |
-|---|---|---|
-| (exec) | 통과. 이후 코드는 exec 된 명령의 것이다 | — |
-| `2` | 거부. 판정할 수 없다 | 아래 사유 코드별 대처 |
-| `3` | 무결성 실패(`quick_check` 가 `ok` 아님) | DB 파일을 조사한다. 판정은 `match` 라 `--on-unknown restore` 만으로는 복원되지 않는다. 복제본이 정본이면 DB 파일(과 `-wal`·`-shm`)을 다른 곳으로 옮기고 `--on-unknown restore` 로 다시 부팅한다. 남은 메타가 `stale_meta` 로 격리되고 복원된다 |
-| `4` | 복원 실패 | 로그의 `restore failed:` 사유를 본다. 임시 복원이 실패했으면 로컬은 그대로이고, 남은 `<db>.restore-…/` 는 조사 뒤 지운다. 격리·설치 중 I/O 실패도 4 다. 격리 도중이면 `<db>.stale-…partial/` 이 남고 다음 부팅이 이어서 끝낸다. 격리를 마친 뒤(설치 중) 실패했으면 다음 부팅이 남은 상태에 따라 다시 복원하거나(로컬이 비었을 때) `no_local_meta` 로 거부한다(아래 '복원 직후 크래시 복구') |
-| `5` | 잠금 실패 | 같은 볼륨에서 이미 돌고 있는 컨테이너·프로세스를 멈춘다 |
-| `64` | 사용법 오류 | 인자를 고친다. `--` 뒤 명령이 꼭 있어야 한다. 경로가 실제 경로가 아니면 메시지의 실제 경로로 바꾸고 Litestream 설정도 같은 경로로 맞춘다 |
-| `127` | `--` 뒤 명령을 실행할 수 없음 | 명령 이름·PATH·실행 권한을 확인한다 |
-
-#### 생애 첫 배포: `--init-new` 를 한 번 쓰고 끈다
-
-볼륨도 복제본도 비어 있으면 boot 는 거부한다(`no_replica_no_local`). Litestream 은 복제본 경로·prefix 오타와 "복제본 없음"을 같은 빈 목록으로 돌려주므로, 빈 목록만 보고 새 DB 를 시작하면 오타 난 경로에 새 DB 를 올려 기존 복제본을 버리게 된다. 처음 배포할 때만 `--init-new` 를 붙인다. boot 는 DB 파일을 만들지 않고 넘어가고, 앱(`migrate`)이 만든다.
-
-```bash
-python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream.yml \
-    --init-new -- litestream replicate -config /etc/litestream.yml -exec "..."
-```
-
-첫 복제가 끝나면 **`--init-new` 를 지운다.** 켜 둔 채로 두면, 나중에 볼륨을 잃고 설정의 복제본 경로까지 틀렸을 때 다시 빈 DB 로 시작한다([D-13](docs/DECISIONS.md)).
-
-#### 기존 DB 도입: `--adopt-existing` 을 한 번 쓰고 끈다
-
-이미 운영 중인 DB 를 처음 Litestream 에 올리면 로컬 메타가 없고 복제본은 비어 있다. 이때만 `--adopt-existing` 을 붙인다. 정확히 (로컬 DB 있음, 로컬 메타 없음, 원격 빈 목록) 일 때만 통과시키고 다른 조합에는 효과가 없다. 첫 복제가 끝나면 지운다([D-11](docs/DECISIONS.md)). `--on-unknown keep-local` 을 도입 절차로 쓰지 않는다.
-
-#### 거부됐을 때 (exit 2): 사유 코드별 대처
-
-로그의 `decision: ... reason_code=...` 와 그 아래 `hint:` 줄을 본다.
-
-| 사유 코드 | 뜻 | 대처 |
-|---|---|---|
-| `no_replica_no_local` | 볼륨도 복제본도 비었다 | 첫 배포면 `--init-new` 를 한 번. 아니면 설정의 복제본 경로·prefix 를 확인한다 |
-| `remote_error` | 복제본 조회 실패·타임아웃 | 네트워크·자격 증명·endpoint(평문 HTTP 면 `http://` 를 붙인다)를 고친다. 이 경우는 `--on-unknown` 과 무관하게 거부한다([D-12](docs/DECISIONS.md)) |
-| `remote_ahead` | 복제본이 이 볼륨보다 새롭다(옛 볼륨으로 재부팅) | 복제본이 정본이면 `--on-unknown restore` 로 한 번 부팅한다. 로컬은 `<db>.stale-<ts>/` 에 남는다 |
-| `no_local_meta` | DB 는 있는데 Litestream 메타가 없다 | 아래 '복원 직후 크래시 복구'. 기존 DB 를 처음 올리는 중이고 복제본이 비었으면 `--adopt-existing` |
-| `stale_meta` | DB 없이 메타만 남았다 | `--on-unknown restore` 로 메타를 격리하고 복원한다 |
-| `remote_empty` | 복제한 적 있는 DB 인데 복제본이 비었다 | 복제본 경로·prefix·버킷을 확인한다. 로컬을 그대로 쓰려면 `--on-unknown keep-local` |
-| `orphan_sidecars` | DB 파일 없이 `-wal`/`-shm`/`-journal` 만 있다 | 파일을 조사한다. 복제본이 정본이면 `--on-unknown restore` 로 격리하고 복원한다 |
-
-`--on-unknown` 은 문제를 푼 그 한 번만 쓰고 원래(`refuse`)로 돌린다. 격리된 `<db>.stale-<ts>/` 는 boot 가 지우지 않는다. 확인한 뒤 직접 지운다.
-
-#### 복원 직후 크래시 복구
-
-복원한 DB 옆에는 Litestream 메타가 없다. `litestream replicate` 가 첫 변경을 기록하기 전에 컨테이너가 죽으면, 다음 부팅은 "DB 는 있는데 메타가 없다"(`no_local_meta`)로 거부된다. 이 DB 는 방금 복제본에서 받은 것이므로 한 번만 `--on-unknown restore` 로 부팅하면 격리하고 다시 복원한다([D-14](docs/DECISIONS.md)).
-
-```bash
-python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream.yml \
-    --on-unknown restore -- litestream replicate -config /etc/litestream.yml -exec "..."
-```
-
-#### 함정
-
-- DB 경로는 Litestream 설정의 `path` 와 같은 값을 준다. 설정에 없는 DB 면 `remote_error` 로 거부된다.
-- `/data -> /mnt/volume` 처럼 부모가 링크인 경로(`--db /data/app.sqlite3`)는 받지 않는다. 링크를 따라간 실제 경로(`/mnt/volume/app.sqlite3`)를 boot 인자와 Litestream 설정 양쪽에 쓴다. 경로는 파일 이름으로 끝나야 한다.
-- `--meta-path` 를 DB 디렉터리 자체나 그 조상으로 두지 않는다. 메타가 DB 를 포함하면 격리가 필요할 때 거부된다(exit 2).
-- 메타 디렉터리는 DB 와 같은 파일시스템에 둔다. 격리는 rename 으로 하므로 다른 볼륨에 있으면 거부한다.
-- **격리가 필요할 때(`restore` 조치) DB·`-wal`·`-shm`·`-journal`·메타 디렉터리 경로가 심볼릭 링크면 거부한다(exit 2).** 링크를 옮기면 실체가 밖에 남기 때문이다(v0.1 제약). 판정만 하고 진행하는 부팅(`match` 등)에서는 메타 디렉터리 링크를 따라가므로 평소에는 드러나지 않는다. 볼륨 안에 실제 파일·디렉터리로 둔다.
-- DB 나 `--meta-path` 의 이름을 `manifest.json` 으로 하지 않는다. 격리 디렉터리의 예약 이름이라 격리가 필요할 때 거부된다.
-- 격리 도중 죽어 `<db>.stale-…partial/` 이 남았다면 **같은 `--db`·`--meta-path`** 로 다시 부팅한다. 다르면 판정할 수 없어 거부한다. 그 안의 파일을 손으로 바꾸지 않는다.
-- `<db>.boot.lock` 을 지우지 않는다. flock 잠금은 파일에 걸리므로, 앱이 도는 중에 잠금 파일을 지우거나 바꾸면 다음 boot 가 새 파일을 잠가 이중 실행을 막지 못한다. 잠금 파일이 링크거나 정규 파일이 아니면 exit 5 다.
-- boot 는 Windows 에서 검증하지 않았다. `fcntl` 이 없으면 exit 64 다.
-
 ### 시스템 체크
 
 `INSTALLED_APPS` 에 `"django_sqlite_ops"` 를 넣으면 `manage.py check` 가 `DATABASES` 의 SQLite 별칭(`ENGINE` 이 `django.db.backends.sqlite3`)을 [권장값](#기본값)과 비교한다. **설정만 읽고 DB 를 열지 않는다.** 그래서 DB 파일이 없어도, 빌드 단계에서도 돌릴 수 있다. 실제로 적용된 PRAGMA 값은 [`sqlite_doctor`](#sqlite_doctor)가 본다.
@@ -370,7 +315,7 @@ python manage.py sqlite_doctor --json          # 모니터링·스크립트용
 
 - **database** — 별칭마다 Django 가 실제로 여는 경로(`OPTIONS["database"]` 가 있으면 `NAME` 대신 그것. 연결하지 않고 Django 의 연결 매개변수에서 읽는다)를 기준으로 역할(쓰기·읽기 전용·메모리·VFS), 파일 크기, `-wal` 크기(연결 전), 실제 `transaction_mode`·`journal_mode`·`synchronous`·`busy_timeout`·`foreign_keys`·SQLite 버전. [권장값](#기본값)과 다르면 `warn`. 읽기 전용 별칭은 쓰기 권고(`transaction_mode`·`journal_mode`·`synchronous`)를 비교하지 않는다. 메모리 DB 는 "메모리 DB" 로만 적는다. Litestream VFS 별칭과 역할을 판정할 수 없는 별칭(W004, 로컬이 아닌 URI authority 포함)은 연결하지 않고 `unknown`. 연결 실패는 `error`.
 - **mount** — 위의 실제 경로로 DB 파일(없으면 존재하는 상위 디렉터리)의 파일시스템 종류. NFS·SMB/CIFS·AFP·sshfs 같은 네트워크 파일시스템이면 `warn` 이다. SQLite 의 파일 잠금을 믿을 수 없고 WAL 이 동작하지 않는다([SQLite 문서](https://www.sqlite.org/useovernet.html)). 로컬로 확인되지 않은 종류(알 수 없는 FUSE 등)는 `unknown`.
-- **litestream** — `litestream databases -config PATH -json` 으로 설정의 DB 목록을 읽어 실제 경로로 대조한다. 쓰기 별칭이 설정에 없으면 `warn`(복제되지 않음). 단 channels-lite 전용 채널 DB(앱 DB 와 다른 파일)는 복제에서 빼는 것이 규칙이라 이 경고를 내지 않는다. 설정 경로가 실제 경로가 아니면(부모에 링크) `warn` — boot 가 거부하는 구성이다(D-15). 상대 경로·`dir:` 항목은 Litestream 의 작업 디렉터리 기준으로 풀려 대조할 수 없으므로 `warn`. 설정에만 있는 DB 는 `ok`(정보). 설정 파일 없음·깨진 YAML·바이너리 없음은 `error`.
+- **litestream** — `litestream databases -config PATH -json` 으로 설정의 DB 목록을 읽어 실제 경로로 대조한다. 쓰기 별칭이 설정에 없으면 `warn`(복제되지 않음). 단 channels-lite 전용 채널 DB(앱 DB 와 다른 파일)는 복제에서 빼는 것이 규칙이라 이 경고를 내지 않는다. 설정 경로가 실제 경로가 아니면(부모에 링크) `warn` — boot 가 거부하는 구성이다([경로 규칙](#경로-규칙)). 상대 경로·`dir:` 항목은 Litestream 의 작업 디렉터리 기준으로 풀려 대조할 수 없으므로 `warn`. 설정에만 있는 DB 는 `ok`(정보). 설정 파일 없음·깨진 YAML·바이너리 없음은 `error`.
 - **channels** — `CHANNEL_LAYERS` 를 읽기만 한다(`channels` 를 import 하지 않는다. 예외는 아래 `patch` 항목). 백엔드별 의미론을 한 줄로 요약한다. `InMemoryChannelLayer` 는 프로필이 `single-server-multiproc` 이면 `warn`. channels-lite 는 채널 DB 가 앱 DB 와 같은 파일이면 `warn`, Litestream 설정의 복제 대상이면 `warn`. 모르는 백엔드(`channels_redis` pub/sub 포함)는 `unknown`. `AIOSQLiteChannelLayer` 를 쓰거나 `PATCH_CHANNELS_LITE_AIO` 가 켜져 있으면 [중복 배달 패치](#channels-lite-패치) 상태를 `patch` 항목으로 보여 준다. 이때만 channels-lite 를 import 한다(DB 는 열지 않는다).
 
 출력 예:
@@ -410,6 +355,128 @@ summary: 1 warning(s), 0 error(s), 0 unknown -> exit 1
 | 2 | 오류가 있음(DB 파일 없음, 연결 실패, Litestream 설정을 읽지 못함 등) |
 
 `call_command("sqlite_doctor")` 로 부르면 종료 코드가 0 이 아닐 때 `SystemExit` 가 난다.
+
+### boot CLI
+
+컨테이너가 뜰 때 Litestream 복제본과 로컬 DB 를 비교해 **쓸 수 있으면 그대로, 볼륨이 비었으면 복원, 판정할 수 없으면 기동을 거부**한 뒤 다음 명령으로 넘어간다. Django 를 import 하지 않는 독립 CLI 다. `manage.py` 명령은 `django.setup()` 중에 빈 DB 파일을 만들 수 있고, 그러면 복원이 건너뛰어지기 때문이다([DESIGN §4-1](docs/DESIGN.md)).
+
+필요한 것: POSIX(Linux·macOS), PATH 의 `litestream` 0.5.17(검증한 버전만 받는다), DB 마다 복제본이 적힌 Litestream 설정 파일. 설치는 [공식 문서](https://litestream.io/install/)를 따른다.
+
+#### 실행 형태
+
+```bash
+python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream.yml \
+    [boot 옵션] -- litestream replicate -config /etc/litestream.yml -exec "앱 명령"
+```
+
+`--` 뒤 명령은 boot 가 판정을 통과했을 때 `exec` 로 boot 프로세스를 대체한다. `migrate` 는 boot 앞이 아니라 그 명령 안에서(`-exec "sh -c 'python manage.py migrate --noinput && exec uvicorn ...'"`) 돌린다. 컨테이너 entrypoint 전체는 [빠른 시작](#빠른-시작) 4단계와 [배포 프로필](#배포-프로필) 문서에 있다.
+
+| 옵션 | 기본값 | 뜻 |
+|---|---|---|
+| `--db PATH` | (필수) | SQLite DB 경로. Litestream 설정의 `path` 와 같아야 한다 |
+| `--config PATH` | (필수) | Litestream 설정 파일 |
+| `--on-unknown` | `refuse` | 판정할 수 없을 때: `refuse`(거부) · `restore`(로컬을 격리하고 복원) · `keep-local`(로컬 유지, 헬스에 `unknown_at_boot`) |
+| `--init-new` | 꺼짐 | 생애 첫 배포에서 새 DB 로 시작. [한 번 쓰고 끈다](#생애-첫-배포---init-new-를-한-번-쓰고-끈다) |
+| `--adopt-existing` | 꺼짐 | 기존 DB 를 처음 Litestream 에 올린다. [한 번 쓰고 끈다](#기존-db-도입---adopt-existing-을-한-번-쓰고-끈다) |
+| `--meta-path PATH` | `<db 디렉터리>/.<db 이름>-litestream` | Litestream 설정에 `meta-path` 를 바꿨다면 같은 값을 준다 |
+| `--litestream BIN` | `litestream` | 실행 파일 |
+| `--ltx-timeout S` | `30` | 원격 TXID 조회 제한 시간(초). 넘으면 거부한다 |
+| `--restore-timeout S` | `600` | 복원 제한 시간(초). DB 크기에 맞춰 늘린다 |
+
+#### 경로 규칙
+
+이 절이 실제 경로 규칙([D-15](docs/DECISIONS.md))의 정본이다. `sqlite_doctor` 와 헬스도 같은 규칙으로 본다.
+
+- boot 의 `--db`·`--meta-path` 는 **실제 경로**로 준다. 부모 경로에 심볼릭 링크·`..`·없는 디렉터리가 있으면 exit 64 이고, 쓸 실제 경로를 안내한다. 경로는 파일 이름으로 끝나야 한다.
+- 예: `/data -> /mnt/volume` 처럼 부모가 링크면 `--db /data/app.sqlite3` 는 받지 않는다. 링크를 따라간 실제 경로(`/mnt/volume/app.sqlite3`)를 쓴다.
+- settings 의 `NAME`, boot 의 `--db`, Litestream 설정의 `dbs[].path` 는 **모두 같은 실제 경로**다. boot 는 이 경로로 Litestream 을 조회·복원하므로, 설정에 없는 경로면 Litestream 이 `database not found in config` 로 실패하고 boot 는 `remote_error` 로 거부한다.
+- 다른 도구의 표시: `sqlite_doctor` 는 Litestream 설정의 경로가 실제 경로가 아니면 `litestream` 섹션에 `warn`(`config_path`)을 낸다. 헬스는 DB 경로나 `meta_path` 가 실제 경로가 아니면 그 별칭을 `unknown`(`path_not_real`)으로 보고한다.
+
+#### 무엇을 하나
+
+1. `<db>.boot.lock` 을 잠근다. 이 잠금은 **exec 된 명령에 상속**된다. 그래서 `litestream replicate`(와 그것이 띄운 앱)가 살아 있는 동안 같은 볼륨에서 boot 를 또 돌리면 exit 5 로 막힌다. 다른 머신끼리의 이중 실행은 막지 못한다.
+2. 앞선 부팅이 격리 도중 죽었으면(`<db>.stale-<ts>.partial/`) 그 격리부터 마저 끝낸다.
+3. 로컬 DB·로컬 메타의 TXID·원격 복제본의 TXID 를 보고 판정한다([DESIGN §4-3](docs/DESIGN.md) 규칙표).
+4. 복원이 필요하면 DB 옆 임시 디렉터리(`<db>.restore-…/`)에 먼저 복원하고, 성공했을 때만 로컬을 `<db>.stale-<ts>/` 로 옮긴 뒤 복원본을 제자리에 놓는다. 복원이 실패하면 로컬은 그대로다.
+5. DB 가 있으면 읽기 전용으로 `PRAGMA quick_check` 를 한다. DB 가 없으면(새 DB) 만들지 않는다.
+6. `<db>.boot-state.json` 에 판정 결과를 남기고 명령을 exec 한다.
+
+stderr 의 `[boot] ...` 줄만 보면 무슨 일이 있었는지 알 수 있다.
+
+```text
+[boot] lock: /data/app.sqlite3.boot.lock
+[boot] inputs: local_exists=False local_txid=None remote=txid 25
+[boot] decision: state=fresh action=restore reason_code=restore_from_remote reason=no local db; restore remote txid 25
+[boot] restore: /data/app.sqlite3 -> /data/app.sqlite3.restore-20261008T010203.000001Z-1a2b3c4d/app.sqlite3
+[boot] restore: ok, txid 25
+[boot] install: /data/app.sqlite3
+[boot] integrity: quick_check ok
+[boot] state: /data/app.sqlite3.boot-state.json
+[boot] exec: litestream replicate -config /etc/litestream.yml -exec uvicorn ...
+```
+
+#### 종료 코드
+
+| 코드 | 뜻 | 할 일 |
+|---|---|---|
+| (exec) | 통과. 이후 코드는 exec 된 명령의 것이다 | — |
+| `2` | 거부. 판정할 수 없다 | 아래 사유 코드별 대처 |
+| `3` | 무결성 실패(`quick_check` 가 `ok` 아님) | DB 파일을 조사한다. 판정은 `match` 라 `--on-unknown restore` 만으로는 복원되지 않는다. 복제본이 정본이면 DB 파일(과 `-wal`·`-shm`)을 다른 곳으로 옮기고 `--on-unknown restore` 로 다시 부팅한다. 남은 메타가 `stale_meta` 로 격리되고 복원된다 |
+| `4` | 복원 실패 | 로그의 `restore failed:` 사유를 본다. 임시 복원이 실패했으면 로컬은 그대로이고, 남은 `<db>.restore-…/` 는 조사 뒤 지운다. 격리·설치 중 I/O 실패도 4 다. 격리 도중이면 `<db>.stale-…partial/` 이 남고 다음 부팅이 이어서 끝낸다. 격리를 마친 뒤(설치 중) 실패했으면 다음 부팅이 남은 상태에 따라 다시 복원하거나(로컬이 비었을 때) `no_local_meta` 로 거부한다(아래 '복원 직후 크래시 복구') |
+| `5` | 잠금 실패 | 같은 볼륨에서 이미 돌고 있는 컨테이너·프로세스를 멈춘다 |
+| `64` | 사용법 오류 | 인자를 고친다. `--` 뒤 명령이 꼭 있어야 한다. 경로가 실제 경로가 아니면 메시지의 실제 경로로 바꾸고 Litestream 설정도 같은 경로로 맞춘다 |
+| `127` | `--` 뒤 명령을 실행할 수 없음 | 명령 이름·PATH·실행 권한을 확인한다 |
+
+#### 생애 첫 배포: `--init-new` 를 한 번 쓰고 끈다
+
+볼륨도 복제본도 비어 있으면 boot 는 거부한다(`no_replica_no_local`). Litestream 은 복제본 경로·prefix 오타와 "복제본 없음"을 같은 빈 목록으로 돌려주므로, 빈 목록만 보고 새 DB 를 시작하면 오타 난 경로에 새 DB 를 올려 기존 복제본을 버리게 된다. 처음 배포할 때만 `--init-new` 를 붙인다. boot 는 DB 파일을 만들지 않고 넘어가고, 앱(`migrate`)이 만든다.
+
+```bash
+python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream.yml \
+    --init-new -- litestream replicate -config /etc/litestream.yml -exec "..."
+```
+
+첫 복제가 끝나면(헬스 본문 `status` 가 `caught_up`) **`--init-new` 를 지운다.** 컨테이너라면 `BOOT_FLAGS` 로 넘기고 비운다([배포 프로필](#배포-프로필)). 켜 둔 채로 두면, 나중에 볼륨을 잃고 설정의 복제본 경로까지 틀렸을 때 다시 빈 DB 로 시작한다([D-13](docs/DECISIONS.md)).
+
+#### 기존 DB 도입: `--adopt-existing` 을 한 번 쓰고 끈다
+
+이미 운영 중인 DB 를 처음 Litestream 에 올리면 로컬 메타가 없고 복제본은 비어 있다. 이때만 `--adopt-existing` 을 붙인다. 정확히 (로컬 DB 있음, 로컬 메타 없음, 원격 빈 목록) 일 때만 통과시키고 다른 조합에는 효과가 없다. 첫 복제가 끝나면 지운다([D-11](docs/DECISIONS.md)). `--on-unknown keep-local` 을 도입 절차로 쓰지 않는다.
+
+#### 거부됐을 때 (exit 2): 사유 코드별 대처
+
+로그의 `decision: ... reason_code=...` 와 그 아래 `hint:` 줄을 본다.
+
+| 사유 코드 | 뜻 | 대처 |
+|---|---|---|
+| `no_replica_no_local` | 볼륨도 복제본도 비었다 | 첫 배포면 `--init-new` 를 한 번. 아니면 설정의 복제본 경로·prefix 를 확인한다 |
+| `remote_error` | 복제본 조회 실패·타임아웃 | 네트워크·자격 증명·endpoint(평문 HTTP 면 `http://` 를 붙인다)를 고친다. 이 경우는 `--on-unknown` 과 무관하게 거부한다([D-12](docs/DECISIONS.md)) |
+| `remote_ahead` | 복제본이 이 볼륨보다 새롭다(옛 볼륨으로 재부팅) | 복제본이 정본이면 `--on-unknown restore` 로 한 번 부팅한다. 로컬은 `<db>.stale-<ts>/` 에 남는다 |
+| `no_local_meta` | DB 는 있는데 Litestream 메타가 없다 | 아래 '복원 직후 크래시 복구'. 기존 DB 를 처음 올리는 중이고 복제본이 비었으면 `--adopt-existing` |
+| `stale_meta` | DB 없이 메타만 남았다 | `--on-unknown restore` 로 메타를 격리하고 복원한다 |
+| `remote_empty` | 복제한 적 있는 DB 인데 복제본이 비었다 | 복제본 경로·prefix·버킷을 확인한다. 로컬을 그대로 쓰려면 `--on-unknown keep-local` |
+| `orphan_sidecars` | DB 파일 없이 `-wal`/`-shm`/`-journal` 만 있다 | 파일을 조사한다. 복제본이 정본이면 `--on-unknown restore` 로 격리하고 복원한다 |
+
+`--on-unknown` 은 문제를 푼 그 한 번만 쓰고 원래(`refuse`)로 돌린다. 격리된 `<db>.stale-<ts>/` 는 boot 가 지우지 않는다. 확인한 뒤 직접 지운다.
+
+#### 복원 직후 크래시 복구
+
+복원한 DB 옆에는 Litestream 메타가 없다. `litestream replicate` 가 첫 변경을 기록하기 전에 컨테이너가 죽으면, 다음 부팅은 "DB 는 있는데 메타가 없다"(`no_local_meta`)로 거부된다. 이 DB 는 방금 복제본에서 받은 것이므로 한 번만 `--on-unknown restore` 로 부팅하면 격리하고 다시 복원한다([D-14](docs/DECISIONS.md)).
+
+```bash
+python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream.yml \
+    --on-unknown restore -- litestream replicate -config /etc/litestream.yml -exec "..."
+```
+
+#### 함정
+
+- 경로는 [경로 규칙](#경로-규칙)대로 준다.
+- `--meta-path` 를 DB 디렉터리 자체나 그 조상으로 두지 않는다. 메타가 DB 를 포함하면 격리가 필요할 때 거부된다(exit 2).
+- 메타 디렉터리는 DB 와 같은 파일시스템에 둔다. 격리는 rename 으로 하므로 다른 볼륨에 있으면 거부한다.
+- **격리가 필요할 때(`restore` 조치) DB·`-wal`·`-shm`·`-journal`·메타 디렉터리 경로가 심볼릭 링크면 거부한다(exit 2).** 링크를 옮기면 실체가 밖에 남기 때문이다(v0.1 제약). 판정만 하고 진행하는 부팅(`match` 등)에서는 메타 디렉터리 링크를 따라가므로 평소에는 드러나지 않는다. 볼륨 안에 실제 파일·디렉터리로 둔다.
+- DB 나 `--meta-path` 의 이름을 `manifest.json` 으로 하지 않는다. 격리 디렉터리의 예약 이름이라 격리가 필요할 때 거부된다.
+- 격리 도중 죽어 `<db>.stale-…partial/` 이 남았다면 **같은 `--db`·`--meta-path`** 로 다시 부팅한다. 다르면 판정할 수 없어 거부한다. 그 안의 파일을 손으로 바꾸지 않는다.
+- `<db>.boot.lock` 을 지우지 않는다. flock 잠금은 파일에 걸리므로, 앱이 도는 중에 잠금 파일을 지우거나 바꾸면 다음 boot 가 새 파일을 잠가 이중 실행을 막지 못한다. 잠금 파일이 링크거나 정규 파일이 아니면 exit 5 다.
+- boot 는 Windows 에서 검증하지 않았다. `fcntl` 이 없으면 exit 64 다.
 
 ### 복제 헬스
 
@@ -496,7 +563,7 @@ urlpatterns = [
 | `backlog` | `db_not_replicated` | `-wal` 에 최신 L0 뒤의 커밋이 `BACKLOG_GRACE` 이상 남아 있음(또는 WAL 근거가 없을 때 파일 시각이 그만큼 L0 보다 새로움). `litestream replicate` 가 죽었거나 멈췄을 수 있다 |
 | `unknown` | `no_wal_evidence` | `-wal` 로 판정할 수 없음: `-wal` 이 없거나(마지막 연결이 닫혀 지워짐) 비었음, L0 이후 WAL 이 다시 시작됐는데 아직 커밋이 없음 등. **이때는 `caught_up` 으로 단정하지 않는다** |
 | `unknown` | `file_time_backwards` | WAL 근거가 없는데 DB·`-wal`·L0 의 파일 시각이 앞선 관측보다 뒤로 감(시계 변경 등) |
-| `unknown` | `remote_error` · `remote_empty` · `no_local_meta` · `remote_ahead` · `unknown_at_boot` · `path_not_real` · `not_file_db` · `refresh_failed` · `not_checked` · `stale` | 판정할 수 없음: 원격 조회 실패, 복제본이 빈 목록(경로·prefix 오타와 구분되지 않는다), 로컬 메타 없음(`litestream replicate` 가 돌지 않음), **복제본이 로컬보다 앞섬**(다른 기계가 같은 복제본에 쓰는 중일 수 있다), 부팅 상태 파일의 `unknown_at_boot`(boot 가 `--on-unknown keep-local` 로 진행함), 경로 규칙 위반(D-15, 아래), 파일 DB 가 아님, 갱신 중 예외, 아직 첫 조회 전, 마지막 결과가 `REFRESH × 3` 보다 오래됨(갱신 스레드가 멈춤) |
+| `unknown` | `remote_error` · `remote_empty` · `no_local_meta` · `remote_ahead` · `unknown_at_boot` · `path_not_real` · `not_file_db` · `refresh_failed` · `not_checked` · `stale` | 판정할 수 없음: 원격 조회 실패, 복제본이 빈 목록(경로·prefix 오타와 구분되지 않는다), 로컬 메타 없음(`litestream replicate` 가 돌지 않음), **복제본이 로컬보다 앞섬**(다른 기계가 같은 복제본에 쓰는 중일 수 있다), 부팅 상태 파일의 `unknown_at_boot`(boot 가 `--on-unknown keep-local` 로 진행함), [경로 규칙](#경로-규칙) 위반, 파일 DB 가 아님, 갱신 중 예외, 아직 첫 조회 전, 마지막 결과가 `REFRESH × 3` 보다 오래됨(갱신 스레드가 멈춤) |
 
 `local_ahead` 의 backlog 시간은 **처음 관측한 미업로드 로컬 TXID 가 원격에 올라가기까지 기다린 시간**이다. 가장 오래된 미업로드 커밋의 엄밀한 나이나 로컬·원격의 총 격차가 아니다.
 
@@ -521,7 +588,7 @@ urlpatterns = [
 - **`ATOMIC_REQUESTS` 를 켠 별칭이 있어도 헬스 요청은 트랜잭션으로 감싸지 않는다.** Django 는 감싸려고 뷰 실행 전에 연결을 연다(그러면 DB 파일이 생길 수 있다). `health_view` 는 모든 별칭에서 빠지도록 표시돼 있다. 헬스 뷰를 다른 데코레이터로 감쌀 때는 `functools.wraps` 로 이 표시(`_non_atomic_requests`)를 옮긴다.
 - **"마지막 업로드 시각"은 쓰지 않는다.** 쓰기가 없는 정상 DB 도 업로드 시각은 오래되기 때문이다.
 - 부팅 상태 파일 `<db>.boot-state.json`([boot CLI](#boot-cli)가 씀)을 `boot_state` 로 보여 준다. 파일이 없거나 형식이 틀리면 `boot_state_error` 에 그 사실만 적고 상태는 바꾸지 않는다(boot 를 쓰지 않는 배포도 있다). `unknown_at_boot` 가 참이면 다음 정상 부팅까지 `unknown` 이다.
-- DB 경로는 Django 가 실제로 여는 경로(`OPTIONS["database"]` 포함, [`sqlite_doctor`](#sqlite_doctor)와 같은 방식)다. **boot 와 같은 실제 경로 규칙(D-15)**을 따른다: 부모 경로에 심볼릭 링크·`..` 가 있거나 DB 파일 자체가 링크면 그 별칭은 `unknown` 이다. `meta_path` 도 같다(`..` 를 접지 않고 쓴 그대로 검사한다. 상대 경로는 작업 디렉터리만 앞에 붙인다). Litestream 설정의 `dbs[].path` 도 같은 실제 경로여야 한다.
+- DB 경로는 Django 가 실제로 여는 경로(`OPTIONS["database"]` 포함, [`sqlite_doctor`](#sqlite_doctor)와 같은 방식)다. boot 와 같은 [경로 규칙](#경로-규칙)을 따른다: 부모 경로에 심볼릭 링크·`..` 가 있거나 DB 파일 자체가 링크면 그 별칭은 `unknown`(`path_not_real`)이다. `meta_path` 도 같다(`..` 를 접지 않고 쓴 그대로 검사한다. 상대 경로는 작업 디렉터리만 앞에 붙인다).
 - 설정이 잘못되면 `manage.py check` 가 `sqlite_ops.E002` 를 내고, 뷰는 `unknown` 과 사유를 돌려준다.
 
 **HTTP 상태는 항상 200 이다.** 헬스 엔드포인트를 로드밸런서의 헬스 체크로 쓰면, 복제가 뒤처지거나 S3 가 끊겼다는 이유로 앱이 서비스에서 빠진다. 복제 지연은 데이터 손실 위험이지 요청을 못 받는 상태가 아니므로 앱을 내리면 안 된다. 모니터링은 **본문의 `status`** 로 알람을 건다(`backlog` 나 `unknown` 이 몇 분 이어지면 경보). HTTP 코드로만 판정할 수 있는 모니터를 쓴다면 `?strict=1` 을 붙인다. 그러면 `caught_up` 이 아닐 때 503 이다. **로드밸런서 헬스 체크에는 `strict` 를 쓰지 않는다.**
@@ -537,21 +604,7 @@ LOGGING = {
 }
 ```
 
-헬스는 "지금 복제가 따라오는가"만 말한다. 복제본으로 실제 복구할 수 있는지는 주기적인 복원 검증으로 따로 본다(예정).
-
-### 배포 프로필
-
-배포 형태별로 프로세스 트리, 복사해 쓰는 설정 조각(`settings.py`·`urls.py`·`litestream.yml`·Dockerfile·`entrypoint.sh`·compose), 운영 절차, 함정을 한 문서에 모았다. 절차와 조각이 길어서 README 가 아니라 `docs/profiles/` 에 둔다.
-
-| 프로필 | 언제 | 채널 레이어 | 문서 |
-|---|---|---|---|
-| `single-server` | 머신 1대, 앱 프로세스 1개 | `InMemoryChannelLayer` | [docs/profiles/single-server.md](docs/profiles/single-server.md) |
-| `single-server-multiproc` | 머신 1대, 앱 프로세스 여럿 | channels-nats(추천) · channels_redis(호환) | [docs/profiles/single-server-multiproc.md](docs/profiles/single-server-multiproc.md) |
-
-- 두 프로필 모두 **쓰는 머신은 1대**다. 두 머신이 같은 복제본에 쓰면 나중 쪽이 경고 없이 이긴다. 배포는 정지 후 기동이다.
-- 프로세스 트리는 `boot`(잠금) → exec → `litestream replicate -exec "sh -c 'migrate && exec uvicorn ...'"` 다. litestream 이 PID 1 이다.
-- 한 번만 쓰는 boot 옵션(`--init-new`·`--adopt-existing`·`--on-unknown restore`)은 이미지에 굳히지 않고 `BOOT_FLAGS` 환경 변수로 넘긴 뒤 비운다.
-- `settings.py`·`urls.py` 조각은 테스트가 실행하고 `check --deploy` 를 통과하는지 본다. `litestream.yml` 은 실제 litestream 0.5.17 이 읽는지, `entrypoint.sh` 는 문법을 본다. Dockerfile·compose 의 컨테이너 종단 검증은 [#10](https://github.com/itda-work/django-sqlite-ops/issues/10) 회귀 랩에서 할 예정이다.
+헬스는 "지금 복제가 따라오는가"만 말한다. 복제본으로 실제 복구할 수 있는지는 주기적인 복원 검증(`sqlite_doctor --restore-test`)으로 따로 본다. 이 검증은 **예정(2단계)**이고 아직 없다([DESIGN §7](docs/DESIGN.md#7-헬스)).
 
 ### channels-lite 패치
 
@@ -627,16 +680,77 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 - 패치는 프로세스마다 적용된다. 워커·ASGI 서버 프로세스가 모두 같은 설정을 읽어야 한다.
 - 새 DB 에 여러 연결이 동시에 처음 `journal_mode=WAL` 로 바꾸면 그중 일부가 `database is locked` 로 실패할 수 있다(원인 미확정 — `busy_timeout` 을 먼저 걸어도 재현됨, 리뷰 대조 실험). channels-lite 는 연결마다 기본 `init_command` 로 `PRAGMA journal_mode=WAL` 을 실행하므로(0.4.0 `channels_lite/layers/aio.py:50-58`), 새 채널 DB 에 여러 프로세스가 동시에 처음 붙을 때 생긴다(테스트 준비에서 재현, #8). 배포 때 `migrate` 직후 채널 DB 를 미리 `PRAGMA journal_mode=WAL` 로 바꿔 둔다. 이 패치가 고치는 문제는 아니다.
 
+## 배포 프로필
+
+배포 형태별로 프로세스 트리, 복사해 쓰는 설정 조각(`settings.py`·`urls.py`·`litestream.yml`·Dockerfile·`entrypoint.sh`·compose), 운영 절차, 함정을 한 문서에 모았다. 절차와 조각이 길어서 README 가 아니라 `docs/profiles/` 에 둔다.
+
+| 프로필 | 언제 | 채널 레이어 | 문서 |
+|---|---|---|---|
+| `single-server` | 머신 1대, 앱 프로세스 1개 | `InMemoryChannelLayer` | [docs/profiles/single-server.md](docs/profiles/single-server.md) |
+| `single-server-multiproc` | 머신 1대, 앱 프로세스 여럿 | channels-nats(추천) · channels_redis(호환) | [docs/profiles/single-server-multiproc.md](docs/profiles/single-server-multiproc.md) |
+
+- 두 프로필 모두 **쓰는 머신은 1대**다. 두 머신이 같은 복제본에 쓰면 나중 쪽이 경고 없이 이긴다. 배포는 정지 후 기동이다.
+- 프로세스 트리는 `boot`(잠금) → exec → `litestream replicate -exec "sh -c 'migrate && exec uvicorn ...'"` 다. litestream 이 PID 1 이다.
+- 한 번만 쓰는 boot 옵션(`--init-new`·`--adopt-existing`·`--on-unknown restore`)은 이미지에 굳히지 않고 `BOOT_FLAGS` 환경 변수로 넘긴 뒤 비운다.
+- `settings.py`·`urls.py` 조각은 테스트가 실행하고 `check --deploy` 를 통과하는지 본다. `litestream.yml` 은 실제 litestream 0.5.17 이 읽는지, `entrypoint.sh` 는 문법을 본다. Dockerfile·compose 의 컨테이너 종단 검증은 [#10](https://github.com/itda-work/django-sqlite-ops/issues/10) 회귀 랩에서 할 예정이다.
+
 ## 문제 해결
 
-- **`options={"timeout": ...}` 을 줬는데 대기 시간이 그대로다.** `busy_timeout`(밀리초)이 `timeout`(초)보다 우선한다. 위 [`timeout` 과 `busy_timeout`](#timeout-과-busy_timeout) 을 본다.
-- **DB 파일 옆에 `-wal`, `-shm` 파일이 생긴다.** WAL 모드의 정상 동작이다. 연결이 열려 있는 동안 커밋된 내용 일부가 `-wal` 에만 있을 수 있으므로, DB 파일을 복사·백업할 때 `.sqlite3` 파일만 따로 옮기지 않는다.
-- **`ValueError: ... use pragmas={...} instead`** — `options` 에 `init_command` 를 넣었다. PRAGMA 는 `pragmas` 로 준다.
-- **`manage.py check` 에 `sqlite_ops.*` 가 안 나온다.** `INSTALLED_APPS` 에 `"django_sqlite_ops"` 가 있는지, W001·W002 라면 `--deploy` 를 붙였는지 본다.
+흩어진 함정을 증상 → 원인 → 대처로 모았다. 자세한 설명은 각 절이 정본이고 여기서는 링크만 단다. 근거는 **재현함**(이 저장소의 테스트·실측에서 다시 일으킴), **코드상 확인**(구현을 읽어 확인), **실측**(`docs/research/` 의 측정)으로 구분한다.
 
-설계서: [`docs/DESIGN.md`](docs/DESIGN.md) · 결정: [`docs/DECISIONS.md`](docs/DECISIONS.md) · 근거: [`docs/research/`](docs/research/)
+### 설정·체크
+
+| 증상 | 원인 | 대처 | 근거 |
+|---|---|---|---|
+| `options={"timeout": 20}` 을 줬는데 잠금 대기가 5초다 | Django 는 연결을 연 뒤 `init_command` 를 실행하므로 `PRAGMA busy_timeout=5000`(밀리초)이 `timeout`(초)을 덮는다 | `pragmas={"busy_timeout": 20000}`([`timeout` 과 `busy_timeout`](#timeout-과-busy_timeout)) | 재현함(연결 뒤 `PRAGMA busy_timeout` 이 5000) |
+| `ValueError: options['init_command'] conflicts with the generated PRAGMAs; use pragmas={...} instead` | `options` 에 `init_command` 를 넣었다 | PRAGMA 는 `pragmas=` 로 준다([거부되는 입력](#거부되는-입력)) | 코드상 확인(`database.py`) |
+| DB 파일 옆에 `-wal`·`-shm` 이 생긴다 | WAL 모드의 정상 동작. 연결이 열린 동안 커밋 일부는 `-wal` 에만 있다 | 복사·백업할 때 DB 파일만 따로 옮기지 않는다 | 재현함(`tests/test_readme.py` 가 연결 중 두 파일을 확인) |
+| `manage.py check` 에 `sqlite_ops.*` 가 안 나온다 | 앱이 `INSTALLED_APPS` 에 없다. W001·W002·W004 는 `--deploy` 일 때만 나온다 | 앱을 넣고 `check --deploy` 로 돌린다([시스템 체크](#시스템-체크)) | 코드상 확인(`checks.py`) |
+
+### 진단(`sqlite_doctor`)
+
+| 증상 | 원인 | 대처 | 근거 |
+|---|---|---|---|
+| doctor 를 돌린 뒤 `-wal`·`-shm` 이 생기거나 `journal_mode` 가 바뀌었다 | doctor 는 실제로 연결하므로 `init_command` 가 실행되고, WAL DB 는 연결만 해도 사이드카가 생긴다 | 운영 DB 에서 돈다는 것을 알고 실행한다([주의](#sqlite_doctor)) | 재현함 |
+| 읽기 전용 별칭(`mode=ro`)이 `unknown` 이다 | WAL DB 는 읽기 전용 연결도 `-shm` 에 쓰고 `-wal` 을 만들 수 있어 연결하지 않는다 | 같은 파일의 쓰기 별칭이나 `immutable=1` URI 별칭으로 진단한다([주의](#sqlite_doctor)) | 재현함 |
+| DB 파일이 없다는 `error` | 없는 파일에 연결하면 SQLite 가 빈 DB 를 만들어 다음 boot 의 복원을 막으므로 연결하지 않는다 | 경로를 확인하거나 boot 로 먼저 복원한다 | 코드상 확인(`doctor.py`) |
+
+### boot
+
+| 증상 | 원인 | 대처 | 근거 |
+|---|---|---|---|
+| 첫 배포에서 exit 2, `no_replica_no_local` | Litestream 은 복제본 경로·prefix 오타와 "복제본 없음"을 똑같이 rc 0·`[]` 로 돌려준다 | 경로를 확인하고 `--init-new` 를 한 번만([생애 첫 배포](#생애-첫-배포---init-new-를-한-번-쓰고-끈다)) | 재현함(Litestream 0.5.17, #3) |
+| exit 2, `remote_error` 이고 사유에 `timed out` (평문 HTTP S3 호환 서버) | `endpoint` 에 스킴이 없으면 Litestream 이 HTTPS 로 접속해 끝없이 기다리고, boot 가 `--ltx-timeout`(기본 30초)에서 끊는다 | `endpoint: http://…` 로 스킴을 붙인다 | 재현함(평범한 HTTP 서버로) |
+| exit 2, `remote_error` 이고 사유에 `database not found in config` | `--db` 가 `litestream.yml` 의 `path` 와 다르다 | 세 곳을 같은 실제 경로로([경로 규칙](#경로-규칙)) | 재현함(fixture `ltx_db_not_in_config`) |
+| exit 64, 실제 경로 안내 | `--db`·`--meta-path` 의 부모에 심볼릭 링크·`..`·없는 디렉터리 | 안내된 실제 경로를 쓰고, 이미지에서 부모 디렉터리를 만든다([경로 규칙](#경로-규칙)) | 코드상 확인([D-15](docs/DECISIONS.md)) |
+| exit 5 | 같은 볼륨에서 boot 나 그것이 exec 한 앱이 이미 돈다(잠금은 exec 된 명령에 상속) | 앞선 컨테이너를 멈춘다. `<db>.boot.lock` 은 지우지 않는다([함정](#boot-cli)) | 코드상 확인 |
+| 옛 볼륨으로 다시 띄우자 exit 2, `remote_ahead` | 복제본이 이 볼륨보다 새롭다. 보호가 없으면 최신본이 옛 볼륨으로 덮인다 | 복제본이 정본이면 `--on-unknown restore` 로 한 번([사유 코드별 대처](#거부됐을-때-exit-2-사유-코드별-대처)) | 실측(docker D4: 150건이 55건으로 덮임) |
+| 복원 직후 컨테이너가 죽은 뒤 exit 2, `no_local_meta` | 복원한 DB 옆에는 Litestream 메타가 없고 `replicate` 가 첫 변경을 기록해야 생긴다 | `--on-unknown restore` 로 한 번([복원 직후 크래시 복구](#복원-직후-크래시-복구)) | 실측(restore 결과에 메타 없음), [D-14](docs/DECISIONS.md) |
+| 직접 만든 entrypoint 의 `litestream restore -if-db-not-exists` 가 복원을 건너뛴다 | 0바이트 DB 파일이 있으면 rc 0 으로 건너뛴다 | boot 를 쓴다. `manage.py` 를 boot 앞에서 부르지 않는다([boot CLI](#boot-cli)) | 재현함([DESIGN §4-1](docs/DESIGN.md#4-1-왜-django-관리-명령이-아닌가)) |
+
+### 복제·헬스
+
+| 증상 | 원인 | 대처 | 근거 |
+|---|---|---|---|
+| S3 가 끊겼는데 Litestream 로그·`status`·메트릭이 조용하다 | Litestream 은 업로드 실패를 드러내지 않는다 | 헬스 본문 `status` 로 알람을 건다([복제 헬스](#복제-헬스)) | 실측([docker D3](docs/research/litestream-django-docker.md#d3-관측-조용한-실패-위험)) |
+| 배포 직후 헬스가 `unknown`(`not_checked`) | 갱신 스레드는 첫 헬스 요청 때 시작한다 | `REFRESH`(기본 15초) 뒤 다시 본다 | 코드상 확인(`health.py`) |
+| 헬스가 `backlog` 인데 HTTP 200 이다 | 설계상 항상 200 이다. 복제 지연으로 로드밸런서가 앱을 빼면 안 된다 | 본문 `status` 로 알람. HTTP 코드만 보는 모니터는 `?strict=1`(로드밸런서에는 쓰지 않는다) | 코드상 확인(`health.py`) |
+| 헬스가 `unknown`(`no_wal_evidence`) | `-wal` 이 없거나 비어 WAL 위치로 판정할 수 없다. Litestream 이 돌면 `-wal` 이 남는다 | `litestream replicate` 가 도는지 본다 | 코드상 확인(`health.py`) |
+| 헬스가 `unknown`(`remote_ahead`) | 복제본이 로컬보다 앞섰다. 다른 머신이 같은 복제본에 쓰는 중일 수 있다 | 쓰는 머신이 1대인지 확인한다. 두 머신이 쓰면 나중 쪽이 경고 없이 이긴다 | 실측(scenarios S2b) |
+| 헬스가 계속 `unknown`(`unknown_at_boot`) | boot 가 `--on-unknown keep-local` 로 진행했다 | 원인을 푼 뒤 옵션 없이 다시 부팅한다 | 코드상 확인(`health.py`) |
+
+### 채널 레이어
+
+| 증상 | 원인 | 대처 | 근거 |
+|---|---|---|---|
+| 워커를 늘렸더니 `group_send` 가 다른 워커의 클라이언트에 닿지 않는다 | `InMemoryChannelLayer` 는 프로세스 안에서만 전한다. doctor 는 프로필이 `single-server-multiproc` 일 때만 경고한다 | [`single-server-multiproc`](docs/profiles/single-server-multiproc.md) 과 channels-nats 를 쓴다. `SQLITE_OPS["PROFILE"]` 을 배포 형태와 맞춘다 | 코드상 확인(`doctor.py`) |
+| channels-lite aio 레이어에서 한 메시지가 두 수신자에게 배달된다 | 선점 성공을 누적 `total_changes` 로 판정한다 | `SQLITE_OPS["PATCH_CHANNELS_LITE_AIO"] = True`([channels-lite 패치](#channels-lite-패치)) | 재현함(#8) |
+| 새 채널 DB 에 여러 프로세스가 처음 붙을 때 `database is locked` | 여러 연결이 동시에 처음 `journal_mode=WAL` 로 바꾸면 일부가 실패한다(원인 미확정) | `migrate` 직후 채널 DB 를 미리 WAL 로 바꿔 둔다 | 재현함(#8) |
+| HTTP 는 되는데 웹소켓 연결이 안 된다 | `uvicorn` 만 설치하면 웹소켓 구현이 없다 | `uvicorn[standard]` 를 설치한다([single-server §3](docs/profiles/single-server.md#dockerfile)) | 출처(uvicorn 0.54.0 메타데이터) |
 
 ## 개발
+
+설계서: [`docs/DESIGN.md`](docs/DESIGN.md) · 결정: [`docs/DECISIONS.md`](docs/DECISIONS.md) · 근거: [`docs/research/`](docs/research/) · 이슈: [GitHub Issues](https://github.com/itda-work/django-sqlite-ops/issues)
 
 ```bash
 uv venv && uv pip install -e . --group dev
