@@ -634,6 +634,39 @@ NAME_TABLE = [
         ([W004], "delete"),
         ([W004], "delete"),
     ),
+    # 디코딩 뒤 NUL 이 든 키·값·파일명 (리뷰 3): SQLite 는 NUL 앞까지만 읽으므로 역할 키가 숨는다
+    (
+        "file:{base}/n1.sqlite3?mode%00ignored=ro",
+        "n1.sqlite3",
+        False,
+        ([W004], "delete"),
+        ([W004], READONLY),
+    ),
+    (
+        "file:{base}/n2.sqlite3?mode%00=ro",
+        "n2.sqlite3",
+        False,
+        ([W004], "delete"),
+        ([W004], READONLY),
+    ),
+    (
+        "file:{base}/n3.sqlite3?immutable%00ignored=0&immutable=1",
+        "n3.sqlite3",
+        False,
+        ([W004], "delete"),
+        ([W004], "wal"),
+    ),
+    (
+        "file:{base}/n4.sqlite3?mode=memory&mode%00ignored=rwc",
+        None,
+        False,
+        ([W004], "delete"),
+        ([W004], "wal"),
+    ),
+    ("file:{base}/n5.sqlite3?cache%00x=shared", None, False, ([W004], "delete"), ([W004], "wal")),
+    ("file:{base}/n6%00x.sqlite3", None, False, ([W004], "delete"), ([W004], "wal")),
+    # URI 가 아닌 일반 경로의 "%00" 은 글자 그대로다: 쓰기 DB
+    ("{base}/p%00.sqlite3", None, False, ([W001, W002], "delete"), ([], "wal")),
     (
         "file:{base}/d9.sqlite3?vfs=litestream&vfs=unix",
         "d9.sqlite3",

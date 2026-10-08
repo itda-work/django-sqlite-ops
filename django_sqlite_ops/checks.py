@@ -111,6 +111,12 @@ def _role(name: Any) -> tuple[str, str | None]:
     if uri is None:
         return "write", None
     path, query = uri
+    # SQLite 는 디코딩된 NUL 앞까지만 읽는다. 역할 키가 숨을 수 있으니 어느 키든 판정하지 않는다
+    if "\0" in path:
+        return "unknown", "the decoded file name contains NUL (%00)"
+    for key, values in query.items():
+        if "\0" in key or any("\0" in value for value in values):
+            return "unknown", f"query key {key!r} or its value contains NUL (%00)"
     for key in _ROLE_KEYS:
         if len(query.get(key, [])) > 1:
             return "unknown", f"query key {key!r} is given more than once"
@@ -255,8 +261,9 @@ def check_deploy_settings(app_configs=None, **kwargs):
                     f"Cannot determine the role of database {alias!r} (write, read-only, "
                     f"memory or Litestream VFS) from its NAME: {reason}.",
                     hint=(
-                        "Give each URI query key (mode, immutable, vfs) once, in standard form: "
-                        "mode=ro|rw|rwc|memory, immutable=1|0, vfs=<name> (DESIGN §6-1)."
+                        "Rewrite NAME as a standard URI: no %00, each query key (mode, "
+                        "immutable, vfs) once, mode=ro|rw|rwc|memory, immutable=1|0, "
+                        "vfs=<name> (DESIGN §6-1)."
                     ),
                     obj=alias,
                     id="sqlite_ops.W004",

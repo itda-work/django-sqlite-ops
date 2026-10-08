@@ -310,7 +310,7 @@ python manage.py check --deploy   # W001·W002·W004 는 --deploy 일 때만 나
 | `sqlite_ops.W001` | `OPTIONS["transaction_mode"]` 가 `IMMEDIATE` 가 아님(없음 포함, 대소문자 무시) | `--deploy` | `sqlite_database()` 를 쓰거나 `"transaction_mode": "IMMEDIATE"` 를 넣는다 |
 | `sqlite_ops.W002` | `OPTIONS["init_command"]` 에서 `journal_mode` 가 `WAL` 로 설정되지 않음, 또는 `journal_mode` 를 언급하는 문장의 형식을 판정할 수 없음 | `--deploy` | `sqlite_database()` 를 쓰거나 `init_command` 에 `PRAGMA journal_mode=WAL` 을 넣는다 |
 | `sqlite_ops.W003` | 이름이 Litestream VFS(`vfs=litestream` 이 든 `file:` URI)인 별칭의 `CONN_MAX_AGE` 가 `None` 이 아님, `ASGI_APPLICATION` 미설정(WSGI) | 항상 | 그 별칭에 `"CONN_MAX_AGE": None`. WSGI 실측에서 요청당 1,008ms → 1.7ms |
-| `sqlite_ops.W004` | `NAME` 의 URI 로 별칭 역할(쓰기·읽기 전용·메모리·VFS)을 판정할 수 없음. 이때 W001·W002 는 내지 않는다 | `--deploy` | URI 쿼리 키 `mode`·`immutable`·`vfs` 를 한 번씩, 표준 표기(`mode=ro\|rw\|rwc\|memory`, `immutable=1\|0`)로 쓴다 |
+| `sqlite_ops.W004` | `NAME` 의 URI 로 별칭 역할(쓰기·읽기 전용·메모리·VFS)을 판정할 수 없음. 이때 W001·W002 는 내지 않는다 | `--deploy` | `%00` 을 빼고, URI 쿼리 키 `mode`·`immutable`·`vfs` 를 한 번씩, 표준 표기(`mode=ro\|rw\|rwc\|memory`, `immutable=1\|0`)로 쓴다 |
 
 - 기준값은 `sqlite_database()` 와 같은 권장값 표에서 읽는다. 프로필은 `SQLITE_OPS["PROFILE"]` 이고 없으면 `"single-server"` 다.
 - `sqlite_database()` 로 만든 설정은 경고가 없다(W003 은 VFS 별칭에 `CONN_MAX_AGE` 를 따로 줘야 한다).
@@ -320,7 +320,7 @@ python manage.py check --deploy   # W001·W002·W004 는 --deploy 일 때만 나
   - 메모리 DB — `:memory:`, 파일명이 정확히 `:memory:` 인 URI(`file::memory:`, `file::memory:?cache=shared`), `mode=memory`: WAL 이 의미 없어 W002 를 건너뛴다. `file::memory:backup.sqlite3` 는 실제 파일이라 검사한다.
   - 읽기 전용 — `mode=ro`, `immutable` 참값(`1`·`yes`·`true`·`on`, 대소문자 무시): W001·W002 를 건너뛴다. 읽기 전용 연결에 `PRAGMA journal_mode=WAL` 을 넣으면 `attempt to write a readonly database` 로 연결이 깨지거나(`mode=ro`) 아무 효과가 없다(`immutable`). `immutable` 거짓값(`0`·`no`·`false`·`off`)은 쓰기 DB 다.
   - Litestream VFS(`vfs=litestream`): W001·W002 를 건너뛴다. W003 은 그대로 본다.
-  - **판정할 수 없음 → W004** — `mode`·`immutable`·`vfs` 가 두 번 이상 나오거나(`mode=rwc&mode=ro`), `mode` 가 `ro`·`rw`·`rwc`·`memory` 가 아니거나(`mode=RO`, `mode=ro%00x`), `immutable` 이 위 불리언 표기가 아닐 때(`immutable=2`). 이때는 W001·W002 를 내지 않는다. SQLite 는 중복 키를 순서에 따라 다르게 해석해서(`mode=rwc&mode=ro` 는 읽기 전용, `mode=ro&mode=rwc` 는 연결 오류) 쓰기 권고를 따르면 연결이 깨질 수 있기 때문이다. W004 는 쓰기 설정을 넣어도 사라지지 않는다. 쿼리 키를 한 번씩, 표준 표기로 고쳐 쓴다.
+  - **판정할 수 없음 → W004** — `mode`·`immutable`·`vfs` 가 두 번 이상 나오거나(`mode=rwc&mode=ro`), `mode` 가 `ro`·`rw`·`rwc`·`memory` 가 아니거나(`mode=RO`, `mode=ro%00x`), `immutable` 이 위 불리언 표기가 아닐 때(`immutable=2`), 디코딩한 파일명이나 쿼리 키·값에 NUL(`%00`)이 있을 때(`mode%00x=ro` — SQLite 는 NUL 앞까지만 읽어 역할 키가 숨는다. URI 가 아닌 일반 경로의 `%00` 은 글자 그대로라 해당 없다). 이때는 W001·W002 를 내지 않는다. SQLite 는 중복 키를 순서에 따라 다르게 해석해서(`mode=rwc&mode=ro` 는 읽기 전용, `mode=ro&mode=rwc` 는 연결 오류) 쓰기 권고를 따르면 연결이 깨질 수 있기 때문이다. W004 는 쓰기 설정을 넣어도 사라지지 않는다. 쿼리 키를 한 번씩, 표준 표기로 고쳐 쓴다.
 - W003 은 ASGI 에서는 내지 않는다. ASGI 의 영속 연결은 아직 재지 않았고, Django 는 async 에서 영속 연결을 끄라고 권한다.
 - 경고를 끄려면 Django 표준 `SILENCED_SYSTEM_CHECKS` 를 쓴다. 이 앱의 체크만 돌리려면 `check --tag sqlite_ops`.
 
