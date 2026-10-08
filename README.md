@@ -15,7 +15,7 @@ PyPI 배포 전이다([D-4·D-9](docs/DECISIONS.md)). 패키지 이름 `django-s
 | [복제 헬스](#복제-헬스) | 구현됨 | [#7](https://github.com/itda-work/django-sqlite-ops/issues/7) |
 | [channels-lite 패치](#channels-lite-패치) | 구현됨 | [#8](https://github.com/itda-work/django-sqlite-ops/issues/8) |
 | [배포 프로필 문서](#배포-프로필) | 구현됨 | [#9](https://github.com/itda-work/django-sqlite-ops/issues/9) |
-| 회귀 랩(Docker 로 실패 경계 L1–L8 재현, PRAGMA 벤치) | 예정 | [#10](https://github.com/itda-work/django-sqlite-ops/issues/10) |
+| 회귀 랩(Docker 로 실패 경계 L1–L8 재현, 프로필 Dockerfile·compose 종단 검증, PRAGMA 벤치). 수동 실행(`scripts/lab.sh`), 기본 CI 밖 | 구현됨 | [#10](https://github.com/itda-work/django-sqlite-ops/issues/10) · [lab/README.md](lab/README.md) · [결과](docs/research/lab-2026-10-08.md) |
 | 복원 검증 `sqlite_doctor --restore-test` | 예정(2단계) | [DESIGN §7](docs/DESIGN.md#7-헬스) |
 | VFS 읽기 복제본용 DB 라우터 | 예정(2단계) | [DESIGN §3-2](docs/DESIGN.md#3-2-2단계-이후) |
 
@@ -144,7 +144,7 @@ curl -s http://127.0.0.1:8000/internal/sqlite-health   # 본문 status 가 caugh
 | `synchronous` | `NORMAL` | WAL 에서 쓰기 비용을 줄인다. 체크포인트 전에 전원이 나가면 마지막 트랜잭션이 빠질 수 있다 |
 | `busy_timeout` | `5000` (밀리초) | 잠금을 만나면 바로 실패하지 않고 5초 기다린다. Python `sqlite3` 의 `timeout` 기본 5초와 같은 값 |
 
-건드리지 않는 것: `foreign_keys` 는 Django 가 이미 켠다. `wal_autocheckpoint` 는 Litestream 이 체크포인트를 관리하므로 바꾸지 않는다. `temp_store`, `mmap_size`, `cache_size`, `journal_size_limit` 는 측정 전이라 기본값이 아니다. 필요하면 `pragmas` 로 직접 켠다.
+건드리지 않는 것: `foreign_keys` 는 Django 가 이미 켠다. `wal_autocheckpoint` 는 Litestream 이 체크포인트를 관리하므로 바꾸지 않는다. `temp_store`, `mmap_size`, `cache_size`, `journal_size_limit` 는 기본값이 아니다. 회귀 랩 벤치에서 개선이 반복해서 재현된 것이 없고, `cache_size=-65536` 만 켜면 오히려 처리량·p99 가 반복해서 나빠졌다(`CONN_MAX_AGE` 기본 0, [결과](docs/research/lab-2026-10-08.md#pragma-벤치)). 필요하면 `pragmas` 로 직접 켜고 자기 부하로 잰다.
 
 #### 프로필
 
@@ -692,7 +692,7 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 - 두 프로필 모두 **쓰는 머신은 1대**다. 두 머신이 같은 복제본에 쓰면 나중 쪽이 경고 없이 이긴다. 배포는 정지 후 기동이다.
 - 프로세스 트리는 `boot`(잠금) → exec → `litestream replicate -exec "sh -c 'migrate && exec uvicorn ...'"` 다. litestream 이 PID 1 이다.
 - 한 번만 쓰는 boot 옵션(`--init-new`·`--adopt-existing`·`--on-unknown restore`)은 이미지에 굳히지 않고 `BOOT_FLAGS` 환경 변수로 넘긴 뒤 비운다.
-- `settings.py`·`urls.py` 조각은 테스트가 실행하고 `check --deploy` 를 통과하는지 본다. `litestream.yml` 은 실제 litestream 0.5.17 이 읽는지, `entrypoint.sh` 는 문법을 본다. Dockerfile·compose 의 컨테이너 종단 검증은 [#10](https://github.com/itda-work/django-sqlite-ops/issues/10) 회귀 랩에서 할 예정이다.
+- `settings.py`·`urls.py` 조각은 테스트가 실행하고 `check --deploy` 를 통과하는지 본다. `litestream.yml` 은 실제 litestream 0.5.17 이 읽는지, `entrypoint.sh` 는 문법을 본다. Dockerfile·compose 는 회귀 랩이 문서 블록을 그대로 꺼내 빌드하고 띄워 종단 검증했다(첫 배포, `check --deploy`, `sqlite_doctor`, `docker stop` 시 exit 0·복제 400/400, 빈 볼륨 소유자 복사, 워커 2개 — [결과](docs/research/lab-2026-10-08.md)). multiproc 의 채널 레이어 런타임(channels-nats 메시지 전달)은 랩에서 재지 않았다.
 
 ## 문제 해결
 
@@ -721,10 +721,11 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 |---|---|---|---|
 | 첫 배포에서 exit 2, `no_replica_no_local` | Litestream 은 복제본 경로·prefix 오타와 "복제본 없음"을 똑같이 rc 0·`[]` 로 돌려준다 | 경로를 확인하고 `--init-new` 를 한 번만([생애 첫 배포](#생애-첫-배포---init-new-를-한-번-쓰고-끈다)) | 재현함(Litestream 0.5.17, #3) |
 | exit 2, `remote_error` 이고 사유에 `timed out` (평문 HTTP S3 호환 서버) | `endpoint` 에 스킴이 없으면 Litestream 이 HTTPS 로 접속해 끝없이 기다리고, boot 가 `--ltx-timeout`(기본 30초)에서 끊는다 | `endpoint: http://…` 로 스킴을 붙인다 | 재현함(평범한 HTTP 서버로) |
+| S3 가 내려가 연결을 거부하는데 boot 가 30초 걸려 exit 2, `remote_error`(사유 `timed out`) | Litestream 0.5.17 의 `ltx` 는 연결 거부에도 곧바로 실패하지 않고 재시도하며 기다린다 | S3 를 복구한 뒤 다시 띄운다. 더 빨리 거부하려면 `--ltx-timeout` 을 줄인다 | 재현함(회귀 랩 L4: toxiproxy 로 끊음 → 30.5초) |
 | exit 2, `remote_error` 이고 사유에 `database not found in config` | `--db` 가 `litestream.yml` 의 `path` 와 다르다 | 세 곳을 같은 실제 경로로([경로 규칙](#경로-규칙)) | 재현함(fixture `ltx_db_not_in_config`) |
 | exit 64, 실제 경로 안내 | `--db`·`--meta-path` 의 부모에 심볼릭 링크·`..`·없는 디렉터리 | 안내된 실제 경로를 쓰고, 이미지에서 부모 디렉터리를 만든다([경로 규칙](#경로-규칙)) | 코드상 확인([D-15](docs/DECISIONS.md)) |
 | exit 5 | 같은 볼륨에서 boot 나 그것이 exec 한 앱이 이미 돈다(잠금은 exec 된 명령에 상속) | 앞선 컨테이너를 멈춘다. `<db>.boot.lock` 은 지우지 않는다([함정](#boot-cli)) | 코드상 확인 |
-| 옛 볼륨으로 다시 띄우자 exit 2, `remote_ahead` | 복제본이 이 볼륨보다 새롭다. 보호가 없으면 최신본이 옛 볼륨으로 덮인다 | 복제본이 정본이면 `--on-unknown restore` 로 한 번([사유 코드별 대처](#거부됐을-때-exit-2-사유-코드별-대처)) | 실측(docker D4: 150건이 55건으로 덮임) |
+| 옛 볼륨으로 다시 띄우자 exit 2, `remote_ahead` | 복제본이 이 볼륨보다 새롭다. 보호가 없으면 최신본이 옛 볼륨으로 덮인다 | 복제본이 정본이면 `--on-unknown restore` 로 한 번([사유 코드별 대처](#거부됐을-때-exit-2-사유-코드별-대처)) | 실측(docker D4: 150건이 55건으로 덮임), 재현함(회귀 랩 L2: boot 가 exit 2 로 막고 복제본 무변경) |
 | 복원 직후 컨테이너가 죽은 뒤 exit 2, `no_local_meta` | 복원한 DB 옆에는 Litestream 메타가 없고 `replicate` 가 첫 변경을 기록해야 생긴다 | `--on-unknown restore` 로 한 번([복원 직후 크래시 복구](#복원-직후-크래시-복구)) | 실측(restore 결과에 메타 없음), [D-14](docs/DECISIONS.md) |
 | 직접 만든 entrypoint 의 `litestream restore -if-db-not-exists` 가 복원을 건너뛴다 | 0바이트 DB 파일이 있으면 rc 0 으로 건너뛴다 | boot 를 쓴다. `manage.py` 를 boot 앞에서 부르지 않는다([boot CLI](#boot-cli)) | 재현함([DESIGN §4-1](docs/DESIGN.md#4-1-왜-django-관리-명령이-아닌가)) |
 
@@ -733,6 +734,7 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 | 증상 | 원인 | 대처 | 근거 |
 |---|---|---|---|
 | S3 가 끊겼는데 Litestream 로그·`status`·메트릭이 조용하다 | Litestream 은 업로드 실패를 드러내지 않는다 | 헬스 본문 `status` 로 알람을 건다([복제 헬스](#복제-헬스)) | 실측([docker D3](docs/research/litestream-django-docker.md#d3-관측-조용한-실패-위험)) |
+| S3 가 통째로 끊긴 동안 헬스가 `backlog` 가 아니라 `unknown`(`stale` 또는 `remote_error`) | 헬스의 원격 조회도 같은 S3 로 간다. 조회가 타임아웃(30초)까지 매달리면 결과가 `REFRESH × 3` 보다 오래되어 `stale`, 끝나면 `remote_error` 다. 업로드만 끊기고 조회가 되면 `backlog`(`local_ahead`)다 | 둘 다 알람 대상으로 둔다(`caught_up` 이 아니면 경보) | 재현함(회귀 랩 L8a·L8b) |
 | 배포 직후 헬스가 `unknown`(`not_checked`) | 갱신 스레드는 첫 헬스 요청 때 시작한다 | `REFRESH`(기본 15초) 뒤 다시 본다 | 코드상 확인(`health.py`) |
 | 헬스가 `backlog` 인데 HTTP 200 이다 | 설계상 항상 200 이다. 복제 지연으로 로드밸런서가 앱을 빼면 안 된다 | 본문 `status` 로 알람. HTTP 코드만 보는 모니터는 `?strict=1`(로드밸런서에는 쓰지 않는다) | 코드상 확인(`health.py`) |
 | 헬스가 `unknown`(`no_wal_evidence`) | `-wal` 이 없거나 비어 WAL 위치로 판정할 수 없다. Litestream 이 돌면 `-wal` 이 남는다 | `litestream replicate` 가 도는지 본다 | 코드상 확인(`health.py`) |
@@ -759,4 +761,7 @@ uv run --no-sync pytest
 scripts/ci-local.sh                 # GitHub Actions CI 를 act 로 로컬 실행 (lint + 전체 매트릭스)
 scripts/ci-local.sh test 3.14 6.1   # 매트릭스 한 칸만
 scripts/ci-local.sh litestream      # 실제 litestream 바이너리 + channels-lite[aio]==0.4.0 으로 통합 테스트 (둘 중 하나가 없어 skip 되면 실패)
+
+scripts/lab.sh run all              # 회귀 랩 L1–L8·프로필 종단 검증 (Docker, 약 8분, 끝나면 down -v)
+scripts/lab.sh bench                # PRAGMA 벤치 (lab/README.md)
 ```

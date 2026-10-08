@@ -5,7 +5,8 @@
   (``CHANNEL_LAYERS`` 는 문자열로만 읽힌다).
 - ``litestream.yml`` 조각: 실제 litestream 의 ``litestream databases -config`` 가 읽어야 한다.
 - 셸 조각: ``bash -n``·``sh -n``.
-- compose 조각: YAML 구문만(컨테이너 종단 검증은 #10 회귀 랩).
+- compose 조각: YAML 구문만. Dockerfile·compose 의 컨테이너 종단 검증은 회귀 랩(lab/, #10)이
+  하고, 문서 블록에서 빌드 컨텍스트를 만드는 규칙은 tests/test_lab.py 가 본다.
 """
 
 import ast

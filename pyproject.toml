@@ -23,8 +23,8 @@ testpaths = ["tests"]
 [tool.ruff]
 target-version = "py313"
 line-length = 100
-# 스파이크 코드는 참고용이라 고치지 않는다 (docs/reference/README.md)
-extend-exclude = ["docs/reference"]
+# 스파이크 코드는 참고용이라 고치지 않는다 (docs/reference/README.md). lab/.build·.out 은 랩 생성물
+extend-exclude = ["docs/reference", "lab/.build", "lab/.out"]
 
 [tool.ruff.lint]
 select = ["E", "F", "I", "B", "UP"]

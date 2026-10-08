@@ -1,0 +1,20 @@
+# 배포 프로필 문서의 compose.yaml(그대로 lab/.build/compose.yaml)에 덮는 랩 설정.
+# 바꾸는 것: 이미지 이름(이미 빌드한 랩 이미지), 라벨, 호스트 포트(127.0.0.1 임의 포트 —
+# 문서의 8000:8000 은 다른 서비스와 겹칠 수 있다), 복제본 prefix, BOOT_FLAGS 주입.
+x-labels: &labels
+  io.itda.dso-lab: "1"
+
+services:
+  app:
+    image: dso-lab-app:${LAB_TAG:-dev}
+    pull_policy: never
+    labels: *labels
+    environment:
+      BOOT_FLAGS: ${BOOT_FLAGS:-}
+      LAB_PREFIX: ${LAB_PREFIX:-unset}
+      DJANGO_SETTINGS_MODULE: ${LAB_SETTINGS:-proj.settings}
+    ports: !override ["127.0.0.1::8000"]
+
+volumes:
+  appdata:
+    labels: *labels

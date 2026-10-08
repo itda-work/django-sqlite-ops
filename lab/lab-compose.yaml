@@ -1,0 +1,162 @@
+# 회귀 랩 기반 구성 (#10, DESIGN §10). scripts/lab.sh 가 lab/.build/ 로 복사해 쓴다.
+# 프로젝트 이름은 늘 -p 로 준다(dso-lab 또는 dso-lab-<suffix>). 이 호스트에는 다른 프로젝트의
+# 컨테이너가 있으므로, 모든 서비스·볼륨·네트워크에 io.itda.dso-lab=1 라벨을 붙이고 정리는
+# `docker compose -p <프로젝트> ... down -v --remove-orphans` 로만 한다.
+x-labels: &labels
+  io.itda.dso-lab: "1"
+
+# 시나리오용 앱. 배포 프로필 compose(lab/.build/compose.yaml)와 같은 이미지·env_file·
+# stop_grace_period 를 쓰고, 볼륨·boot 옵션·복제본 prefix 만 시나리오마다 바꾼다.
+# 종료 코드를 보려고 재시작하지 않는다.
+x-app: &app
+  image: dso-lab-app:${LAB_TAG:-dev}
+  pull_policy: never
+  profiles: [app]
+  labels: *labels
+  env_file: .env.litestream
+  environment: &app-env
+    BOOT_FLAGS: ${BOOT_FLAGS:-}
+    LAB_PREFIX: ${LAB_PREFIX:-unset}
+    LAB_HEALTH_REFRESH: ${LAB_HEALTH_REFRESH:-15}
+    LAB_HEALTH_GRACE: ${LAB_HEALTH_GRACE:-60}
+    LAB_HEALTH_CONFIG: ${LAB_HEALTH_CONFIG:-}
+    LAB_PRAGMAS: ${LAB_PRAGMAS:-}
+    LAB_RENAME_DELAY: ${LAB_RENAME_DELAY:-}
+    PYTHONPATH: ${LAB_PYTHONPATH:-}
+    DJANGO_SETTINGS_MODULE: ${LAB_SETTINGS:-proj.settings}
+  stop_grace_period: 30s
+  restart: "no"
+
+services:
+  s3:
+    image: chrislusf/seaweedfs:4.48@sha256:4e61d15fd35994cb1e43e1e553dff106794841fd9a99ade2fc8c8bfce4d7872d
+    # 버킷 하나를 prefix 로 나눠 쓴다. 볼륨 한도를 올린다(CLAUDE.md 함정).
+    command: server -dir=/data -s3 -s3.port=8333 -master.volumeSizeLimitMB=64 -volume.max=200
+    labels: *labels
+    volumes: [s3data:/data]
+    healthcheck:
+      test: ["CMD-SHELL", "curl -s -o /dev/null http://127.0.0.1:8333/ && curl -s -o /dev/null http://127.0.0.1:8888/"]
+      interval: 2s
+      retries: 60
+
+  toxiproxy:
+    image: ghcr.io/shopify/toxiproxy:2.12.0@sha256:9378ed52a28bc50edc1350f936f518f31fa95f0d15917d6eb40b8e376d1a214e
+    labels: *labels
+    # 호스트에는 API 만 127.0.0.1 의 임의 포트로 연다(다른 서비스와 겹치지 않게).
+    ports: ["127.0.0.1::8474"]
+
+  # 볼륨이 있는 앱. 볼륨 이름은 LAB_VOLUME(아래 v01..v40 중 하나).
+  labapp:
+    <<: *app
+    ports: ["127.0.0.1::8000"]
+    volumes: ["${LAB_VOLUME:-v01}:/data"]
+
+  # 볼륨 없는 앱(무상태 교체, L1).
+  labapp-nv:
+    <<: *app
+    ports: ["127.0.0.1::8000"]
+
+  # 볼륨 없이 복제본만 보는 도구(복원해 행 수 세기).
+  tool:
+    <<: *app
+    entrypoint: ["python", "/app/lab_tools/replica.py"]
+
+  # 벤치 부하 발생기. 앱과 같은 네트워크에서 돈다.
+  loadgen:
+    <<: *app
+    entrypoint: ["python", "/app/lab_tools/loadgen.py"]
+
+  # 시작하지 않는 서비스. compose 는 어느 서비스도 쓰지 않거나 비활성 프로필 서비스만 쓰는 볼륨을
+  # 모델에서 빼므로 `down -v` 가 그 볼륨을 지우지 않는다(재현함, compose 5.5.1). 풀의 모든
+  # 볼륨을 여기에 붙이고 정리는 `--profile app down -v` 로 한다.
+  volume-holder:
+    <<: *app
+    entrypoint: ["true"]
+    volumes:
+      - v01:/v/v01
+      - v02:/v/v02
+      - v03:/v/v03
+      - v04:/v/v04
+      - v05:/v/v05
+      - v06:/v/v06
+      - v07:/v/v07
+      - v08:/v/v08
+      - v09:/v/v09
+      - v10:/v/v10
+      - v11:/v/v11
+      - v12:/v/v12
+      - v13:/v/v13
+      - v14:/v/v14
+      - v15:/v/v15
+      - v16:/v/v16
+      - v17:/v/v17
+      - v18:/v/v18
+      - v19:/v/v19
+      - v20:/v/v20
+      - v21:/v/v21
+      - v22:/v/v22
+      - v23:/v/v23
+      - v24:/v/v24
+      - v25:/v/v25
+      - v26:/v/v26
+      - v27:/v/v27
+      - v28:/v/v28
+      - v29:/v/v29
+      - v30:/v/v30
+      - v31:/v/v31
+      - v32:/v/v32
+      - v33:/v/v33
+      - v34:/v/v34
+      - v35:/v/v35
+      - v36:/v/v36
+      - v37:/v/v37
+      - v38:/v/v38
+      - v39:/v/v39
+      - v40:/v/v40
+
+networks:
+  default:
+    labels: *labels
+
+volumes:
+  s3data: {labels: *labels}
+  v01: {labels: *labels}
+  v02: {labels: *labels}
+  v03: {labels: *labels}
+  v04: {labels: *labels}
+  v05: {labels: *labels}
+  v06: {labels: *labels}
+  v07: {labels: *labels}
+  v08: {labels: *labels}
+  v09: {labels: *labels}
+  v10: {labels: *labels}
+  v11: {labels: *labels}
+  v12: {labels: *labels}
+  v13: {labels: *labels}
+  v14: {labels: *labels}
+  v15: {labels: *labels}
+  v16: {labels: *labels}
+  v17: {labels: *labels}
+  v18: {labels: *labels}
+  v19: {labels: *labels}
+  v20: {labels: *labels}
+  v21: {labels: *labels}
+  v22: {labels: *labels}
+  v23: {labels: *labels}
+  v24: {labels: *labels}
+  v25: {labels: *labels}
+  v26: {labels: *labels}
+  v27: {labels: *labels}
+  v28: {labels: *labels}
+  v29: {labels: *labels}
+  v30: {labels: *labels}
+  v31: {labels: *labels}
+  v32: {labels: *labels}
+  v33: {labels: *labels}
+  v34: {labels: *labels}
+  v35: {labels: *labels}
+  v36: {labels: *labels}
+  v37: {labels: *labels}
+  v38: {labels: *labels}
+  v39: {labels: *labels}
+  v40: {labels: *labels}

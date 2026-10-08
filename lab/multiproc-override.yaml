@@ -1,0 +1,15 @@
+# single-server-multiproc 문서의 compose 에 profile-override.yaml 과 함께 덮는다.
+# 더하는 것: 문서 entrypoint(워커 수 WEB_WORKERS), channels-nats 설정, nats 이미지 고정·라벨.
+# 채널 레이어는 런타임에 쓰지 않는다(channels-nats 미설치, 설정 검사만 — #10 범위).
+x-labels: &labels
+  io.itda.dso-lab: "1"
+
+services:
+  app:
+    entrypoint: ["/app/entrypoint-multiproc.sh"]
+    environment:
+      WEB_WORKERS: ${WEB_WORKERS:-2}
+      DJANGO_SETTINGS_MODULE: proj.settings_multiproc
+  nats:
+    image: nats:2.15.0@sha256:cd3fcd4ecdda44e3a66728a5334af0a959bc3979b32810e033d1c547241cd0f4
+    labels: *labels
