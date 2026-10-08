@@ -5,6 +5,7 @@ Django 설정은 프로세스당 한 번만 정할 수 있어서, 시나리오�
 (``test_checks.py`` 와 같은 방식).
 """
 
+import hashlib
 import json
 import os
 import shutil
@@ -632,9 +633,10 @@ def test_channels_not_imported():
 # --- 라운드 1 회귀 (review-1) ------------------------------------------------------------
 
 
-def snapshot(directory: Path) -> dict[str, tuple[int, int]]:
+def snapshot(directory: Path) -> dict[str, tuple[int, int, str]]:
+    """파일 이름 → (크기, mtime, SHA-256). 진단 전후 무변경 검사용."""
     return {
-        p.name: (p.stat().st_size, p.stat().st_mtime_ns)
+        p.name: (p.stat().st_size, p.stat().st_mtime_ns, hashlib.sha256(p.read_bytes()).hexdigest())
         for p in sorted(directory.iterdir())
         if p.is_file()
     }
@@ -734,18 +736,60 @@ def test_read_only_rollback_db_leaves_directory_unchanged(tmp_path):
     assert rc == 0
 
 
-def test_read_only_wal_db_with_live_writer_is_connected(tmp_path):
-    db = _wal_db(tmp_path / "wal.sqlite3")
-    writer = sqlite3.connect(db)  # 쓰는 쪽이 열려 있으면 -shm 이 있다
-    writer.execute("INSERT INTO t VALUES (1)")
-    writer.commit()
+CRASHED_WRITER = """
+import os
+import sqlite3
+import sys
+
+conn = sqlite3.connect(sys.argv[1])
+conn.execute("PRAGMA journal_mode=WAL")
+conn.execute("CREATE TABLE t (x)")
+conn.execute("INSERT INTO t VALUES (42)")
+conn.commit()
+os._exit(0)  # 연결을 닫지 않고 끝낸다: -wal·-shm 이 남는다
+"""
+
+
+@pytest.mark.parametrize("case", ["empty_shm", "crashed_writer", "live_writer"])
+def test_read_only_wal_db_is_never_connected(tmp_path, case):
+    # WAL 읽기는 SQLite 가 -shm 에 쓰고 -wal 을 만들 수 있다. -shm 이 있어도 무변경 근거가
+    # 아니다(review-2 재현: 빈 -shm 이 32768 바이트로 커지고, 남은·열린 -shm 의 해시가 바뀐다)
+    db = tmp_path / "wal.sqlite3"
+    writer = None
+    if case == "crashed_writer":
+        subprocess.run([sys.executable, "-c", CRASHED_WRITER, str(db)], check=True)
+        assert Path(f"{db}-wal").exists() and Path(f"{db}-shm").exists()
+    else:
+        _wal_db(db)
+        if case == "empty_shm":
+            Path(f"{db}-shm").touch()
+        else:
+            writer = sqlite3.connect(db)
+            writer.execute("INSERT INTO t VALUES (42)")
+            writer.commit()
     try:
-        assert Path(f"{db}-shm").exists()
+        before = snapshot(tmp_path)
         rc, data = doctor({"default": MEMORY, "ro": raw(f"file:{db}?mode=ro")})
-        assert one(data, "database", "ro", "journal_mode")["value"] == "WAL"
-        assert rc == 0
+        assert snapshot(tmp_path) == before
+        item = one(data, "database", "ro", "connect")
+        assert item["level"] == "unknown"
+        assert "WAL" in item["message"]
+        assert items(data, "database", "ro", "journal_mode") == []
+        assert rc == 1
     finally:
-        writer.close()
+        if writer is not None:
+            writer.close()
+
+
+@pytest.mark.parametrize("query", ["immutable=1", "mode=ro&immutable=1"])
+def test_immutable_wal_db_is_connected_without_changes(tmp_path, query):
+    db = _wal_db(tmp_path / "wal.sqlite3")
+    before = snapshot(tmp_path)
+    rc, data = doctor({"default": MEMORY, "ro": raw(f"file:{db}?{query}")})
+    assert snapshot(tmp_path) == before
+    assert one(data, "database", "ro", "role")["value"] == "read-only"
+    assert one(data, "database", "ro", "sqlite_version")["level"] == "ok"
+    assert rc == 0
 
 
 @needs_litestream

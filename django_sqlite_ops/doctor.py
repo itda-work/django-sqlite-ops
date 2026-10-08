@@ -460,14 +460,11 @@ def _diagnose_alias(alias: str, target: _Target, rec: dict[str, Any]) -> list[It
                 "bytes" if wal is not None else "no -wal file",
             )
         )
-        # 읽기 전용 별칭은 진단이 파일을 만들면 안 된다. WAL DB 에 -shm 이 없으면(쓰는 쪽이
-        # 열려 있지 않으면) 읽기 연결이 -wal·-shm 을 만든다(재현함). immutable 은 만들지 않는다.
-        if (
-            role == "read-only"
-            and not _immutable(target.name)
-            and _wal_header(path)
-            and not os.path.exists(path + "-shm")
-        ):
+        # 읽기 전용 별칭은 진단이 파일을 바꾸면 안 된다. WAL 읽기는 SQLite 가 본래 -shm 에 쓰고
+        # -wal 을 만들 수 있으므로 -shm 이 있어도 무변경 근거가 아니다(재현함: 빈 -shm 확장,
+        # 남은·열린 -shm 의 해시 변경). immutable 참값 URI 는 WAL 을 무시하고 아무것도 만들지
+        # 않는다(실측).
+        if role == "read-only" and not _immutable(target.name) and _wal_header(path):
             return items + [
                 Item(
                     section,
@@ -476,8 +473,9 @@ def _diagnose_alias(alias: str, target: _Target, rec: dict[str, Any]) -> list[It
                     "unknown",
                     None,
                     None,
-                    "not connected: WAL database without -shm; connecting would create "
-                    "-wal/-shm files",
+                    "not connected: read-only alias of a WAL database; reading WAL writes "
+                    "-shm and may create -wal. Diagnose it through the writer's alias or an "
+                    "immutable=1 URI",
                 )
             ]
     pragmas = rec["pragmas"]

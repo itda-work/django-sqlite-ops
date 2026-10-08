@@ -361,7 +361,7 @@ python manage.py sqlite_doctor --json          # 모니터링·스크립트용
 
 > **주의 — 연결하면 `init_command` 가 실행되고 `-wal`·`-shm` 이 생길 수 있다.** Django 는 연결할 때마다 `OPTIONS["init_command"]` 를 실행하므로 진단이 DB 를 바꿀 수 있다. 예를 들어 `PRAGMA journal_mode=WAL` 은 파일에 남는다. 또 WAL 모드 DB 는 연결만 해도 SQLite 가 `-wal`·`-shm` 파일을 만든다(`init_command` 가 없어도). 쓰기 별칭은 앱이 연결할 때와 같은 일이므로 그대로 연결한다. 운영 DB 에서 돌린다는 점을 알고 실행한다.
 >
-> **읽기 전용 별칭은 파일을 만들지 않는다.** DB 헤더가 WAL 인데 `-shm` 이 없으면(쓰는 프로세스가 열려 있지 않으면) 연결하지 않고 `unknown` 으로 적는다. 연결하면 `-wal`·`-shm` 이 생기기 때문이다(재현함). `immutable=1` 별칭은 사이드카를 만들지 않으므로 연결한다.
+> **읽기 전용 별칭은 파일을 바꾸지 않는다.** DB 헤더가 WAL 이면 `-shm` 이 있든 없든 연결하지 않고 `unknown` 으로 적는다. WAL 읽기는 SQLite 가 본래 `-shm` 에 쓰고 `-wal` 을 만들 수 있기 때문이다(재현함: 없던 `-wal` 생성, 빈 `-shm` 이 32KB 로 커짐, 쓰는 프로세스가 열려 있거나 비정상 종료 뒤 남은 `-shm` 의 내용 변경). `immutable=1` URI 는 사이드카를 건드리지 않으므로(실측) 연결한다. **읽기 전용 WAL 복제본은 쓰기 쪽 별칭이나 `immutable` URI 로 진단한다.** 예: `DATABASES["ro"]` 가 `file:/srv/app.sqlite3?mode=ro` 면 같은 파일의 쓰기 별칭(`default`)을 `--database default` 로 보거나, 진단용으로 `file:/srv/app.sqlite3?immutable=1` 별칭을 둔다(`immutable` 은 `-wal` 의 커밋을 무시하므로 쓰는 프로세스가 도는 중에는 최신 내용이 아닐 수 있다).
 >
 > **DB 파일이 없으면 연결하지 않는다.** SQLite 는 없는 파일에 연결하면 빈 DB 를 만든다. 그러면 boot 가 다음 부팅에서 복원 대신 그 빈 DB 를 판정하게 된다. 그래서 파일이 없으면 오류로 적고 연결하지 않는다.
 
