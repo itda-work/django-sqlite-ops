@@ -308,13 +308,17 @@ python manage.py check --deploy   # W001·W002 는 --deploy 일 때만 나온다
 |---|---|---|---|
 | `sqlite_ops.E001` | `SQLITE_OPS` 가 dict 가 아니거나 `PROFILE` 이 알 수 없는 이름 | 항상 | `PROFILE` 을 `"single-server"`·`"single-server-multiproc"` 중 하나로. 이 오류가 있으면 다른 체크는 돌지 않는다 |
 | `sqlite_ops.W001` | `OPTIONS["transaction_mode"]` 가 `IMMEDIATE` 가 아님(없음 포함, 대소문자 무시) | `--deploy` | `sqlite_database()` 를 쓰거나 `"transaction_mode": "IMMEDIATE"` 를 넣는다 |
-| `sqlite_ops.W002` | `OPTIONS["init_command"]` 에서 `journal_mode` 가 `WAL` 로 설정되지 않음 | `--deploy` | `sqlite_database()` 를 쓰거나 `init_command` 에 `PRAGMA journal_mode=WAL` 을 넣는다 |
+| `sqlite_ops.W002` | `OPTIONS["init_command"]` 에서 `journal_mode` 가 `WAL` 로 설정되지 않음, 또는 `journal_mode` 를 언급하는 문장의 형식을 판정할 수 없음 | `--deploy` | `sqlite_database()` 를 쓰거나 `init_command` 에 `PRAGMA journal_mode=WAL` 을 넣는다 |
 | `sqlite_ops.W003` | 이름이 Litestream VFS(`vfs=litestream` 이 든 `file:` URI)인 별칭의 `CONN_MAX_AGE` 가 `None` 이 아님, `ASGI_APPLICATION` 미설정(WSGI) | 항상 | 그 별칭에 `"CONN_MAX_AGE": None`. WSGI 실측에서 요청당 1,008ms → 1.7ms |
 
 - 기준값은 `sqlite_database()` 와 같은 권장값 표에서 읽는다. 프로필은 `SQLITE_OPS["PROFILE"]` 이고 없으면 `"single-server"` 다.
 - `sqlite_database()` 로 만든 설정은 경고가 없다(W003 은 VFS 별칭에 `CONN_MAX_AGE` 를 따로 줘야 한다).
-- W002 는 Django 처럼 `init_command` 를 `;` 로 나눈 각 문장을 본다. `PRAGMA journal_mode = wal`, `PRAGMA main.journal_mode=WAL` 처럼 대소문자·공백·`main.` 접두가 달라도 인정하고, 여러 번 설정했으면 마지막 값을 본다.
-- 메모리 DB(`:memory:`, `file::memory:`, `mode=memory`)는 WAL 이 의미 없어 W002 를 건너뛴다.
+- W002 는 Django 처럼 `init_command` 를 `;` 로 나눈 각 문장을 본다. SQL 주석(`-- …`, `/* … */`)은 지우고 본다. `PRAGMA journal_mode = wal`, `PRAGMA main.journal_mode=WAL`, `PRAGMA "journal_mode"=WAL`, `PRAGMA journal_mode('wal')` 처럼 대소문자·공백·인용 식별자·`main.` 접두가 달라도 인정하고, 여러 번 설정했으면 마지막 값을 본다. `temp.` 같은 다른 스키마는 이 DB 의 모드를 바꾸지 않으므로 세지 않는다.
+- 정적 체크는 SQL 파서가 아니다. `journal_mode` 를 언급하는데 위 형식이 아닌 문장(`SELECT … pragma_journal_mode`, 알 수 없는 값 등)이 있으면 **판정할 수 없다는 W002** 를 낸다. 메시지에 그 문장이 나온다. `PRAGMA journal_mode=WAL` 형식으로 고쳐 쓴다.
+- 건너뛰는 경우(이름이 `file:` URI 일 때 쿼리 키가 **정확히 한 번** 있어야 인정한다. `mode=rwc&mode=ro` 처럼 겹치면 판정하지 않고 검사한다):
+  - 메모리 DB — `:memory:`, 파일명이 정확히 `:memory:` 인 URI(`file::memory:`, `file::memory:?cache=shared`), `mode=memory`: WAL 이 의미 없어 W002 를 건너뛴다. `file::memory:backup.sqlite3` 는 실제 파일이라 검사한다.
+  - 읽기 전용 — `mode=ro`, `immutable=1`: W001·W002 를 건너뛴다. 읽기 전용 연결에 `PRAGMA journal_mode=WAL` 을 넣으면 `attempt to write a readonly database` 로 연결이 깨진다.
+  - Litestream VFS(`vfs=litestream`): W001·W002 를 건너뛴다. W003 은 그대로 본다.
 - W003 은 ASGI 에서는 내지 않는다. ASGI 의 영속 연결은 아직 재지 않았고, Django 는 async 에서 영속 연결을 끄라고 권한다.
 - 경고를 끄려면 Django 표준 `SILENCED_SYSTEM_CHECKS` 를 쓴다. 이 앱의 체크만 돌리려면 `check --tag sqlite_ops`.
 

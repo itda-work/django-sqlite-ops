@@ -237,12 +237,17 @@ django_sqlite_ops/
 | ID | 조건 | 수준 |
 |---|---|---|
 | `sqlite_ops.E001` | `SQLITE_OPS` 가 dict 가 아니거나 `PROFILE` 이 알 수 없는 이름. 이때는 이 오류 하나만 내고 다른 체크는 건너뛴다 | Error (항상) |
-| `sqlite_ops.W001` | sqlite3 별칭의 `OPTIONS.transaction_mode` 가 `IMMEDIATE` 가 아님(없음 포함, 대소문자 무시) | Warning (`--deploy` 일 때만) |
-| `sqlite_ops.W002` | `init_command` 에서 `journal_mode` 가 `WAL` 로 설정되지 않음. Django 처럼 `;` 로 나눈 문장마다 보고 마지막 설정값을 쓴다. 대소문자·공백·`main.` 접두는 인정한다. 메모리 DB(`:memory:`, `file::memory:`, `mode=memory`)는 건너뛴다 | Warning (`--deploy`) |
+| `sqlite_ops.W001` | sqlite3 별칭의 `OPTIONS.transaction_mode` 가 `IMMEDIATE` 가 아님(없음 포함, 대소문자 무시). 읽기 전용·VFS 별칭은 건너뛴다 | Warning (`--deploy` 일 때만) |
+| `sqlite_ops.W002` | `init_command` 에서 `journal_mode` 가 `WAL` 로 설정되지 않음, 또는 판정할 수 없음. Django 처럼 `;` 로 나눈 문장마다 SQL 주석을 지우고 보며, 마지막으로 확정된 설정값을 쓴다. 대소문자·공백·인용 식별자(`"…"`·`` `…` ``·`[…]`)·`main.` 접두는 인정하고 다른 스키마는 세지 않는다. `journal_mode` 를 언급하지만 형식을 확정할 수 없는 문장이 하나라도 있으면 판정할 수 없다고 경고한다. 메모리 DB·읽기 전용·VFS 별칭은 건너뛴다 | Warning (`--deploy`) |
 | `sqlite_ops.W003` | 이름이 Litestream VFS(`vfs=litestream` 이 든 `file:` URI)인 별칭의 `CONN_MAX_AGE` 가 `None` 이 아님(키 없음 = Django 기본 0 포함), 그리고 `ASGI_APPLICATION` 미설정(WSGI 로 판단). ASGI 는 미검증이라 내지 않는다(교차 리뷰) | Warning (항상) |
 
 - W001 은 권고 수준이다. Django 는 `DEFERRED`·`EXCLUSIVE`·`IMMEDIATE` 를 모두 허용하므로 오류로 올리지 않는다(교차 리뷰).
-- 체크 태그는 `sqlite_ops` 다. `Tags.database` 는 `check --database` 없이는 돌지 않아 쓰지 않는다.
+- 원칙: **판정할 수 없으면 경고한다.** 정적 체크는 SQL 파서가 아니므로 모르는 형식을 조용히 건너뛰지 않는다. 체크 결과는 실제 Django 연결의 `PRAGMA journal_mode` 와 대조하는 표 테스트로 고정한다(`tests/test_checks.py`).
+- 별칭 이름 판별(`file:` URI 는 쿼리 키가 정확히 한 번일 때만 인정, 겹치면 판정하지 않고 검사한다):
+  - 메모리 DB: `NAME == ":memory:"`, URI 파일명이 정확히 `:memory:`, 또는 `mode=memory`. `file::memory:backup.sqlite3` 는 실제 파일이다(재현함).
+  - 읽기 전용: `mode=ro` 또는 `immutable=1`. 쓰기 권고(W001·W002)가 의미 없고, W002 안내를 따르면 연결이 `attempt to write a readonly database` 로 깨진다(재현함).
+  - Litestream VFS: `vfs=litestream`. W001·W002 를 건너뛰고 W003 만 본다. VFS 의 PRAGMA 동작은 미검증이다.
+- 체크 태그는 `sqlite_ops` 다. Django 6.1 은 `--database` 없이 돌면 `database` 태그 체크를 빼고(6.1.2 `django/core/checks/registry.py:89-93`), 5.2 는 빼지 않는다(5.2.18 같은 파일 `run_checks` :72-96 에 그 분기가 없다). 두 지원 버전에서 기본으로 돌도록 자체 태그를 쓴다.
 
 뺀 것과 그 이유:
 - "다중 프로세스인데 InMemory 레이어 사용": check 시점에는 프로세스 수를 알 수 없다. wireview W006 이 이미 이 경우를 다룬다.
