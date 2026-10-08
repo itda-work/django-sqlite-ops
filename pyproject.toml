@@ -15,7 +15,7 @@ nats = ["channels-nats"]
 channels-lite = ["channels-lite"]
 
 [dependency-groups]
-dev = ["pytest>=8", "ruff>=0.6"]
+dev = ["pytest>=8", "pyyaml>=6", "ruff>=0.6"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

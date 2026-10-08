@@ -11,7 +11,7 @@ Django 에서 SQLite 를 운영 DB 로 안전하게 쓰게 하는 **운영 도�
 | 시스템 체크 | 구현됨 | [#5](https://github.com/itda-work/django-sqlite-ops/issues/5) |
 | `sqlite_doctor` 관리 명령 | 구현됨 | [#6](https://github.com/itda-work/django-sqlite-ops/issues/6) |
 | 복제 헬스 | 구현됨 | [#7](https://github.com/itda-work/django-sqlite-ops/issues/7) |
-| 배포 프로필 문서 | 예정 | [#9](https://github.com/itda-work/django-sqlite-ops/issues/9) |
+| 배포 프로필 문서 ([single-server](docs/profiles/single-server.md) · [single-server-multiproc](docs/profiles/single-server-multiproc.md)) | 구현됨 | [#9](https://github.com/itda-work/django-sqlite-ops/issues/9) |
 | channels-lite 패치 | 구현됨 | [#8](https://github.com/itda-work/django-sqlite-ops/issues/8) |
 
 PyPI 배포 전이다. 패키지 이름도 가칭이라 바뀔 수 있다.
@@ -541,7 +541,17 @@ LOGGING = {
 
 ### 배포 프로필
 
-예정. `single-server`, `single-server-multiproc` 의 채널 레이어·프로세스 구성 문서. [#9](https://github.com/itda-work/django-sqlite-ops/issues/9)
+배포 형태별로 프로세스 트리, 복사해 쓰는 설정 조각(`settings.py`·`urls.py`·`litestream.yml`·Dockerfile·`entrypoint.sh`·compose), 운영 절차, 함정을 한 문서에 모았다. 절차와 조각이 길어서 README 가 아니라 `docs/profiles/` 에 둔다.
+
+| 프로필 | 언제 | 채널 레이어 | 문서 |
+|---|---|---|---|
+| `single-server` | 머신 1대, 앱 프로세스 1개 | `InMemoryChannelLayer` | [docs/profiles/single-server.md](docs/profiles/single-server.md) |
+| `single-server-multiproc` | 머신 1대, 앱 프로세스 여럿 | channels-nats(추천) · channels_redis(호환) | [docs/profiles/single-server-multiproc.md](docs/profiles/single-server-multiproc.md) |
+
+- 두 프로필 모두 **쓰는 머신은 1대**다. 두 머신이 같은 복제본에 쓰면 나중 쪽이 경고 없이 이긴다. 배포는 정지 후 기동이다.
+- 프로세스 트리는 `boot`(잠금) → exec → `litestream replicate -exec "sh -c 'migrate && exec uvicorn ...'"` 다. litestream 이 PID 1 이다.
+- 한 번만 쓰는 boot 옵션(`--init-new`·`--adopt-existing`·`--on-unknown restore`)은 이미지에 굳히지 않고 `BOOT_FLAGS` 환경 변수로 넘긴 뒤 비운다.
+- `settings.py`·`urls.py` 조각은 테스트가 실행하고 `check --deploy` 를 통과하는지 본다. `litestream.yml` 은 실제 litestream 0.5.17 이 읽는지, `entrypoint.sh` 는 문법을 본다. Dockerfile·compose 의 컨테이너 종단 검증은 [#10](https://github.com/itda-work/django-sqlite-ops/issues/10) 회귀 랩에서 할 예정이다.
 
 ### channels-lite 패치
 
