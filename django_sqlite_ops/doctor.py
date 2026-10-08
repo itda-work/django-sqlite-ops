@@ -23,7 +23,7 @@ from django.conf import settings
 from django.db import connections
 
 from .boot import litestream
-from .checks import _is_litestream_vfs, _profile, _role, _uri
+from .checks import _TRUE, _is_litestream_vfs, _options, _profile, _role, _uri
 from .database import DEFAULT_PROFILE, ENGINE, recommended
 
 __all__ = [
@@ -302,6 +302,61 @@ def _alias_role(name: Any) -> tuple[str, str | None]:
     return role, reason
 
 
+@dataclass(frozen=True, slots=True)
+class _Target:
+    """별칭이 실제로 여는 대상. 모든 섹션이 이 값 하나를 쓴다.
+
+    ``name`` 은 Django 가 ``sqlite3.connect()`` 에 넘기는 ``database`` 다
+    (``get_connection_params()`` — 연결을 열지 않는다. Django 5.2·6.1 은 ``NAME`` 뒤에
+    ``OPTIONS`` 를 병합하므로 ``OPTIONS['database']`` 가 ``NAME`` 을 덮는다).
+    """
+
+    name: Any
+    role: str
+    reason: str | None
+    path: str | None
+    overridden: bool = False
+
+
+def _target(alias: str, config: Mapping[str, Any]) -> _Target:
+    try:
+        params = connections[alias].get_connection_params()
+    except Exception as exc:  # noqa: BLE001 - ImproperlyConfigured 등을 한 줄로 보고한다
+        return _Target(None, "error", _one_line(f"{type(exc).__name__}: {exc}"), None)
+    name = params.get("database")
+    if isinstance(name, os.PathLike):
+        name = os.fspath(name)
+    overridden = "database" in _options(config)
+    if not isinstance(name, str):
+        return _Target(name, "unknown", "the database parameter is not a string", None, overridden)
+    role, reason = _alias_role(name)
+    path = _db_file(name) if role in ("write", "read-only") else None
+    return _Target(name, role, reason, path, overridden)
+
+
+def _immutable(name: str) -> bool:
+    uri = _uri(name)
+    return uri is not None and any(v.lower() in _TRUE for v in uri[1].get("immutable", []))
+
+
+def _wal_header(path: str) -> bool | None:
+    """DB 헤더의 쓰기·읽기 버전(오프셋 18·19)이 2(WAL)인지. 읽지 못하면 ``None``.
+
+    https://www.sqlite.org/fileformat2.html#file_format_version_numbers. 읽기 전용으로 연다.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | getattr(os, "O_NONBLOCK", 0))
+        try:
+            header = os.read(fd, 20)
+        finally:
+            os.close(fd)
+    except OSError:
+        return None
+    if len(header) < 20:
+        return None  # 빈 파일 등. 연결해도 헤더가 아직 없다
+    return header[18] == 2 or header[19] == 2
+
+
 def _canon(key: str, value: Any) -> Any:
     """비교용 정규화. 실제 값과 권장값을 같은 표기로 맞춘다."""
     if key == "synchronous":
@@ -339,13 +394,17 @@ def _read_pragmas(alias: str, keys: Iterable[str]) -> dict[str, Any]:
         conn.close()
 
 
-def _diagnose_alias(alias: str, config: Mapping[str, Any], rec: dict[str, Any]) -> list[Item]:
+def _diagnose_alias(alias: str, target: _Target, rec: dict[str, Any]) -> list[Item]:
     section = "database"
-    name = config.get("NAME")
-    role, reason = _alias_role(name)
-    items = [Item(section, alias, "role", "ok", role)]
+    role = target.role
+    if role == "error":
+        return [Item(section, alias, "connect", "error", None, None, target.reason or "")]
+    note = "OPTIONS['database'] overrides NAME; checking that path" if target.overridden else ""
+    items = [Item(section, alias, "role", "ok", role, None, note)]
     if role == "unknown":
-        return [Item(section, alias, "role", "unknown", role, None, f"not connected: {reason}")]
+        return [
+            Item(section, alias, "role", "unknown", role, None, f"not connected: {target.reason}")
+        ]
     if role == "vfs":
         return [
             Item(
@@ -360,9 +419,9 @@ def _diagnose_alias(alias: str, config: Mapping[str, Any], rec: dict[str, Any]) 
         ]
     path = None
     if role != "memory":
-        path = _db_file(name)
+        path = target.path
         if path is None:
-            return [Item(section, alias, "file", "error", None, None, "NAME is empty")]
+            return [Item(section, alias, "file", "error", None, None, "database path is empty")]
         if not os.path.exists(path):
             return items + [
                 Item(
@@ -401,6 +460,26 @@ def _diagnose_alias(alias: str, config: Mapping[str, Any], rec: dict[str, Any]) 
                 "bytes" if wal is not None else "no -wal file",
             )
         )
+        # 읽기 전용 별칭은 진단이 파일을 만들면 안 된다. WAL DB 에 -shm 이 없으면(쓰는 쪽이
+        # 열려 있지 않으면) 읽기 연결이 -wal·-shm 을 만든다(재현함). immutable 은 만들지 않는다.
+        if (
+            role == "read-only"
+            and not _immutable(target.name)
+            and _wal_header(path)
+            and not os.path.exists(path + "-shm")
+        ):
+            return items + [
+                Item(
+                    section,
+                    alias,
+                    "connect",
+                    "unknown",
+                    None,
+                    None,
+                    "not connected: WAL database without -shm; connecting would create "
+                    "-wal/-shm files",
+                )
+            ]
     pragmas = rec["pragmas"]
     keys = list(dict.fromkeys([*pragmas, "foreign_keys"]))
     try:
@@ -446,6 +525,18 @@ def _diagnose_mount(alias: str, path: str) -> Item:
 
 def _real(path: str) -> str:
     return os.path.realpath(os.path.abspath(path))
+
+
+def _caller_path(path: str) -> str:
+    """호출자 작업 디렉터리 기준 절대 경로. Litestream 은 임시 cwd 에서 돌기 때문이다."""
+    return os.path.abspath(path)
+
+
+def _binary(binary: str) -> str:
+    """경로 구분자가 든 바이너리는 절대 경로로, PATH 로 찾는 이름은 그대로 둔다."""
+    if os.sep in binary or (os.altsep and os.altsep in binary):
+        return os.path.abspath(binary)
+    return binary
 
 
 def _litestream_items(
@@ -619,6 +710,35 @@ def _channel_items(
     return items
 
 
+def _sharing(alias: str, sqlite_files: Mapping[str, str]) -> list[str]:
+    """``alias`` 와 같은 실제 파일을 쓰는 다른 별칭."""
+    real = _real(sqlite_files[alias])
+    return sorted(
+        other for other, path in sqlite_files.items() if other != alias and _real(path) == real
+    )
+
+
+def _dedicated_channel_aliases(sqlite_files: Mapping[str, str]) -> set[str]:
+    """channels-lite 가 쓰는 전용 채널 DB 별칭(앱 DB 와 다른 파일). 복제 대상이 아니다(§8)."""
+    layers = getattr(settings, "CHANNEL_LAYERS", None)
+    if not isinstance(layers, Mapping):
+        return set()
+    found = set()
+    for layer in layers.values():
+        if not isinstance(layer, Mapping) or layer.get("BACKEND") not in _LITE:
+            continue
+        config = layer.get("CONFIG")
+        alias = config.get("database") if isinstance(config, Mapping) else None
+        if (
+            isinstance(alias, str)
+            and alias in sqlite_files
+            and alias != "default"
+            and not _sharing(alias, sqlite_files)
+        ):
+            found.add(alias)
+    return found
+
+
 def _lite_items(
     name: str,
     layer: Mapping[str, Any],
@@ -645,9 +765,7 @@ def _lite_items(
             )
         ]
     real = _real(sqlite_files[alias])
-    shared = sorted(
-        other for other, path in sqlite_files.items() if other != alias and _real(path) == real
-    )
+    shared = _sharing(alias, sqlite_files)
     items = []
     if alias == "default" or shared:
         if alias == "default":
@@ -735,18 +853,17 @@ def diagnose(
             else:
                 selected.append(alias)
 
+    # 별칭마다 실제로 여는 대상을 한 번 정하고 모든 섹션이 그것을 쓴다(연결하지 않는다).
+    targets = {alias: _target(alias, config) for alias, config in sqlite.items()}
     # 파일 DB 별칭(쓰기·읽기 전용)의 경로. 메모리·VFS·판정 불가는 빼고 본다.
-    files: dict[str, str] = {}
-    roles: dict[str, str] = {}
-    for alias, config in sqlite.items():
-        role, _ = _alias_role(config.get("NAME"))
-        roles[alias] = role
-        path = _db_file(config.get("NAME"))
-        if role in ("write", "read-only") and path is not None:
-            files[alias] = path
+    files = {
+        alias: t.path
+        for alias, t in targets.items()
+        if t.role in ("write", "read-only") and t.path is not None
+    }
 
     for alias in selected:
-        items.extend(_diagnose_alias(alias, sqlite[alias], rec))
+        items.extend(_diagnose_alias(alias, targets[alias], rec))
     for alias in selected:
         if alias in files:
             items.append(_diagnose_mount(alias, files[alias]))
@@ -765,9 +882,15 @@ def diagnose(
             )
         )
     else:
-        write_aliases = [a for a in selected if roles.get(a) == "write" and a in files]
+        # 전용 채널 DB 는 복제에서 빼는 것이 규칙이므로 "복제되지 않음" 대상이 아니다(§8)
+        channel_only = _dedicated_channel_aliases(files)
+        write_aliases = [
+            a
+            for a in selected
+            if targets[a].role == "write" and a in files and a not in channel_only
+        ]
         ls_items, replicated = _litestream_items(
-            litestream_config, litestream_binary, files, write_aliases
+            _caller_path(litestream_config), _binary(litestream_binary), files, write_aliases
         )
         items.extend(ls_items)
 

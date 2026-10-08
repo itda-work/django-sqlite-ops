@@ -674,6 +674,37 @@ NAME_TABLE = [
         ([W004], "delete"),
         ([W004], "wal"),
     ),
+    # URI authority (라운드 #6 리뷰 1): "//" 뒤 다음 "/" 까지. 비었거나 정확히 "localhost" 만
+    # 로컬이다(https://www.sqlite.org/uri.html). 대소문자를 가리고 퍼센트 디코딩하지 않는다(실측)
+    (
+        "file://localhost{base}/a1.sqlite3?mode=ro",
+        "a1.sqlite3",
+        False,
+        ([], "delete"),
+        ([], READONLY),
+    ),
+    ("file://{base}/a2.sqlite3", None, False, ([W001, W002], "delete"), ([], "wal")),
+    (
+        "file://example.com{base}/a3.sqlite3?mode=rwc",
+        None,
+        False,
+        ([W004], "error: invalid uri authority: example.com"),
+        ([W004], "error: invalid uri authority: example.com"),
+    ),
+    (
+        "file://LOCALHOST{base}/a4.sqlite3?mode=ro",
+        "a4.sqlite3",
+        False,
+        ([W004], "error: invalid uri authority: LOCALHOST"),
+        ([W004], "error: invalid uri authority: LOCALHOST"),
+    ),
+    (
+        "file://localhost?mode=memory",
+        None,
+        False,
+        ([W004], "error: invalid uri authority: localhost?mode=memory"),
+        ([W004], "error: invalid uri authority: localhost?mode=memory"),
+    ),
 ]
 
 

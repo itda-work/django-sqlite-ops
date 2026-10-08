@@ -13,8 +13,10 @@ HELP = (
     "Diagnose SQLite databases with a real connection: actual PRAGMA values after "
     "init_command, file and WAL sizes, filesystem type, Litestream config paths and the "
     "channel layer. Connecting runs OPTIONS['init_command'], which can change the database "
-    "(PRAGMA journal_mode=WAL persists in the file). A database whose file does not exist is "
-    "reported and NOT connected (connecting would create an empty file). "
+    "(PRAGMA journal_mode=WAL persists in the file), and connecting to a WAL database can "
+    "create -wal/-shm files. A database whose file does not exist is reported and NOT "
+    "connected (connecting would create an empty file); neither is a read-only WAL database "
+    "without -shm. "
     "Exit status: 0 no problems, 1 warnings or undeterminable items, 2 errors."
 )
 

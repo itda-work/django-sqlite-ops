@@ -79,7 +79,13 @@ def _uri(name: Any) -> tuple[str, dict[str, list[str]]] | None:
         name = os.fspath(name)
     if not isinstance(name, str) or not name.startswith("file:"):
         return None
-    rest = name[len("file:") :].split("#", 1)[0]
+    rest = name[len("file:") :]
+    if rest.startswith("//"):
+        # authority 는 "//" 뒤 다음 "/" 까지다(쿼리·프래그먼트 구분자보다 먼저 본다). 로컬
+        # authority 는 떼어 낸다. 그 밖의 authority 는 _uri_authority() 가 판정한다.
+        end = rest.find("/", 2)
+        rest = rest[end:] if end >= 0 else ""
+    rest = rest.split("#", 1)[0]
     path, _, raw_query = rest.partition("?")
     query: dict[str, list[str]] = {}
     for part in raw_query.split("&"):
@@ -87,6 +93,24 @@ def _uri(name: Any) -> tuple[str, dict[str, list[str]]] | None:
             key, _, value = part.partition("=")
             query.setdefault(unquote(key), []).append(unquote(value))
     return unquote(path), query
+
+
+def _uri_authority(name: Any) -> str | None:
+    """``file://`` URI 의 authority 가 SQLite 가 받지 않는 값이면 그 값을, 아니면 ``None``.
+
+    SQLite 는 authority 로 빈 문자열과 ``localhost`` 만 받는다(https://www.sqlite.org/uri.html).
+    authority 는 ``//`` 뒤 다음 ``/`` 까지이고, 대소문자를 가리며 퍼센트 디코딩하지 않는다
+    (``LOCALHOST``·``%6cocalhost``·``localhost?mode=ro`` 는 연결 오류, 재현함). Windows 의
+    ``SQLITE_ALLOW_URI_AUTHORITY`` UNC 경로는 흉내 내지 않는다.
+    """
+    if isinstance(name, os.PathLike):
+        name = os.fspath(name)
+    if not isinstance(name, str) or not name.startswith("file://"):
+        return None
+    rest = name[len("file://") :]
+    end = rest.find("/")
+    authority = rest[:end] if end >= 0 else rest
+    return None if authority in ("", "localhost") else authority
 
 
 # SQLite 가 받는 값 (https://www.sqlite.org/uri.html, sqlite3_uri_boolean). 그 밖은 판정하지 않는다.
@@ -100,8 +124,9 @@ def _role(name: Any) -> tuple[str, str | None]:
     """별칭의 역할과, 판정할 수 없을 때 그 이유를 돌려준다.
 
     역할: ``"write"`` · ``"memory"`` · ``"read-only"`` · ``"vfs"`` · ``"unknown"``.
-    역할을 정하는 쿼리 키(``mode``·``immutable``·``vfs``)가 겹치거나 SQLite 표준 표기가 아니면
-    ``"unknown"`` 이다. SQLite 의 중복·비표준 해석을 흉내 내지 않는다.
+    역할을 정하는 쿼리 키(``mode``·``immutable``·``vfs``)가 겹치거나 SQLite 표준 표기가 아니면,
+    또는 URI authority 가 빈 값·``localhost`` 가 아니면 ``"unknown"`` 이다. SQLite 의
+    중복·비표준 해석을 흉내 내지 않는다.
     """
     if isinstance(name, os.PathLike):
         name = os.fspath(name)
@@ -110,6 +135,9 @@ def _role(name: Any) -> tuple[str, str | None]:
     uri = _uri(name)
     if uri is None:
         return "write", None
+    authority = _uri_authority(name)
+    if authority is not None:
+        return "unknown", f"URI authority {authority!r} is not empty or 'localhost'"
     path, query = uri
     # SQLite 는 디코딩된 NUL 앞까지만 읽는다. 역할 키가 숨을 수 있으니 어느 키든 판정하지 않는다
     if "\0" in path:
@@ -261,8 +289,9 @@ def check_deploy_settings(app_configs=None, **kwargs):
                     f"Cannot determine the role of database {alias!r} (write, read-only, "
                     f"memory or Litestream VFS) from its NAME: {reason}.",
                     hint=(
-                        "Rewrite NAME as a standard URI: no %00, each query key (mode, "
-                        "immutable, vfs) once, mode=ro|rw|rwc|memory, immutable=1|0, "
+                        "Rewrite NAME as a standard URI: no authority other than "
+                        "'localhost' (file:///path or file:/path), no %00, each query key "
+                        "(mode, immutable, vfs) once, mode=ro|rw|rwc|memory, immutable=1|0, "
                         "vfs=<name> (DESIGN §6-1)."
                     ),
                     obj=alias,

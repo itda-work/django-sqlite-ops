@@ -7,13 +7,14 @@ Django 설정은 프로세스당 한 번만 정할 수 있어서, 시나리오�
 
 import json
 import os
+import shutil
 import sqlite3
 import subprocess
 import sys
 from pathlib import Path
 
 import pytest
-from _litestream import needs_litestream
+from _litestream import needs_litestream, require_litestream
 
 from django_sqlite_ops.boot.litestream import parse_databases_json
 from django_sqlite_ops.database import sqlite_database
@@ -592,8 +593,8 @@ def test_channels_lite_replicated_warns(tmp_path):
         databases, "--litestream-config", str(_config(lab, str(app))), CHANNEL_LAYERS=layers
     )
     assert one(data, "channels", "default", "replicated")["level"] == "ok"
-    # 복제하지 않는 채널 DB 는 쓰기 별칭이라도 "복제되지 않음" 경고가 나온다
-    assert one(data, "litestream", "channels", "replicated")["level"] == "warn"
+    # 전용 채널 DB 는 복제 대상이 아니므로 "복제되지 않음" 경고를 내지 않는다(DESIGN §8)
+    assert items(data, "litestream", "channels", "replicated") == []
 
 
 DOCTOR_NO_CHANNELS_SCRIPT = """
@@ -626,3 +627,154 @@ def test_channels_not_imported():
         check=True,
     )
     assert json.loads(result.stdout) == []
+
+
+# --- 라운드 1 회귀 (review-1) ------------------------------------------------------------
+
+
+def snapshot(directory: Path) -> dict[str, tuple[int, int]]:
+    return {
+        p.name: (p.stat().st_size, p.stat().st_mtime_ns)
+        for p in sorted(directory.iterdir())
+        if p.is_file()
+    }
+
+
+def test_options_database_overriding_name_is_what_doctor_checks(tmp_path):
+    # Django 는 NAME 뒤에 OPTIONS 를 병합하므로 OPTIONS['database'] 가 실제 연결 대상이다
+    app = make_db(tmp_path / "app.sqlite3")
+    new = tmp_path / "unexpected.sqlite3"
+    rc, data = doctor({"default": sqlite_database(app, options={"database": str(new)})})
+    item = one(data, "database", "default", "file")
+    assert item["level"] == "error"
+    assert item["value"] == str(new)
+    assert not new.exists()
+    assert not Path(f"{new}-wal").exists()
+    assert not Path(f"{new}-shm").exists()
+    assert sorted(os.listdir(tmp_path)) == ["app.sqlite3"]
+    assert rc == 2
+
+
+def test_options_database_existing_file_is_measured(tmp_path):
+    app = make_db(tmp_path / "app.sqlite3")
+    other = make_db(tmp_path / "other.sqlite3")
+    rc, data = doctor({"default": raw(app, database=str(other))})
+    assert one(data, "database", "default", "file")["value"] == other.stat().st_size
+    assert "OPTIONS['database']" in one(data, "database", "default", "role")["message"]
+
+
+def test_relative_litestream_config_and_binary(tmp_path):
+    if (binary := shutil.which("litestream")) is None:
+        require_litestream()
+    lab = Path(os.path.realpath(tmp_path))
+    app = make_db(lab / "app.sqlite3")
+    config = _config(lab, str(app))
+    (lab / "bin").mkdir()
+    (lab / "bin" / "litestream").symlink_to(binary)
+    config_json = json.dumps({"DATABASES": {"default": sqlite_database(app)}})
+    argv = [sys.executable, "-c", RUN_DOCTOR_SCRIPT, config_json]
+    argv += ["--litestream-config", "litestream.yml", "--litestream", "./bin/litestream", "--json"]
+    env = {**os.environ, "PYTHONPATH": str(ROOT)}
+    result = subprocess.run(argv, cwd=lab, capture_output=True, text=True, check=False, env=env)
+    data = json.loads(result.stdout)
+    assert one(data, "litestream", None, "config")["level"] == "ok", result.stdout
+    assert one(data, "litestream", "default", "replicated")["level"] == "ok"
+    assert result.returncode == 0
+    assert config.exists()
+
+
+@pytest.mark.parametrize("prefix", ["file://localhost", "file://"])
+def test_uri_with_local_authority(tmp_path, prefix):
+    app = make_db(tmp_path / "app.sqlite3")
+    rc, data = doctor({"default": raw(f"{prefix}{app}?mode=ro")})
+    assert one(data, "database", "default", "role")["value"] == "read-only"
+    assert one(data, "database", "default", "file")["value"] == app.stat().st_size
+    assert problems(data) == []
+    assert rc == 0
+
+
+@pytest.mark.parametrize("authority", ["example.com", "LOCALHOST", "%6cocalhost"])
+def test_uri_with_other_authority_is_unknown_and_not_connected(tmp_path, authority):
+    app = make_db(tmp_path / "app.sqlite3")
+    rc, data = doctor({"default": raw(f"file://{authority}{app}?mode=rwc")})
+    item = one(data, "database", "default", "role")
+    assert item["level"] == "unknown"
+    assert "authority" in item["message"]
+    assert items(data, "database", "default", "journal_mode") == []
+    assert rc == 1
+
+
+def _wal_db(path: Path) -> Path:
+    make_db(path)
+    conn = sqlite3.connect(path)
+    conn.execute("PRAGMA journal_mode=WAL")
+    conn.close()  # 마지막 연결이 닫히면 -wal·-shm 이 지워지고 헤더는 WAL 로 남는다
+    return path
+
+
+def test_read_only_wal_db_without_shm_is_not_connected(tmp_path):
+    db = _wal_db(tmp_path / "wal.sqlite3")
+    before = snapshot(tmp_path)
+    assert list(before) == ["wal.sqlite3"]
+    rc, data = doctor({"default": MEMORY, "ro": raw(f"file:{db}?mode=ro")})
+    assert snapshot(tmp_path) == before
+    item = one(data, "database", "ro", "connect")
+    assert item["level"] == "unknown"
+    assert "-shm" in item["message"]
+    assert items(data, "database", "ro", "journal_mode") == []
+    assert rc == 1
+
+
+def test_read_only_rollback_db_leaves_directory_unchanged(tmp_path):
+    db = make_db(tmp_path / "app.sqlite3")
+    before = snapshot(tmp_path)
+    rc, data = doctor({"default": MEMORY, "ro": raw(f"file:{db}?mode=ro")})
+    assert snapshot(tmp_path) == before
+    assert one(data, "database", "ro", "journal_mode")["value"] == "DELETE"
+    assert rc == 0
+
+
+def test_read_only_wal_db_with_live_writer_is_connected(tmp_path):
+    db = _wal_db(tmp_path / "wal.sqlite3")
+    writer = sqlite3.connect(db)  # 쓰는 쪽이 열려 있으면 -shm 이 있다
+    writer.execute("INSERT INTO t VALUES (1)")
+    writer.commit()
+    try:
+        assert Path(f"{db}-shm").exists()
+        rc, data = doctor({"default": MEMORY, "ro": raw(f"file:{db}?mode=ro")})
+        assert one(data, "database", "ro", "journal_mode")["value"] == "WAL"
+        assert rc == 0
+    finally:
+        writer.close()
+
+
+@needs_litestream
+def test_dedicated_channel_db_not_expected_in_litestream_config(tmp_path):
+    lab = Path(os.path.realpath(tmp_path))
+    app = make_db(lab / "app.sqlite3")
+    chan = make_db(lab / "channels.sqlite3")
+    rc, data = doctor(
+        {"default": sqlite_database(app), "channels": sqlite_database(chan)},
+        "--litestream-config",
+        str(_config(lab, str(app))),
+        CHANNEL_LAYERS={"default": {"BACKEND": LITE, "CONFIG": {"database": "channels"}}},
+    )
+    assert items(data, "litestream", "channels", "replicated") == []
+    assert one(data, "channels", "default", "replicated")["level"] == "ok"
+    assert problems(data) == []
+    assert rc == 0
+
+
+@needs_litestream
+def test_channel_db_sharing_app_file_still_needs_replication(tmp_path):
+    lab = Path(os.path.realpath(tmp_path))
+    app = make_db(lab / "app.sqlite3")
+    other = make_db(lab / "other.sqlite3")
+    rc, data = doctor(
+        {"default": sqlite_database(app), "channels": sqlite_database(app)},
+        "--litestream-config",
+        str(_config(lab, str(other))),
+        CHANNEL_LAYERS={"default": {"BACKEND": LITE, "CONFIG": {"database": "channels"}}},
+    )
+    assert one(data, "litestream", "default", "replicated")["level"] == "warn"
+    assert one(data, "litestream", "channels", "replicated")["level"] == "warn"
