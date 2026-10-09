@@ -224,7 +224,7 @@ django_sqlite_ops/
   | `foreign_keys` | `ON` | Django sqlite3 백엔드가 이미 켠다 — 생성 함수는 건드리지 않는다 | 해당 없음 |
   | `temp_store`, `mmap_size`, `cache_size`, `journal_size_limit` | 후보 | 랩 벤치(§10, 2026-10-08): 개선이 재현된 후보 없음. `cache_size=-65536` 단독은 반복마다 나빠짐(처리량 −8~−12%, p99 +17~+27%, `CONN_MAX_AGE=0`)([`lab-2026-10-08.md`](research/lab-2026-10-08.md#pragma-벤치)). 재측정(#26, `CONN_MAX_AGE` 0·None × WAL 이 자라는 부하): 재현된 차이 없음, `cache_size` 악화도 재현 안 됨(소음 큼, #27). `journal_size_limit` 은 Litestream 과 함께면 WAL 을 묶지 못함(관측: 그 변형의 `write` 10단계 중 4단계에서만 64 MiB 로 잘리고 다시 자람. SQLite 는 재시작 뒤 첫 커밋한 연결의 한도로만 자르고 Litestream 은 체크포인트 직후 자기 연결로 쓴다 — 구조는 코드상 확인, 대개 Litestream 이 먼저 커밋한다는 것은 추정)([`bench-2026-10-08.md`](research/bench-2026-10-08.md)) | 끔 |
   | `wal_autocheckpoint` | 건드리지 않음 | Litestream 이 체크포인트를 관리한다. 바꾸면 복제와 충돌할 수 있다 [확인 필요] | 끔 |
-  | `CONN_MAX_AGE` | 프로필별 | VFS 별칭은 `None` 필수(실측 1,008ms → 1.7ms, WSGI). ASGI 동기 뷰(일반 별칭)에서는 `None` 이어도 요청마다 새 연결이고(요청마다 새 스레드), 닫히지 않은 연결이 fd 를 쌓아 500 이 났다(재현함, [`bench-2026-10-08.md`](research/bench-2026-10-08.md#결과-연결-재사용)). ASGI 의 VFS 별칭은 미검증 | 2단계(VFS 프로필) |
+  | `CONN_MAX_AGE` | 프로필별 | VFS 별칭은 `None` 필수(실측 1,008ms → 1.7ms, WSGI). ASGI 동기 뷰(일반 별칭)에서는 `None` 이어도 요청마다 새 연결이고(요청마다 새 스레드), 닫히지 않은 연결이 fd 를 쌓아 500 이 났다(재현함, [`bench-2026-10-08.md`](research/bench-2026-10-08.md#결과-연결-재사용)). ASGI 의 VFS 별칭은 미검증. 일반 별칭의 `None` 은 ASGI 로 판단되면 W005 로 알린다(§6-1) | 2단계(VFS 프로필) |
 
 - `init_command` 는 연결마다 실행된다. 그래서 가벼운 PRAGMA 만 넣고, 데이터나 스키마를 바꾸는 문장은 넣지 않는다.
 
@@ -240,9 +240,30 @@ django_sqlite_ops/
 | `sqlite_ops.E002` | `SQLITE_OPS["HEALTH"]`(§7)가 잘못됨: dict 가 아님, 모르는 키, `DATABASES` 가 비었거나 `DATABASES` 에 없는·sqlite3 가 아닌 별칭, 별칭 항목이 dict 가 아님·`litestream_config` 없음·`meta_path`/`litestream` 이 빈 값, `REFRESH` 가 양수 아님, `BACKLOG_GRACE` 가 음수(숫자가 아니거나 bool·무한대 포함). `HEALTH` 가 없으면 검사하지 않는다. 검증은 `health.parse_config()` 한 곳이고 뷰도 같은 결과를 쓴다. `obj` 는 해당 별칭(설정 전체 문제면 없음) | Error (항상, ASGI 포함) |
 | `sqlite_ops.W001` | sqlite3 별칭의 `OPTIONS.transaction_mode` 가 `IMMEDIATE` 가 아님(없음 포함, 대소문자 무시). 읽기 전용·VFS 별칭은 건너뛴다 | Warning (`--deploy` 일 때만) |
 | `sqlite_ops.W002` | `init_command` 에서 `journal_mode` 가 `WAL` 로 설정되지 않음, 또는 판정할 수 없음. Django 처럼 `;` 로 나눈 문장마다 SQL 주석을 지우고 보며, 마지막으로 확정된 설정값을 쓴다. 대소문자·공백·인용 식별자(`"…"`·`` `…` ``·`[…]`)·`main.` 접두는 인정하고 다른 스키마는 세지 않는다. `journal_mode` 를 언급하지만 형식을 확정할 수 없는 문장이 하나라도 있으면 판정할 수 없다고 경고한다. 메모리 DB·읽기 전용·VFS 별칭은 건너뛴다 | Warning (`--deploy`) |
-| `sqlite_ops.W003` | 이름이 Litestream VFS(`vfs=litestream` 이 든 `file:` URI)인 별칭의 `CONN_MAX_AGE` 가 `None` 이 아님(키 없음 = Django 기본 0 포함), 그리고 `ASGI_APPLICATION` 미설정(WSGI 로 판단). ASGI 는 미검증이라 내지 않는다(교차 리뷰) | Warning (항상) |
+| `sqlite_ops.W003` | 이름이 Litestream VFS(`vfs=litestream` 이 든 `file:` URI)인 별칭의 `CONN_MAX_AGE` 가 `None` 이 아님(키 없음 = Django 기본 0 포함), 그리고 ASGI 근거가 없음(WSGI 로 판단, 아래 'ASGI 판단'). ASGI 는 미검증이라 내지 않는다(교차 리뷰) | Warning (항상) |
+| `sqlite_ops.W005` | VFS 가 아닌(`vfs=litestream` 이 없는) sqlite3 별칭의 `CONN_MAX_AGE` 가 `None`(키가 있고 값이 `None`), 그리고 ASGI 근거가 있음. 메모리·읽기 전용·W004 대상 별칭도 VFS 가 아니면 본다. 메시지에 판단 근거를 적는다. 0·양수·키 없음에는 내지 않는다 | Warning (항상) |
 | `sqlite_ops.W004` | `NAME` 으로 별칭 역할(쓰기·읽기 전용·메모리·VFS)을 판정할 수 없음: URI 쿼리 키 `mode`·`immutable`·`vfs` 중복, `mode` 가 `ro`·`rw`·`rwc`·`memory` 밖, `immutable` 이 SQLite 불리언 표기 밖, 디코딩한 파일명이나 쿼리 키·값(역할과 무관한 키 포함)에 NUL, `file://` 의 authority 가 빈 값·`localhost` 가 아님. 이 별칭에는 W001·W002 를 내지 않는다 | Warning (`--deploy`) |
 
+- **ASGI 판단**(W003·W005 공통, `checks._asgi_evidence()`): 서버 실행 명령은 설정에 없으므로 설정에서 정적으로 보이는 근거만 쓴다. 한 설정에는 판단이 하나라 W003(WSGI 일 때만)과 W005(ASGI 일 때만)가 서로 반대로 판단하지 않는다(테스트 `test_w003_w005_never_disagree_in_one_settings`).
+
+  | 근거 | 판단 | 이유 |
+  |---|---|---|
+  | `ASGI_APPLICATION` 이 참값 | ASGI | channels·daphne 가 쓰는 설정. Django 자체 설정이 아니므로 넣었다면 ASGI 서버를 쓰려는 것이다 |
+  | `SQLITE_OPS` 에 `"PROFILE"` 키(값 무관 — 모르는 값은 E001 이 먼저 막는다) | ASGI | 두 배포 프로필은 ASGI 서버로 띄운다: 문서의 앱 프로세스가 `uvicorn --workers 1`·`uvicorn --workers N` 이고 entrypoint 가 `exec uvicorn proj.asgi:application` 이다(`docs/profiles/*.md`, §8). 기본값으로 정해진 프로필(키 없음)은 근거가 아니다 — 모든 설정에 적용되기 때문이다 |
+  | 위 둘 다 없음 | WSGI | 종전 W003 규칙과 같다 |
+  | `WSGI_APPLICATION` | 근거로 쓰지 않음 | `startproject` 의 settings 템플릿이 늘 넣는다(Django 의 기본값은 `None`) |
+  | `INSTALLED_APPS` 의 `daphne`·`channels` | 근거로 쓰지 않음 | 설치만으로는 실행 서버를 알 수 없다. 프로필 문서의 channels 구성은 `ASGI_APPLICATION` 을 함께 두므로 첫 행이 잡는다 |
+
+  | 사례 | 실제 서버 | 판단 | 결과 |
+  |---|---|---|---|
+  | 프로필 문서 그대로(`ASGI_APPLICATION` + `PROFILE`) | uvicorn | ASGI | 맞음 |
+  | channels 없이 `PROFILE` 만 두고 `ASGI_APPLICATION` 을 뺌(single-server 문서가 허용) | uvicorn | ASGI | 맞음 |
+  | `PROFILE`·`ASGI_APPLICATION` 둘 다 없음 | uvicorn·daphne·hypercorn | WSGI | **미탐**: W005 가 나지 않고, VFS 별칭이면 W003 이 난다(ASGI 의 VFS 동작은 미검증이라 그 W003 은 근거가 없다). 정적으로 알 수 없어 남긴다 |
+  | `PROFILE` 또는 `ASGI_APPLICATION` 이 있음 | gunicorn(WSGI) | ASGI | **오탐**: W005 가 나고(WSGI 에서는 `None` 이 재사용된다), VFS 별칭의 W003 이 빠진다. `SILENCED_SYSTEM_CHECKS` 로 끈다 |
+  | 웹소켓만 daphne, HTTP 는 gunicorn(혼합) | 둘 다 | ASGI | 프로세스마다 다르다. ASGI 프로세스 기준으로 경고한다(오탐일 수 있다) |
+  | 아무 근거 없음 | gunicorn | WSGI | 맞음 |
+
+- W005 근거: ASGI(uvicorn, Django 6.1) 동기 뷰에서 일반 별칭의 `None` 은 DB 요청마다 새 연결(연결 생성 ≈1.0/요청)이고 요청 끝에 닫히지 않아 열린 DB fd 가 810–982(한도 1024)까지 쌓였으며 `unable to open database file` 500 이 났다(재현함, [`bench-2026-10-08.md`](research/bench-2026-10-08.md#결과-연결-재사용)). 원인이 fd 고갈이라는 것은 추정이다(SQLite 메시지에 errno 가 없다). 그래서 메시지는 fd 고갈을 "suspected cause" 로만 쓴다. 권장은 `0` 또는 키 삭제(기본 0)이고, `0` 일 때 재사용 이득도 없었다. 양수 `CONN_MAX_AGE` 는 재지 않아 경고하지 않는다(§12).
 - W001 은 권고 수준이다. Django 는 `DEFERRED`·`EXCLUSIVE`·`IMMEDIATE` 를 모두 허용하므로 오류로 올리지 않는다(교차 리뷰).
 - 원칙: **판정할 수 없으면 경고한다.** 정적 체크는 SQL 파서가 아니므로 모르는 형식을 조용히 건너뛰지 않는다. 체크 결과는 실제 Django 연결의 `PRAGMA journal_mode` 와 대조하는 표 테스트로 고정한다(`tests/test_checks.py`).
 - 원칙(별칭 역할): **역할(쓰기·읽기 전용·메모리·VFS)을 확정할 수 없으면 쓰기 권고(W001·W002)를 내지 않고 W004 를 낸다.** 잘못된 권고로 연결을 깨뜨리지 않으면서 문제를 조용히 넘기지도 않는다. W004 는 쓰기 설정을 넣어도 사라지지 않는다. SQLite 의 중복·비표준 해석을 흉내 내지 않는다(중복 `mode` 는 순서에 따라 읽기 전용이 되거나 연결 오류가 난다 — 재현함).
@@ -471,6 +492,7 @@ SQLITE_OPS = {
 
 ## 12. 미검증·확인 필요
 - ASGI 에서의 VFS 별칭 `CONN_MAX_AGE` 동작 (미검증). 일반 별칭은 확인함: 동기 뷰에서 `None` 은 재사용되지 않고 fd 를 쌓는다([`bench-2026-10-08.md`](research/bench-2026-10-08.md#결과-연결-재사용))
+- W003·W005 의 ASGI 판단은 설정만 본다. `PROFILE`·`ASGI_APPLICATION` 없이 ASGI 서버로 띄우는 경우는 정적으로 알 수 없어 미탐으로 남긴다(§6-1 'ASGI 판단'). W005 는 #26 원자료가 근거이고 랩에서 따로 재현하지 않았다. 양수 `CONN_MAX_AGE` 의 ASGI 동작은 재지 않았다
 - PRAGMA 후보의 5% 크기 효과: #26 실행은 반복 간 흔들림(약 7%)이 커서 검출하지 못했다. `cache_size` 단독 악화의 원인(#27)
 - 실제 클라우드 S3·R2·Tigris (미검증. 비용이 들어 마스터 승인 필요)
 - 회귀 랩은 SeaweedFS 4.48 + toxiproxy 2.12.0 으로만 돌았다(colima linux/arm64 와 GitHub Actions ubuntu-latest linux/amd64, 둘 다 11/11 통과 — [`lab-2026-10-08.md`](research/lab-2026-10-08.md#amd64-실행-github-actions-25)). 다른 S3 구현은 미검증

@@ -260,17 +260,34 @@ def _health_errors() -> list[checks.Error]:
     ]
 
 
+def _asgi_evidence() -> str | None:
+    """ASGI 로 도는 근거를 돌려준다. 없으면 ``None``(WSGI 로 본다). W003·W005 가 함께 쓴다.
+
+    근거는 ``ASGI_APPLICATION`` 설정, 그리고 명시한 ``SQLITE_OPS["PROFILE"]`` 이다(두 배포
+    프로필은 ASGI 서버로 띄운다, DESIGN §8). 기본값으로 정해진 프로필은 근거가 아니다.
+    ``WSGI_APPLICATION`` 은 ``startproject`` 가 늘 넣으므로 WSGI 근거로 쓰지 않는다. 판단 표와
+    미탐은 DESIGN §6-1.
+    """
+    if getattr(settings, "ASGI_APPLICATION", None):
+        return "ASGI_APPLICATION is set"
+    config = getattr(settings, "SQLITE_OPS", {})
+    if isinstance(config, Mapping) and "PROFILE" in config:
+        return f"SQLITE_OPS['PROFILE'] = {config['PROFILE']!r} is an ASGI deployment profile"
+    return None
+
+
 def check_settings(app_configs=None, **kwargs):
-    """항상 도는 체크: E001(프로필), E002(헬스 설정), W003(VFS 별칭의 ``CONN_MAX_AGE``)."""
+    """항상 도는 체크: E001(프로필), E002(헬스 설정), W003·W005(별칭의 ``CONN_MAX_AGE``)."""
     _, error = _profile()
     if error:
         return [error]
     messages: list = _health_errors()
-    if getattr(settings, "ASGI_APPLICATION", None):
-        # ASGI 의 영속 연결은 미검증이다. 보편적으로 강제하지 않는다 (DESIGN §6-1).
-        return messages
+    asgi = _asgi_evidence()
     for alias, config in _sqlite_aliases():
-        if _is_litestream_vfs(config.get("NAME")) and config.get("CONN_MAX_AGE", 0) is not None:
+        vfs = _is_litestream_vfs(config.get("NAME"))
+        conn_max_age = config.get("CONN_MAX_AGE", 0)
+        if asgi is None and vfs and conn_max_age is not None:
+            # ASGI 의 VFS 별칭은 미검증이다. WSGI 로 판단될 때만 낸다 (DESIGN §6-1)
             messages.append(
                 checks.Warning(
                     f"Litestream VFS database {alias!r} reconnects per request "
@@ -281,6 +298,23 @@ def check_settings(app_configs=None, **kwargs):
                     ),
                     obj=alias,
                     id="sqlite_ops.W003",
+                )
+            )
+        elif asgi is not None and not vfs and conn_max_age is None:
+            messages.append(
+                checks.Warning(
+                    f"Database {alias!r} has CONN_MAX_AGE = None under ASGI ({asgi}).",
+                    hint=(
+                        "Under ASGI, sync views run in a new thread per request, so the "
+                        "connection is not reused and is not closed at request end; a benchmark "
+                        "saw 810-982 open database file descriptors (limit 1024) and 'unable to "
+                        "open database file' errors (fd exhaustion is the suspected cause). "
+                        f'Set DATABASES["{alias}"]["CONN_MAX_AGE"] = 0 or remove the key. '
+                        "See docs/research/bench-2026-10-08.md and DESIGN §6-1; if this "
+                        "project runs under WSGI, silence sqlite_ops.W005."
+                    ),
+                    obj=alias,
+                    id="sqlite_ops.W005",
                 )
             )
     return messages

@@ -1,4 +1,4 @@
-"""정적 시스템 체크 W001–W003·E001 (DESIGN §6-1).
+"""정적 시스템 체크 W001–W005·E001 (DESIGN §6-1).
 
 Django 설정은 프로세스당 한 번만 정할 수 있어서, 시나리오마다 새 인터프리터에서
 ``settings.configure()`` → ``django.setup()`` 을 한다(기존 테스트와 같은 방식, 새 의존성 없음).
@@ -168,10 +168,17 @@ def test_w003_negative_conn_max_age_none():
     assert run_checks({"default": db}) == []
 
 
-def test_w003_negative_asgi():
-    # ASGI 의 영속 연결은 미검증이라 내지 않는다 (교차 리뷰)
+@pytest.mark.parametrize(
+    "evidence",
+    [
+        {"ASGI_APPLICATION": "proj.asgi.application"},
+        {"SQLITE_OPS": {"PROFILE": "single-server"}},
+    ],
+)
+def test_w003_negative_asgi(evidence):
+    # ASGI 의 영속 연결은 미검증이라 내지 않는다 (교차 리뷰). ASGI 판단은 W005 와 같은 규칙이다
     db = sqlite_database(VFS)
-    assert run_checks({"default": db}, ASGI_APPLICATION="proj.asgi.application") == []
+    assert run_checks({"default": db}, **evidence) == []
 
 
 @pytest.mark.parametrize(
@@ -179,6 +186,182 @@ def test_w003_negative_asgi():
 )
 def test_w003_negative_not_vfs(name):
     assert run_checks({"default": sqlite_database(name)}) == []
+
+
+# W005: 일반 별칭 + CONN_MAX_AGE=None (ASGI)
+
+# ASGI 판단 근거(DESIGN §6-1 표). 값: 설정, ASGI 로 판단하는가
+EVIDENCE = {
+    "none": ({}, False),
+    "wsgi_application": ({"WSGI_APPLICATION": "proj.wsgi.application"}, False),
+    "asgi_application": ({"ASGI_APPLICATION": "proj.asgi.application"}, True),
+    "asgi_application_empty": ({"ASGI_APPLICATION": ""}, False),
+    "profile_single": ({"SQLITE_OPS": {"PROFILE": "single-server"}}, True),
+    "profile_multiproc": ({"SQLITE_OPS": {"PROFILE": "single-server-multiproc"}}, True),
+    "sqlite_ops_without_profile": ({"SQLITE_OPS": {}}, False),  # 기본 프로필은 근거가 아니다
+    "both": (
+        {
+            "ASGI_APPLICATION": "proj.asgi.application",
+            "WSGI_APPLICATION": "proj.wsgi.application",
+            "SQLITE_OPS": {"PROFILE": "single-server"},
+        },
+        True,
+    ),
+}
+# 별칭 종류: NAME, VFS 별칭인가
+KINDS = {
+    "default": ("/srv/app/app.sqlite3", False),  # 일반 쓰기 별칭
+    "readonly": ("file:/srv/app/app.sqlite3?mode=ro", False),
+    "memory": (":memory:", False),
+    "vfs": (VFS, True),
+}
+MISSING = object()
+CONN_MAX_AGES = {"missing": MISSING, "zero": 0, "none": None, "positive": 60}
+
+
+@pytest.mark.parametrize("cma", CONN_MAX_AGES)
+@pytest.mark.parametrize("evidence", EVIDENCE)
+def test_w003_w005_table(evidence, cma):
+    # 종류마다 별칭 하나씩 한 설정에 넣는다. 한 설정의 ASGI 판단은 하나라 W003·W005 가
+    # 함께 나지 않는다.
+    # W003: WSGI 판단 · VFS · None 아님. W005: ASGI 판단 · VFS 아님 · None
+    extra, asgi = EVIDENCE[evidence]
+    value = CONN_MAX_AGES[cma]
+    databases = {}
+    for kind, (name, _) in KINDS.items():
+        db = sqlite_database(name)
+        if value is not MISSING:
+            db["CONN_MAX_AGE"] = value
+        databases[kind] = db
+    expected = []
+    for kind, (_, vfs) in KINDS.items():
+        if not asgi and vfs and value is not None:
+            expected.append(("sqlite_ops.W003", kind))
+        if asgi and not vfs and value is None:
+            expected.append(("sqlite_ops.W005", kind))
+    assert run_checks(databases, deploy=False, **extra) == sorted(expected)
+
+
+@pytest.mark.parametrize("evidence", EVIDENCE)
+def test_w003_w005_never_disagree_in_one_settings(evidence):
+    # 한 설정에 W003 대상(VFS·0)과 W005 대상(일반·None)을 함께 둔다. 판단이 하나라 둘 중 하나만 난다
+    extra, asgi = EVIDENCE[evidence]
+    databases = {
+        "default": {**sqlite_database("/srv/app/app.sqlite3"), "CONN_MAX_AGE": None},
+        "replica": {**sqlite_database(VFS), "CONN_MAX_AGE": 0},
+    }
+    expected = [("sqlite_ops.W005", "default")] if asgi else [("sqlite_ops.W003", "replica")]
+    assert run_checks(databases, **extra) == expected
+
+
+def test_w005_skips_non_sqlite_engines():
+    databases = {
+        "default": {"ENGINE": "django.db.backends.postgresql", "NAME": "app", "CONN_MAX_AGE": None},
+        "other": {
+            "ENGINE": "myproject.backends.sqlite3",
+            "NAME": "/srv/x.sqlite3",
+            "CONN_MAX_AGE": None,
+        },
+    }
+    assert run_checks(databases, ASGI_APPLICATION="proj.asgi.application") == []
+
+
+SILENCED_SCRIPT = """
+import io
+import json
+import sys
+
+import django
+from django.conf import settings
+
+from django_sqlite_ops.database import sqlite_database
+
+db = {**sqlite_database("/srv/app/app.sqlite3"), "CONN_MAX_AGE": None}
+settings.configure(
+    INSTALLED_APPS=["django_sqlite_ops"],
+    DATABASES={"default": db},
+    ASGI_APPLICATION="proj.asgi.application",
+    SILENCED_SYSTEM_CHECKS=json.loads(sys.argv[1]),
+)
+django.setup()
+
+from django.core.management import call_command
+
+err = io.StringIO()
+call_command("check", stderr=err)
+print(err.getvalue())
+"""
+
+
+@pytest.mark.parametrize("silenced", [[], ["sqlite_ops.W005"]])
+def test_w005_silenced(silenced):
+    # SILENCED_SYSTEM_CHECKS 는 run_checks() 가 아니라 check 명령이 거른다
+    result = subprocess.run(
+        [sys.executable, "-c", SILENCED_SCRIPT, json.dumps(silenced)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    assert ("default: (sqlite_ops.W005)" in result.stdout) == (not silenced)
+
+
+@pytest.mark.parametrize(
+    ("extra", "reason"),
+    [
+        ({"ASGI_APPLICATION": "proj.asgi.application"}, "ASGI_APPLICATION is set"),
+        (
+            {"SQLITE_OPS": {"PROFILE": "single-server-multiproc"}},
+            "SQLITE_OPS['PROFILE'] = 'single-server-multiproc' is an ASGI deployment profile",
+        ),
+    ],
+)
+def test_w005_message(extra, reason):
+    result = subprocess.run(
+        [sys.executable, "-c", W005_MESSAGE_SCRIPT, json.dumps(extra)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    ident, obj, level, msg, hint = result.stdout.rstrip("\n").split("\n")
+    assert (ident, obj, level) == ("sqlite_ops.W005", "default", "30")
+    assert msg == f"Database 'default' has CONN_MAX_AGE = None under ASGI ({reason})."
+    for part in (
+        "not reused",
+        "810-982",
+        "suspected cause",
+        'DATABASES["default"]["CONN_MAX_AGE"] = 0 or remove the key',
+        "docs/research/bench-2026-10-08.md",
+        "DESIGN §6-1",
+        "silence sqlite_ops.W005",
+    ):
+        assert part in hint
+
+
+W005_MESSAGE_SCRIPT = """
+import json
+import sys
+
+import django
+from django.conf import settings
+
+from django_sqlite_ops.database import sqlite_database
+
+db = {**sqlite_database("/srv/app/app.sqlite3"), "CONN_MAX_AGE": None}
+settings.configure(
+    INSTALLED_APPS=["django_sqlite_ops"], DATABASES={"default": db}, **json.loads(sys.argv[1])
+)
+django.setup()
+
+from django.core.checks import run_checks
+
+for m in run_checks():
+    if m.id.startswith("sqlite_ops."):
+        print(m.id, m.obj, m.level, m.msg, m.hint, sep="\\n")
+"""
 
 
 # 대상 고르기·여러 별칭
@@ -308,6 +491,10 @@ settings.configure(
     },
     SECRET_KEY="x" * 64,
 )
+if sys.argv[2:] == ["asgi"]:
+    # W005 경로도 DB 를 열지 않는다
+    settings.ASGI_APPLICATION = "proj.asgi.application"
+    settings.DATABASES["raw"]["CONN_MAX_AGE"] = None
 django.setup()
 
 from django.core.management import call_command
@@ -322,9 +509,12 @@ print(err.getvalue())
 """
 
 
-def test_check_deploy_does_not_open_database(tmp_path):
+@pytest.mark.parametrize(
+    ("server", "conn_max_age_id"), [("wsgi", "sqlite_ops.W003"), ("asgi", "sqlite_ops.W005")]
+)
+def test_check_deploy_does_not_open_database(tmp_path, server, conn_max_age_id):
     result = subprocess.run(
-        [sys.executable, "-c", NO_CONNECT_SCRIPT, str(tmp_path)],
+        [sys.executable, "-c", NO_CONNECT_SCRIPT, str(tmp_path), server],
         cwd=ROOT,
         capture_output=True,
         text=True,
@@ -333,7 +523,7 @@ def test_check_deploy_does_not_open_database(tmp_path):
     assert result.returncode == 0, result.stderr
     files, _, report = result.stdout.partition("\n")
     assert files == "[]"  # DB 파일·디렉터리가 생기지 않았다
-    for expected in ("(sqlite_ops.W001) ", "(sqlite_ops.W002) ", "(sqlite_ops.W003) "):
+    for expected in ("(sqlite_ops.W001) ", "(sqlite_ops.W002) ", f"({conn_max_age_id}) "):
         assert expected in report
     assert "?: (sqlite_ops." not in report  # obj 는 별칭 이름이다
     assert "raw: (sqlite_ops.W001)" in report

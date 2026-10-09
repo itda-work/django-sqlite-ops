@@ -94,6 +94,7 @@ CHANNEL_LAYERS = {
 
 - `profile` 은 지금 두 프로필의 DB 설정이 같다. 그래도 배포 형태에 맞는 이름을 쓴다([README 프로필](../../README.md#프로필)). `SQLITE_OPS["PROFILE"]` 은 시스템 체크와 `sqlite_doctor` 의 기준이다.
 - `channels` 를 쓰지 않는 앱이면 `CHANNEL_LAYERS` 와 `ASGI_APPLICATION` 은 빼도 된다. `sqlite_doctor` 와 시스템 체크는 `CHANNEL_LAYERS` 를 문자열로만 읽고 `channels` 를 import 하지 않는다.
+- `SQLITE_OPS["PROFILE"]` 은 빼지 않는다. 시스템 체크는 이 키나 `ASGI_APPLICATION` 이 있을 때 ASGI 로 판단해 `CONN_MAX_AGE=None` 을 `sqlite_ops.W005` 로 알린다. 둘 다 없으면 uvicorn 으로 띄워도 WSGI 로 본다([README ASGI 판단](../../README.md#asgi-판단)).
 
 ### `urls.py` — 복제 헬스
 

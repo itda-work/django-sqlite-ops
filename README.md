@@ -255,7 +255,8 @@ python manage.py check --deploy   # W001·W002·W004 는 --deploy 일 때만 나
 | `sqlite_ops.E002` | `SQLITE_OPS["HEALTH"]` 가 잘못됨: dict 가 아님, 모르는 키, `DATABASES` 가 비었거나 `DATABASES` 에 없는·sqlite3 가 아닌 별칭, `litestream_config` 없음, `REFRESH` 가 양수가 아님, `BACKLOG_GRACE` 가 음수 등. `HEALTH` 가 없으면 검사하지 않는다 | 항상 | [복제 헬스](#복제-헬스)의 설정 형식대로 고친다 |
 | `sqlite_ops.W001` | `OPTIONS["transaction_mode"]` 가 `IMMEDIATE` 가 아님(없음 포함, 대소문자 무시) | `--deploy` | `sqlite_database()` 를 쓰거나 `"transaction_mode": "IMMEDIATE"` 를 넣는다 |
 | `sqlite_ops.W002` | `OPTIONS["init_command"]` 에서 `journal_mode` 가 `WAL` 로 설정되지 않음, 또는 `journal_mode` 를 언급하는 문장의 형식을 판정할 수 없음 | `--deploy` | `sqlite_database()` 를 쓰거나 `init_command` 에 `PRAGMA journal_mode=WAL` 을 넣는다 |
-| `sqlite_ops.W003` | 이름이 Litestream VFS(`vfs=litestream` 이 든 `file:` URI)인 별칭의 `CONN_MAX_AGE` 가 `None` 이 아님, `ASGI_APPLICATION` 미설정(WSGI) | 항상 | 그 별칭에 `"CONN_MAX_AGE": None`. WSGI 실측에서 요청당 1,008ms → 1.7ms |
+| `sqlite_ops.W003` | 이름이 Litestream VFS(`vfs=litestream` 이 든 `file:` URI)인 별칭의 `CONN_MAX_AGE` 가 `None` 이 아님, 그리고 [ASGI 근거](#asgi-판단)가 없음(WSGI 로 본다) | 항상 | 그 별칭에 `"CONN_MAX_AGE": None`. WSGI 실측에서 요청당 1,008ms → 1.7ms |
+| `sqlite_ops.W005` | VFS 가 아닌 SQLite 별칭의 `CONN_MAX_AGE` 가 `None`, 그리고 [ASGI 근거](#asgi-판단)가 있음 | 항상 | 그 별칭의 `"CONN_MAX_AGE"` 를 `0` 으로 하거나 키를 지운다. ASGI 동기 뷰에서는 연결이 재사용되지 않고 닫히지도 않는다([문제 해결](#설정체크)) |
 | `sqlite_ops.W004` | `NAME` 의 URI 로 별칭 역할(쓰기·읽기 전용·메모리·VFS)을 판정할 수 없음. 이때 W001·W002 는 내지 않는다 | `--deploy` | authority 는 비우거나 `localhost` 로(`file:///path`), `%00` 을 빼고, URI 쿼리 키 `mode`·`immutable`·`vfs` 를 한 번씩, 표준 표기(`mode=ro\|rw\|rwc\|memory`, `immutable=1\|0`)로 쓴다 |
 
 - 기준값은 `sqlite_database()` 와 같은 권장값 표에서 읽는다. 프로필은 `SQLITE_OPS["PROFILE"]` 이고 없으면 `"single-server"` 다.
@@ -267,7 +268,21 @@ python manage.py check --deploy   # W001·W002·W004 는 --deploy 일 때만 나
   - 읽기 전용 — `mode=ro`, `immutable` 참값(`1`·`yes`·`true`·`on`, 대소문자 무시): W001·W002 를 건너뛴다. 읽기 전용 연결에 `PRAGMA journal_mode=WAL` 을 넣으면 `attempt to write a readonly database` 로 연결이 깨지거나(`mode=ro`) 아무 효과가 없다(`immutable`). `immutable` 거짓값(`0`·`no`·`false`·`off`)은 쓰기 DB 다.
   - Litestream VFS(`vfs=litestream`): W001·W002 를 건너뛴다. W003 은 그대로 본다.
   - **판정할 수 없음 → W004** — `mode`·`immutable`·`vfs` 가 두 번 이상 나오거나(`mode=rwc&mode=ro`), `mode` 가 `ro`·`rw`·`rwc`·`memory` 가 아니거나(`mode=RO`, `mode=ro%00x`), `immutable` 이 위 불리언 표기가 아닐 때(`immutable=2`), 디코딩한 파일명이나 쿼리 키·값에 NUL(`%00`)이 있을 때(`mode%00x=ro` — SQLite 는 NUL 앞까지만 읽어 역할 키가 숨는다. URI 가 아닌 일반 경로의 `%00` 은 글자 그대로라 해당 없다), `file://` 뒤 authority 가 빈 값이나 정확히 `localhost` 가 아닐 때(`file://example.com/…`, `file://LOCALHOST/…` — SQLite 는 연결 오류를 낸다. `file://localhost/srv/app.sqlite3`·`file:///srv/app.sqlite3` 는 로컬 파일이다). 이때는 W001·W002 를 내지 않는다. SQLite 는 중복 키를 순서에 따라 다르게 해석해서(`mode=rwc&mode=ro` 는 읽기 전용, `mode=ro&mode=rwc` 는 연결 오류) 쓰기 권고를 따르면 연결이 깨질 수 있기 때문이다. W004 는 쓰기 설정을 넣어도 사라지지 않는다. 쿼리 키를 한 번씩, 표준 표기로 고쳐 쓴다.
-- W003 은 ASGI 에서는 내지 않는다. ASGI 의 영속 연결은 아직 재지 않았고, Django 는 async 에서 영속 연결을 끄라고 권한다.
+- W003 은 ASGI 에서는 내지 않는다. ASGI 의 VFS 별칭 영속 연결은 아직 재지 않았고, Django 는 async 에서 영속 연결을 끄라고 권한다.
+- W005 는 ASGI 에서 일반(VFS 아닌) 별칭에 `CONN_MAX_AGE=None` 을 준 경우다. uvicorn·Django 6.1 동기 뷰 실측에서 DB 요청마다 연결이 새로 열렸고(재사용 없음), 요청이 끝나도 닫히지 않아 열린 DB 파일 디스크립터가 810–982개(한도 1024)까지 쌓이며 `unable to open database file` 500 이 났다. fd 고갈이 원인이라는 것은 추정이다([재측정](docs/research/bench-2026-10-08.md#결과-연결-재사용)).
+
+#### ASGI 판단
+
+W003 과 W005 는 같은 규칙으로 ASGI 인지 판단한다. 한 설정에서 둘의 판단이 엇갈리지 않는다(W003 은 WSGI 일 때만, W005 는 ASGI 일 때만 난다). 서버 실행 명령은 설정에서 보이지 않으므로 아래 근거만 본다.
+
+| 설정 | 판단 |
+|---|---|
+| `ASGI_APPLICATION` 이 빈 값이 아님 | ASGI |
+| `SQLITE_OPS` 에 `"PROFILE"` 키가 있음(값은 무엇이든). 두 [배포 프로필](#배포-프로필)은 ASGI 서버(uvicorn)로 띄운다 | ASGI |
+| 둘 다 없음(`WSGI_APPLICATION` 은 `startproject` 가 늘 넣으므로 보지 않는다) | WSGI |
+
+- 놓치는 경우: `SQLITE_OPS["PROFILE"]` 도 `ASGI_APPLICATION` 도 없이 `uvicorn proj.asgi:application` 으로 띄우면 WSGI 로 본다. W005 가 나지 않고, VFS 별칭이면 W003 이 난다. 프로필을 적어 두면 ASGI 로 판단된다.
+- 잘못 잡는 경우: 프로필을 적었거나 `ASGI_APPLICATION` 이 있는데 실제로는 gunicorn(WSGI)으로 띄우면 ASGI 로 본다. W005 가 나고, VFS 별칭의 W003 은 나지 않는다. 이때는 `SILENCED_SYSTEM_CHECKS = ["sqlite_ops.W005"]` 로 끈다.
 - 경고를 끄려면 Django 표준 `SILENCED_SYSTEM_CHECKS` 를 쓴다. 이 앱의 체크만 돌리려면 `check --tag sqlite_ops`.
 
 ```python
@@ -705,7 +720,7 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 | `options={"timeout": 20}` 을 줬는데 잠금 대기가 5초다 | Django 는 연결을 연 뒤 `init_command` 를 실행하므로 `PRAGMA busy_timeout=5000`(밀리초)이 `timeout`(초)을 덮는다 | `pragmas={"busy_timeout": 20000}`([`timeout` 과 `busy_timeout`](#timeout-과-busy_timeout)) | 재현함(연결 뒤 `PRAGMA busy_timeout` 이 5000) |
 | `ValueError: options['init_command'] conflicts with the generated PRAGMAs; use pragmas={...} instead` | `options` 에 `init_command` 를 넣었다 | PRAGMA 는 `pragmas=` 로 준다([거부되는 입력](#거부되는-입력)) | 코드상 확인(`database.py`) |
 | DB 파일 옆에 `-wal`·`-shm` 이 생긴다 | WAL 모드의 정상 동작. 연결이 열린 동안 커밋 일부는 `-wal` 에만 있다 | 복사·백업할 때 DB 파일만 따로 옮기지 않는다 | 재현함(`tests/test_readme.py` 가 연결 중 두 파일을 확인) |
-| ASGI(uvicorn) 에서 부하가 몰리면 `OperationalError: unable to open database file` 로 500 이 난다 | `CONN_MAX_AGE=None` 을 줬다. ASGI 의 동기 뷰는 요청마다 새 스레드에서 돌아 연결이 재사용되지 않고, 닫히지 않은 연결이 파일 디스크립터를 쌓는다(동시 16·48 에서 DB fd 810–982개, 한도 1024) | 일반 별칭은 `CONN_MAX_AGE` 를 주지 않는다(기본 0). 재사용 이득도 없었다 | 재현함([재측정](docs/research/bench-2026-10-08.md#결과-연결-재사용). fd 고갈이 원인이라는 것은 추정) |
+| ASGI(uvicorn) 에서 부하가 몰리면 `OperationalError: unable to open database file` 로 500 이 난다 | `CONN_MAX_AGE=None` 을 줬다. ASGI 의 동기 뷰는 요청마다 새 스레드에서 돌아 연결이 재사용되지 않고, 닫히지 않은 연결이 파일 디스크립터를 쌓는다(동시 16·48 에서 DB fd 810–982개, 한도 1024). [시스템 체크](#시스템-체크) `sqlite_ops.W005` 가 이 설정을 알린다(ASGI 로 [판단](#asgi-판단)될 때) | 일반 별칭은 `CONN_MAX_AGE` 를 주지 않는다(기본 0). 재사용 이득도 없었다 | 재현함([재측정](docs/research/bench-2026-10-08.md#결과-연결-재사용). fd 고갈이 원인이라는 것은 추정) |
 | `manage.py check` 에 `sqlite_ops.*` 가 안 나온다 | 앱이 `INSTALLED_APPS` 에 없다. W001·W002·W004 는 `--deploy` 일 때만 나온다 | 앱을 넣고 `check --deploy` 로 돌린다([시스템 체크](#시스템-체크)) | 코드상 확인(`checks.py`) |
 
 ### 진단(`sqlite_doctor`)
