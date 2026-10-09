@@ -134,7 +134,7 @@ L6 의 훅은 `LAB_RENAME_DELAY` 가 있을 때만 `os.rename` 뒤에 한 줄(`[
 
 환경 변수: `LAB_SOAK_DURATION`(1800초), `LAB_SOAK_INTERVAL`(10초), `LAB_SOAK_CONCURRENCY`(16), `LAB_SOAK_ROWS`(100000), `LAB_SOAK_CMA`(`none,0`), `LAB_SOAK_MEM`(`2g`), `LAB_SOAK_NOFILE`(1048576), `LAB_SOAK_STOP_MEM_FRAC`(0.8), `LAB_SOAK_STOP_ERR_RATE`(0.5), `LAB_SOAK_STOP_ERR_INTERVALS`(3). 짧게 확인할 때: `LAB_SOAK_DURATION=60 LAB_SOAK_INTERVAL=5 LAB_SOAK_ROWS=10000 scripts/lab.sh soak`.
 
-결과: `lab/.out/soak-<시각>.jsonl`(줄마다 `cma`·`kind` = `env`·`baseline`·`interval`·`final`·`summary`), `soak-<시각>-summary.json`(두 값 비교와 실행별 요약), 콘솔 `soak-<시각>.log`.
+결과: `lab/.out/soak-<시각>.jsonl`(줄마다 `cma`·`kind` = `env`·`baseline`·`interval`·`final`·`summary`), `soak-<시각>-summary.json`(두 값 비교와 실행별 요약), 콘솔 `soak-<시각>.log`. 결과 문서의 표는 손으로 옮기지 않고 `uv run --no-project python lab/soak_report.py lab/.out/soak-<시각>.jsonl` 의 출력을 넣는다(중앙값은 `statistics.median`, p90 은 최근접 순위).
 
 ## 파일
 
@@ -153,6 +153,7 @@ lab/
 ├── test_scenarios.py       P1·P2, L1–L8
 ├── test_bench.py           PRAGMA 벤치, 포화 측정
 ├── test_soak.py            fd·RSS 장시간 실행(#33)
+├── soak_report.py          soak 원자료 → 결과 문서의 표(_soakstat 로 계산)
 └── app/                    랩 Django 프로젝트(문서 조각 밖의 것)
     ├── manage.py, proj/asgi.py(벤치 계측 래퍼), proj/*_tail.py, notes/(뷰·계측)
     ├── lab_tools/          inspect_data.py, replica.py, s3_objects.py, loadgen.py
