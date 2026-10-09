@@ -106,7 +106,7 @@ L6 의 훅은 `LAB_RENAME_DELAY` 가 있을 때만 `os.rename` 뒤에 한 줄(`[
 | 무엇 | 어디서 | 쓰임 |
 |---|---|---|
 | `connection_created` 횟수, DB 요청 수, 열린 DB fd 수, fd 한도 | `notes/metrics.py`, `/lab/probe`(DB 를 열지 않음) | 연결 재사용 여부(DB 요청당 연결 생성), 연결 누적 |
-| `-wal` 크기와 헤더(체크포인트 순번·salt 둘) | `/lab/probe`, 0.5초마다 | WAL 시작·최대·끝(표본 최대), 줄어든 횟수, 시작·끝 헤더, 순번 차이(`wal_ckpt_seq_delta`), salt 가 바뀐 표본 간격 수(`wal_salt_changes`). 순번은 헤더를 쓴 연결의 카운터라 여러 연결이 재시작하면 **재시작 횟수가 아니다**(#26 리뷰 1). salt 변화 수는 0.5초 해상도의 하한이다. 정확한 재시작 횟수는 세지 않는다 |
+| `-wal` 크기와 헤더(체크포인트 순번·salt 둘) | `/lab/probe`, 0.5초마다 | WAL 시작·최대·끝(표본 최대), 줄어든 횟수, 시작·끝 헤더, 순번 차이(`wal_ckpt_seq_delta`), salt 가 바뀐 표본 간격 수(`wal_salt_changes`). 순번은 헤더를 쓴 연결의 카운터라 여러 연결이 재시작하면 **재시작 횟수도, 재시작이 있었다는 하한도 아니다**(#26 리뷰 1·2: 재시작 한 번에 4 → 24). 날것으로만 남긴다. salt 변화 수는 0.5초 해상도의 하한이다. 정확한 재시작 횟수는 세지 않는다 |
 | `X-Lab-View-Us` | 랩 뷰를 감싼 `notes/timing.py` 의 `timed`(`urls_tail.py`) | 동기 뷰 함수 호출 하나의 시간(뷰·ORM·SQLite, 다른 스레드와 GIL 을 다툰 대기 포함). 미들웨어를 쓰지 않는다: #26 첫 실행의 `X-Lab-Svc-Us`(sync-only 미들웨어)에는 ASGI 의 sync/async 왕복과 뷰 스레드 배정 대기가 섞였고, 배포 프로필에 없는 왕복도 더했다 |
 | `X-Lab-App-Us` | `proj/asgi.py` 래퍼 | 요청을 받은 때부터 응답 시작까지(스레드 배정·대기 포함) |
 | 같은 요청 안의 차이 `gap.client_minus_app`, `gap.app_minus_view` | `loadgen.py` | 요청마다 뺀 값의 분포. 세 헤더의 중앙값끼리 빼서 구간을 나누지 않는다(중앙값의 차 ≠ 차의 중앙값) |

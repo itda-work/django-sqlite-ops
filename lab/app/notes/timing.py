@@ -18,15 +18,22 @@ from . import metrics
 
 
 def timed(view, *, db: bool = True):
-    """``db`` 가 참이면 연결 재사용 비율의 분모(DB 요청 수)에 센다."""
+    """``db`` 가 참이면 연결 재사용 비율의 분모(DB 요청 수)에 센다.
+
+    예외(``OperationalError``, ``Http404`` 등)로 끝난 요청도 ``finally`` 에서 한 번 센다. 연결 생성
+    시그널은 SQL 실패 전에 이미 났을 수 있으므로, 빼면 비율이 1 을 넘는다(#26 리뷰 2, 재현함).
+    예외는 그대로 전파한다(Django 가 500·404 로 바꾼다).
+    """
 
     @functools.wraps(view)
     def wrapper(request, *args, **kwargs):
         t0 = time.perf_counter()
-        response = view(request, *args, **kwargs)
-        response["X-Lab-View-Us"] = str(int((time.perf_counter() - t0) * 1e6))
-        if db:
-            metrics.bump("db_requests")
-        return response
+        try:
+            response = view(request, *args, **kwargs)
+            response["X-Lab-View-Us"] = str(int((time.perf_counter() - t0) * 1e6))
+            return response
+        finally:
+            if db:
+                metrics.bump("db_requests")
 
     return wrapper

@@ -62,7 +62,8 @@ def probe_delta(first: dict | None, last: dict | None, samples: list[dict]) -> d
         round(out["conn_created"] / out["db_requests"], 4) if out["db_requests"] else None
     )
     # WAL 재시작 횟수는 세지 않는다. 헤더의 ckpt_seq 는 헤더를 쓴 연결 핸들의 카운터라 여러
-    # 연결(요청마다 새 앱 연결, Litestream)이 재시작하면 횟수가 아니다(#26 리뷰 1, 재현함).
+    # 연결(요청마다 새 앱 연결, Litestream)이 재시작하면 횟수도 그 하한도 아니다(재시작 한 번에
+    # 4 → 24 로 뛸 수 있다, #26 리뷰 1·2 재현함). 그래서 차이는 날것으로만 남긴다.
     # 날것의 차이와, salt 가 바뀐 표본 간격 수(그 사이 헤더가 한 번 이상 다시 쓰였다는 하한)만 낸다.
     out["wal_head_start"] = first.get("wal")
     out["wal_head_end"] = last.get("wal")

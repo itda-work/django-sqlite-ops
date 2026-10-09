@@ -5,6 +5,7 @@
 """
 
 import importlib.util
+import json
 import os
 import re
 import subprocess
@@ -433,3 +434,103 @@ def test_loadgen_paired_gaps_are_not_differences_of_medians():
     paired = g.dist_ms([c - a for c, a in zip(client, app, strict=True)])
     assert paired["p50_ms"] == 9.0
     assert g.dist_ms(client)["p50_ms"] - g.dist_ms(app)["p50_ms"] == 98.0
+
+
+_TIMED_COUNTER_SCRIPT = r"""
+import asyncio, json, sys, tempfile
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+tmp = Path(tempfile.mkdtemp())
+import django
+from django.conf import settings
+
+settings.configure(
+    SECRET_KEY="x",
+    ROOT_URLCONF=__name__,
+    MIDDLEWARE=[],
+    ALLOWED_HOSTS=["testserver"],
+    DATABASES={
+        "default": {"ENGINE": "django.db.backends.sqlite3", "NAME": str(tmp / "ok.db")},
+        "bad": {"ENGINE": "django.db.backends.sqlite3", "NAME": str(tmp / "missing" / "x.db")},
+    },
+)
+django.setup()
+from asgiref.sync import ThreadSensitiveContext
+from django.core.handlers.base import BaseHandler
+from django.db import connections
+from django.db.backends.signals import connection_created
+from django.http import Http404, HttpResponse
+from django.test import RequestFactory
+from django.urls import path
+from notes import metrics
+from notes.timing import timed
+
+connection_created.connect(metrics.on_connection_created)
+
+
+def ok(request):
+    with connections["default"].cursor() as c:
+        c.execute("SELECT 1")
+    return HttpResponse("ok")
+
+
+def sql_error(request):
+    with connections["default"].cursor() as c:
+        c.execute("SELECT * FROM no_such_table")
+    return HttpResponse("unreachable")
+
+
+def connect_error(request):
+    with connections["bad"].cursor() as c:  # 디렉터리가 없어 연결 생성 자체가 실패
+        c.execute("SELECT 1")
+    return HttpResponse("unreachable")
+
+
+def not_found(request):
+    with connections["default"].cursor() as c:
+        c.execute("SELECT 1")
+    raise Http404
+
+
+urlpatterns = [path(n, timed(v)) for n, v in
+               (("ok", ok), ("sql", sql_error), ("connect", connect_error), ("404", not_found))]
+
+
+async def main():
+    handler = BaseHandler()
+    handler.load_middleware(is_async=True)
+    out = {}
+    for name in ("ok", "sql", "connect", "404"):
+        before = dict(metrics._counts)
+        async with ThreadSensitiveContext():
+            resp = await handler.get_response_async(RequestFactory().get("/" + name))
+        after = dict(metrics._counts)
+        out[name] = {"status": resp.status_code,
+                     **{k: after[k] - before[k] for k in after}}
+    print(json.dumps(out))
+
+
+asyncio.run(main())
+"""
+
+
+def test_lab_timed_view_counts_failed_db_requests():
+    """#26 리뷰 2: 예외로 끝난 DB 요청도 요청당 한 번 센다(연결 생성 비율의 분모)."""
+    proc = subprocess.run(
+        [sys.executable, "-c", _TIMED_COUNTER_SCRIPT, str(ROOT / "lab" / "app")],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    # 정상: 연결 1, 요청 1
+    assert out["ok"] == {"status": 200, "conn_created": 1, "db_requests": 1}
+    # 연결 뒤 SQL 실패: 연결은 생겼고 요청도 센다(500, 예외는 그대로 전파돼 핸들러가 500 으로 바꿈)
+    assert out["sql"] == {"status": 500, "conn_created": 1, "db_requests": 1}
+    # 연결 생성 자체 실패: 시그널이 없으므로 연결 0, 요청 1
+    assert out["connect"] == {"status": 500, "conn_created": 0, "db_requests": 1}
+    # Http404: 쿼리 뒤 404
+    assert out["404"] == {"status": 404, "conn_created": 1, "db_requests": 1}
