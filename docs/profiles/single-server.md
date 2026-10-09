@@ -243,6 +243,7 @@ volumes:
 
 - 서비스의 컨테이너는 하나만 둔다(`docker compose up --scale app=2` 를 하지 않는다).
 - `restart: on-failure` 면 boot 가 거부(exit 2)할 때도 계속 재시작하며 같은 거부를 되풀이한다. 거부는 사람이 판단할 일이므로 로그의 `[boot] decision:` 줄을 보고 아래 절차를 따른다.
+- 열린 파일 한도(`ulimits`)는 넣지 않았다. 권장 설정에서는 Docker 기본 한도로 충분했고, 올릴 값은 서비스의 동시 접속 수로 정해지기 때문이다([이유](fd-limits.md#6-프로필-compose-예에-ulimits-를-넣지-않은-이유)). 웹소켓 등 동시 연결이 많으면 [fd 한도 가이드](fd-limits.md#4-얼마로-둘까--계산법)로 값을 계산해 `app` 서비스에 `ulimits` 를 더한다.
 
 ## 4. 운영 절차
 
@@ -298,4 +299,5 @@ boot 의 판정·사유 코드·종료 코드는 [README boot CLI](../../README.
 - **워커는 1개.** `InMemoryChannelLayer` 는 프로세스 밖으로 메시지를 보내지 않는다. `sqlite_doctor` 는 프로필이 `single-server-multiproc` 일 때만 이를 경고하므로, `single-server` 로 두고 워커를 늘리면 경고 없이 깨진다. `WEB_CONCURRENCY` 를 조심한다(§3).
 - **migrate 와 옛 코드가 겹치지 않게.** 정지 후 기동이면 겹치지 않는다. 겹치면 새 NOT NULL 컬럼에 옛 코드의 INSERT 가 실패한다(scenarios S8: 6건). 새 NOT NULL 필드에는 `db_default` 를 쓴다.
 - **복제는 비동기다.** 커밋 응답이 내구성 보장이 아니다(약 1초 RPO, scenarios RPO).
+- **열린 파일 한도는 호스트마다 다르다.** 한도를 주지 않은 컨테이너의 `nofile` 은 Docker 데몬 설정을 따른다(colima 에서 soft 1024·hard 524288, 재현함). 배포할 호스트에서 `/proc/1/limits` 나 `sqlite_doctor` 의 `[process]` 로 확인한다. 한도를 올려도 `CONN_MAX_AGE=None`(ASGI)의 fd 누적은 해결되지 않는다 — 설정을 고친다(`sqlite_ops.W005`). 설정법·계산법·근거는 [fd 한도 가이드](fd-limits.md).
 - **VFS 읽기 복제본은 예정(2단계)이다.** 이 프로필에서 쓰지 않는다([DESIGN §3-2](../DESIGN.md)).

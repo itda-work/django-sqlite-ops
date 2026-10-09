@@ -305,7 +305,7 @@ DATABASES = {
 
 ### `sqlite_doctor`
 
-`manage.py check` 는 설정 문자열만 본다. `sqlite_doctor` 는 **DB 에 실제로 연결해** `init_command` 가 실행된 뒤의 값을 보고, 파일시스템 종류·Litestream 설정·채널 레이어까지 한 번에 진단한다. 배포 직후, 설정을 바꾼 뒤, 장애를 조사할 때 명시적으로 실행한다.
+`manage.py check` 는 설정 문자열만 본다. `sqlite_doctor` 는 **DB 에 실제로 연결해** `init_command` 가 실행된 뒤의 값을 보고, 파일시스템 종류·Litestream 설정·채널 레이어·열린 파일 한도까지 한 번에 진단한다. 배포 직후, 설정을 바꾼 뒤, 장애를 조사할 때 명시적으로 실행한다.
 
 ```bash
 python manage.py sqlite_doctor
@@ -318,7 +318,7 @@ python manage.py sqlite_doctor --json          # 모니터링·스크립트용
 | `--database ALIAS` | 볼 별칭(여러 번 줄 수 있다). 없으면 sqlite3 엔진 별칭 전부 |
 | `--litestream-config PATH` | Litestream 설정 파일. 주면 그 DB 목록을 `DATABASES` 와 대조한다. 없으면 이 섹션은 건너뛴다. 상대 경로는 명령을 실행한 디렉터리 기준이다 |
 | `--litestream BIN` | Litestream 바이너리(기본 PATH 의 `litestream`, 0.5.17 만 받는다) |
-| `--json` | JSON 출력(스키마 `version: 1`, [DESIGN §6-2](docs/DESIGN.md)) |
+| `--json` | JSON 출력(스키마 `version: 1`, [DESIGN §6-2](docs/DESIGN.md)). 열린 파일 한도는 `section` `process`, `key` `nofile_soft`·`nofile_hard`(값은 정수 또는 `"unlimited"`) 또는 `nofile`(값 `null`, 읽지 못함) |
 
 > **주의 — 연결하면 `init_command` 가 실행되고 `-wal`·`-shm` 이 생길 수 있다.** Django 는 연결할 때마다 `OPTIONS["init_command"]` 를 실행하므로 진단이 DB 를 바꿀 수 있다. 예를 들어 `PRAGMA journal_mode=WAL` 은 파일에 남는다. 또 WAL 모드 DB 는 연결만 해도 SQLite 가 `-wal`·`-shm` 파일을 만든다(`init_command` 가 없어도). 쓰기 별칭은 앱이 연결할 때와 같은 일이므로 그대로 연결한다. 운영 DB 에서 돌린다는 점을 알고 실행한다.
 >
@@ -332,6 +332,7 @@ python manage.py sqlite_doctor --json          # 모니터링·스크립트용
 - **mount** — 위의 실제 경로로 DB 파일(없으면 존재하는 상위 디렉터리)의 파일시스템 종류. NFS·SMB/CIFS·AFP·sshfs 같은 네트워크 파일시스템이면 `warn` 이다. SQLite 의 파일 잠금을 믿을 수 없고 WAL 이 동작하지 않는다([SQLite 문서](https://www.sqlite.org/useovernet.html)). 로컬로 확인되지 않은 종류(알 수 없는 FUSE 등)는 `unknown`.
 - **litestream** — `litestream databases -config PATH -json` 으로 설정의 DB 목록을 읽어 실제 경로로 대조한다. 쓰기 별칭이 설정에 없으면 `warn`(복제되지 않음). 단 channels-lite 전용 채널 DB(앱 DB 와 다른 파일)는 복제에서 빼는 것이 규칙이라 이 경고를 내지 않는다. 설정 경로가 실제 경로가 아니면(부모에 링크) `warn` — boot 가 거부하는 구성이다([경로 규칙](#경로-규칙)). 상대 경로·`dir:` 항목은 Litestream 의 작업 디렉터리 기준으로 풀려 대조할 수 없으므로 `warn`. 설정에만 있는 DB 는 `ok`(정보). 설정 파일 없음·깨진 YAML·바이너리 없음은 `error`.
 - **channels** — `CHANNEL_LAYERS` 를 읽기만 한다(`channels` 를 import 하지 않는다. 예외는 아래 `patch` 항목). 백엔드별 의미론을 한 줄로 요약한다. `InMemoryChannelLayer` 는 프로필이 `single-server-multiproc` 이면 `warn`. channels-lite 는 채널 DB 가 앱 DB 와 같은 파일이면 `warn`, Litestream 설정의 복제 대상이면 `warn`. 모르는 백엔드(`channels_redis` pub/sub 포함)는 `unknown`. `AIOSQLiteChannelLayer` 를 쓰거나 `PATCH_CHANNELS_LITE_AIO` 가 켜져 있으면 [중복 배달 패치](#channels-lite-패치) 상태를 `patch` 항목으로 보여 준다. 이때만 channels-lite 를 import 한다(DB 는 열지 않는다).
+- **process** — 명령을 실행한 프로세스의 열린 파일 한도(`RLIMIT_NOFILE`)를 `nofile_soft`·`nofile_hard` 로 보여 준다(무한대는 `unlimited`). **보고만 하고 판정하지 않으므로 늘 `ok` 이고 종료 코드를 바꾸지 않는다.** 필요한 값은 동시 접속 수에 달려 있어 근거 있는 경고 기준이 없기 때문이다. 표준 라이브러리 `resource` 가 없는 플랫폼(Windows)에서는 `nofile` 한 줄에 `unavailable` 로 적는다. 컨테이너에서는 `docker compose exec app python manage.py sqlite_doctor` 로 앱과 같은 한도를 본다(재현함: `exec` 프로세스도 컨테이너의 한도를 받는다). 설정법·계산법은 [fd 한도 가이드](docs/profiles/fd-limits.md).
 
 출력 예:
 
@@ -359,6 +360,10 @@ python manage.py sqlite_doctor --json          # 모니터링·스크립트용
 
 [channels]
   OK      default  backend  channels.layers.InMemoryChannelLayer  — in-memory: one process only; messages do not reach other processes or workers
+
+[process]
+  OK      -  nofile_soft  1024  — RLIMIT_NOFILE of this process; reported, not judged (docs/profiles/fd-limits.md)
+  OK      -  nofile_hard  524288  — RLIMIT_NOFILE of this process; reported, not judged (docs/profiles/fd-limits.md)
 
 summary: 1 warning(s), 0 error(s), 0 unknown -> exit 1
 ```
@@ -707,6 +712,7 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 - 두 프로필 모두 **쓰는 머신은 1대**다. 두 머신이 같은 복제본에 쓰면 나중 쪽이 경고 없이 이긴다. 배포는 정지 후 기동이다.
 - 프로세스 트리는 `boot`(잠금) → exec → `litestream replicate -exec "sh -c 'migrate && exec uvicorn ...'"` 다. litestream 이 PID 1 이다.
 - 한 번만 쓰는 boot 옵션(`--init-new`·`--adopt-existing`·`--on-unknown restore`)은 이미지에 굳히지 않고 `BOOT_FLAGS` 환경 변수로 넘긴 뒤 비운다.
+- 열린 파일 한도(`nofile`)의 확인·설정(Docker `--ulimit`, compose `ulimits`, systemd `LimitNOFILE=`)·계산법은 두 프로필 공통 문서 [docs/profiles/fd-limits.md](docs/profiles/fd-limits.md) 에 있다. 프로필 compose 예에는 `ulimits` 를 넣지 않았다(이유는 그 문서 §6).
 - `settings.py`·`urls.py` 조각은 테스트가 실행하고 `check --deploy` 를 통과하는지 본다. `litestream.yml` 은 실제 litestream 0.5.17 이 읽는지, `entrypoint.sh` 는 문법을 본다. Dockerfile·compose 는 회귀 랩이 문서 블록을 그대로 꺼내 빌드하고 띄워 종단 검증했다(첫 배포, `check --deploy`, `sqlite_doctor`, `docker stop` 시 exit 0·복제 400/400, 빈 볼륨 소유자 복사, 워커 2개 — [결과](docs/research/lab-2026-10-08.md)). multiproc 의 채널 레이어 런타임(channels-nats 메시지 전달)은 랩에서 재지 않았다.
 
 ## 문제 해결
@@ -720,7 +726,8 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 | `options={"timeout": 20}` 을 줬는데 잠금 대기가 5초다 | Django 는 연결을 연 뒤 `init_command` 를 실행하므로 `PRAGMA busy_timeout=5000`(밀리초)이 `timeout`(초)을 덮는다 | `pragmas={"busy_timeout": 20000}`([`timeout` 과 `busy_timeout`](#timeout-과-busy_timeout)) | 재현함(연결 뒤 `PRAGMA busy_timeout` 이 5000) |
 | `ValueError: options['init_command'] conflicts with the generated PRAGMAs; use pragmas={...} instead` | `options` 에 `init_command` 를 넣었다 | PRAGMA 는 `pragmas=` 로 준다([거부되는 입력](#거부되는-입력)) | 코드상 확인(`database.py`) |
 | DB 파일 옆에 `-wal`·`-shm` 이 생긴다 | WAL 모드의 정상 동작. 연결이 열린 동안 커밋 일부는 `-wal` 에만 있다 | 복사·백업할 때 DB 파일만 따로 옮기지 않는다 | 재현함(`tests/test_readme.py` 가 연결 중 두 파일을 확인) |
-| ASGI(uvicorn) 에서 부하가 몰리면 `OperationalError: unable to open database file` 로 500 이 난다 | `CONN_MAX_AGE=None` 을 줬다. ASGI 의 동기 뷰는 요청마다 새 스레드에서 돌아 연결이 재사용되지 않고, 닫히지 않은 연결이 파일 디스크립터를 쌓는다(동시 16·48 에서 DB fd 810–982개, 한도 1024). [시스템 체크](#시스템-체크) `sqlite_ops.W005` 가 이 설정을 알린다(ASGI 로 [판단](#asgi-판단)될 때) | 일반 별칭은 `CONN_MAX_AGE` 를 주지 않는다(기본 0). 재사용 이득도 없었다 | 재현함([재측정](docs/research/bench-2026-10-08.md#결과-연결-재사용). fd 고갈이 원인이라는 것은 추정). fd 한도를 1,048,576 으로 올리면 동시 16·30분에서 오류는 없었지만 fd 중앙값 1,370개·앱 RSS 중앙값 411.5 MiB 를 썼다(`0` 은 82개·73.2 MiB). 이득 없이 자원만 더 쓴다([장시간 실행](docs/research/fd-soak-2026-10-09.md)) |
+| ASGI(uvicorn) 에서 부하가 몰리면 `OperationalError: unable to open database file` 로 500 이 난다 | `CONN_MAX_AGE=None` 을 줬다. ASGI 의 동기 뷰는 요청마다 새 스레드에서 돌아 연결이 재사용되지 않고, 닫히지 않은 연결이 파일 디스크립터를 쌓는다(동시 16·48 에서 DB fd 810–982개, 한도 1024). [시스템 체크](#시스템-체크) `sqlite_ops.W005` 가 이 설정을 알린다(ASGI 로 [판단](#asgi-판단)될 때) | 일반 별칭은 `CONN_MAX_AGE` 를 주지 않는다(기본 0). 재사용 이득도 없었다. fd 한도를 올리는 것은 대처가 아니다([fd 한도 가이드 §5](docs/profiles/fd-limits.md#5-한도를-올려도-해결되지-않는-것--conn_max_agenone--asgi)) | 재현함([재측정](docs/research/bench-2026-10-08.md#결과-연결-재사용). fd 고갈이 원인이라는 것은 추정). fd 한도를 1,048,576 으로 올리면 동시 16·30분에서 오류는 없었지만 fd 중앙값 1,370개·앱 RSS 중앙값 411.5 MiB 를 썼다(`0` 은 82개·73.2 MiB). 이득 없이 자원만 더 쓴다([장시간 실행](docs/research/fd-soak-2026-10-09.md)) |
+| 동시 접속(웹소켓·keep-alive)이 많을 때 `OSError: [Errno 24] Too many open files` 또는 `unable to open database file` | 프로세스의 열린 파일 한도(`RLIMIT_NOFILE` soft)에 닿았다. 한도를 주지 않은 컨테이너는 Docker 데몬 설정을 따른다(colima 에서 soft 1024) | `/proc/1/limits` 나 `sqlite_doctor` 의 `[process]` 로 현재 값을 보고, 피크 동시 접속으로 잰 fd 수에 여유를 더해 compose `ulimits`·`docker run --ulimit`·systemd `LimitNOFILE=` 로 올린다. hard 는 `fs.nr_open` 을 넘길 수 없다. 먼저 위 `CONN_MAX_AGE=None` 줄이 아닌지 본다([fd 한도 가이드](docs/profiles/fd-limits.md)) | 공식 문서([getrlimit(2)](https://man7.org/linux/man-pages/man2/getrlimit.2.html): 한도 초과는 `EMFILE`), 재현함(soft 를 64 로 낮춘 프로세스에서 `open` 은 `OSError(24, 'Too many open files')`, `sqlite3.connect` 는 `unable to open database file` — macOS. compose `ulimits` 적용·`nr_open` 초과 시 기동 실패 — colima, #32) |
 | `manage.py check` 에 `sqlite_ops.*` 가 안 나온다 | 앱이 `INSTALLED_APPS` 에 없다. W001·W002·W004 는 `--deploy` 일 때만 나온다 | 앱을 넣고 `check --deploy` 로 돌린다([시스템 체크](#시스템-체크)) | 코드상 확인(`checks.py`) |
 
 ### 진단(`sqlite_doctor`)
@@ -728,6 +735,7 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 | 증상 | 원인 | 대처 | 근거 |
 |---|---|---|---|
 | doctor 를 돌린 뒤 `-wal`·`-shm` 이 생기거나 `journal_mode` 가 바뀌었다 | doctor 는 실제로 연결하므로 `init_command` 가 실행되고, WAL DB 는 연결만 해도 사이드카가 생긴다 | 운영 DB 에서 돈다는 것을 알고 실행한다([주의](#sqlite_doctor)) | 재현함 |
+| `[process]` 의 `nofile_soft` 가 compose 에 준 값과 다르다 | doctor 는 자기 프로세스의 한도를 본다. 다른 셸이나 호스트에서 돌렸거나, 앱이 `setrlimit` 으로 바꿨다 | `docker compose exec app ...` 로 컨테이너 안에서 돌리고, 앱 PID 의 `/proc/<pid>/limits` 와 맞춰 본다([fd 한도 가이드 §2](docs/profiles/fd-limits.md#2-현재-한도-확인)) | 재현함(#32) |
 | 읽기 전용 별칭(`mode=ro`)이 `unknown` 이다 | WAL DB 는 읽기 전용 연결도 `-shm` 에 쓰고 `-wal` 을 만들 수 있어 연결하지 않는다 | 같은 파일의 쓰기 별칭이나 `immutable=1` URI 별칭으로 진단한다([주의](#sqlite_doctor)) | 재현함 |
 | DB 파일이 없다는 `error` | 없는 파일에 연결하면 SQLite 가 빈 DB 를 만들어 다음 boot 의 복원을 막으므로 연결하지 않는다 | 경로를 확인하거나 boot 로 먼저 복원한다 | 코드상 확인(`doctor.py`) |
 

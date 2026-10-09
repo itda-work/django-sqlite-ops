@@ -157,6 +157,7 @@ volumes:
 
 - `app` 서비스의 컨테이너는 하나만 둔다. 프로세스를 늘릴 때는 `WEB_WORKERS` 를 올리고 컨테이너 수(`--scale`)를 늘리지 않는다. 같은 볼륨을 두 컨테이너가 쓰면 두 번째 boot 가 잠금(exit 5)에서 막히고, 다른 볼륨이면 두 머신이 쓰는 것과 같다.
 - nats-server 에 인증·TLS 를 걸면 channels-nats 의 `connect_options` 로 넘긴다. 이 패키지는 NATS 설정을 검사하지 않는다.
+- 열린 파일 한도(`ulimits`)는 [`single-server`](single-server.md#composeyaml-예) 와 같은 이유로 넣지 않았다([이유](fd-limits.md#6-프로필-compose-예에-ulimits-를-넣지-않은-이유)). 한도는 워커 프로세스마다 따로 적용되므로([getrlimit(2)](https://man7.org/linux/man-pages/man2/getrlimit.2.html)) [계산](fd-limits.md#4-얼마로-둘까--계산법)은 워커 하나가 맡는 동시 접속 수로 한다.
 
 ### 채널 레이어 의미론 ([DESIGN §8](../DESIGN.md))
 
@@ -204,4 +205,5 @@ SQLite 기반 채널 레이어(channels-lite)는 **추천하지 않는다**. 폴
 - **channels-nats 는 수신자가 생기기 전의 메시지를 버린다.** `ChannelFull` 도 나지 않는다(§3 의미론 표). 이 차이에 기대는 코드는 channels_redis 가 맞다.
 - **브로커를 앱과 같은 `-exec` 에 넣지 않는다**(§2).
 - **컨테이너를 늘려 확장하지 않는다.** 워커 수로 늘린다(§3 compose).
+- **열린 파일 한도는 워커마다 따로다.** 컨테이너에 준 `nofile` 을 워커 프로세스가 각각 물려받는다. 설정·확인·계산은 [fd 한도 가이드](fd-limits.md).
 - **VFS 읽기 복제본은 예정(2단계)이다**([DESIGN §3-2](../DESIGN.md)).
