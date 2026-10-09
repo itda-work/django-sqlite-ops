@@ -21,16 +21,17 @@ LAB_SOAK_STOP_MEM_FRAC(0.8), LAB_SOAK_STOP_ERR_RATE(0.5), LAB_SOAK_STOP_ERR_INTE
 
 from __future__ import annotations
 
+import collections
 import json
 import os
+import queue
 import subprocess
+import threading
 import time
 
 import pytest
-from _lab import TAG, http_json, log
-from _soakstat import analyze, compare, nofile_limits
-from conftest import OUT, RUN_ID
-from test_bench import error_log
+from _lab import OUT, RUN_ID, TAG, error_log, http_json, log
+from _soakstat import analyze, compare, harness_problems, nofile_limits
 from test_scenarios import Volumes, env
 
 SERVICE = "labapp-soak"
@@ -45,6 +46,63 @@ STOP_MEM_FRAC = float(os.environ.get("LAB_SOAK_STOP_MEM_FRAC", "0.8"))
 STOP_ERR_RATE = float(os.environ.get("LAB_SOAK_STOP_ERR_RATE", "0.5"))
 STOP_ERR_INTERVALS = int(os.environ.get("LAB_SOAK_STOP_ERR_INTERVALS", "3"))
 MIX = {"read": 0.7, "sorted": 0.1, "write_rows": 1}  # 벤치 mixed 와 같다
+# 발생기 기한 = DURATION + 이 값. 넘으면 출력이 없어도 죽이고 'harness timeout' 으로 남긴다.
+HARNESS_GRACE = 600.0
+KILL_DRAIN_S = 30.0
+
+
+def read_loadgen(proc, limit_s: float, on_row) -> dict:
+    """발생기의 stdout(JSON 줄)·stderr 를 스레드로 읽으며 기한을 따로 잰다(리뷰 1).
+
+    줄을 기다리는 동안에도 기한을 본다. 출력이 없거나, 줄이 끝나지 않거나, JSON 이 아닌 줄만
+    나와도 기한이 지나면 ``proc.kill()`` 하고 ``timed_out`` 을 참으로 돌려준다. kill 뒤에도
+    파이프가 ``KILL_DRAIN_S`` 안에 닫히지 않으면 기다리지 않고 돌아간다(정리는 ``down`` 이 한다).
+    """
+    q: queue.Queue = queue.Queue()
+
+    def pump(stream, tag: str) -> None:
+        try:
+            for line in stream:
+                q.put((tag, line))
+        finally:
+            q.put((tag, None))
+
+    for stream, tag in ((proc.stdout, "out"), (proc.stderr, "err")):
+        threading.Thread(target=pump, args=(stream, tag), daemon=True).start()
+    deadline = time.monotonic() + limit_s
+    open_streams, timed_out = 2, False
+    err: collections.deque = collections.deque(maxlen=200)
+    nonjson: list[str] = []
+    while open_streams:
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            if timed_out:
+                break
+            proc.kill()  # docker compose CLI 만 끊긴다. 컨테이너는 down 이 지운다.
+            timed_out = True
+            deadline = time.monotonic() + KILL_DRAIN_S
+            continue
+        try:
+            tag, line = q.get(timeout=min(1.0, remaining))
+        except queue.Empty:
+            continue
+        if line is None:
+            open_streams -= 1
+        elif tag == "err":
+            err.append(line)
+        elif line.strip():
+            try:
+                row = json.loads(line)
+            except ValueError:
+                nonjson.append(line.strip()[:300])
+                continue
+            on_row(row)
+    try:
+        rc = proc.wait(timeout=KILL_DRAIN_S)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+        rc = None
+    return {"rc": rc, "timed_out": timed_out, "stderr": "".join(err), "nonjson": nonjson}
 
 
 def soak_one(stack, run_id: str, cma: str, jsonl) -> dict:
@@ -106,22 +164,17 @@ def soak_one(stack, run_id: str, cma: str, jsonl) -> dict:
     )
     rows: list[dict] = []
     final: dict = {}
-    t0 = time.monotonic()
-    for line in proc.stdout:
-        line = line.strip()
-        if not line.startswith("{"):
-            continue
-        row = json.loads(line)
-        jsonl.write(
-            json.dumps({"cma": cma, "kind": "final" if row.get("final") else "interval", **row})
-            + "\n"
-        )
+
+    def on_row(row: dict) -> None:
+        nonlocal final
+        kind = "final" if row.get("final") else "interval"
+        jsonl.write(json.dumps({"cma": cma, "kind": kind, **row}) + "\n")
         jsonl.flush()
         if row.get("final"):
             final = row
-            continue
+            return
         rows.append(row)
-        if row["i"] % 6 == 0:
+        if row["i"] % 6 == 0 or row.get("tail"):
             p = row.get("probe") or {}
             fds = p.get("fds") or {}
             log(
@@ -129,23 +182,29 @@ def soak_one(stack, run_id: str, cma: str, jsonl) -> dict:
                 f"p99={row['p99_ms']} err={row['errors']} {row['error_kinds']} "
                 f"fd={fds.get('total')} db/wal/shm={fds.get('db')}/{fds.get('wal')}/"
                 f"{fds.get('shm')} rss={p.get('VmRSS')} thr={p.get('Threads')}"
+                + (" (tail)" if row.get("tail") else "")
             )
-        if time.monotonic() - t0 > DURATION + 600:
-            proc.kill()  # docker compose CLI 만 끊긴다. 컨테이너는 down 이 지운다.
-            final = {"stop_reason": "harness timeout"}
-            break
-    rc = proc.wait(timeout=120)
-    stderr = proc.stderr.read()
+
+    got = read_loadgen(proc, DURATION + HARNESS_GRACE, on_row)
+    rc, timed_out = got["rc"], got["timed_out"]
+    if timed_out:
+        log(f"soak {cma}: harness timeout after {DURATION + HARNESS_GRACE:.0f}s, loadgen killed")
+    problems = harness_problems(
+        rows, final, rc, duration=DURATION, interval=INTERVAL, timed_out=timed_out
+    )
     state = stack.state(SERVICE)
     app_log = error_log(stack, [{"errors": final.get("cum_errors") or 0}], SERVICE)
     stack.stop_app(SERVICE)
-    summary = analyze(rows, fd_limit=soft, mem_limit=mem_limit)
+    summary = analyze(rows, fd_limit=soft, mem_limit=mem_limit, baseline=baseline)
     summary.update(
         {
             "cma": cma,
-            "stop_reason": final.get("stop_reason"),
+            "stop_reason": final.get("stop_reason") or ("harness timeout" if timed_out else None),
+            "harness_problems": problems,
             "loadgen_rc": rc,
-            "loadgen_stderr_tail": stderr[-2000:],
+            "loadgen_final": {k: v for k, v in final.items() if k != "error_sample"},
+            "loadgen_stderr_tail": got["stderr"][-2000:],
+            "loadgen_nonjson_stdout": got["nonjson"][-20:],
             "error_sample": final.get("error_sample"),
             "app_state": {k: state.get(k) for k in ("Status", "ExitCode", "OOMKilled")},
             "app_log_errors": app_log,
@@ -193,6 +252,9 @@ def test_soak(stack, run_id, rec):
     summary_path.write_text(json.dumps(out, indent=1))
     rec["soak_jsonl"] = str(path)
     rec["soak_summary"] = str(summary_path)
+    # 하네스·발생기 실패는 CONN_MAX_AGE 와 관계없이 실패다(리뷰 1).
+    bad = {cma: s["harness_problems"] for cma, s in by_cma.items() if s["harness_problems"]}
+    assert not bad, f"harness problems: {bad}"
     # None 의 오류·조기 정지는 결과로 기록한다. 실패 판정은 프로필 기본(0)에만 건다(벤치와 같다).
     for cma, s in by_cma.items():
         if cma != "none":

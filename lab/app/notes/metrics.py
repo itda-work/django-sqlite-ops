@@ -125,7 +125,8 @@ def proc_status(status_path: str = "/proc/self/status") -> dict:
     """``VmRSS``(바이트)·``VmHWM``(최대 RSS)·``Threads``(OS 스레드)."""
     out: dict = {}
     try:
-        text = open(status_path, encoding="ascii").read()
+        with open(status_path, encoding="ascii") as f:
+            text = f.read()
     except FileNotFoundError:
         return out
     for line in text.splitlines():
@@ -139,7 +140,8 @@ def proc_status(status_path: str = "/proc/self/status") -> dict:
 
 def _read_int(path: str) -> int | None:
     try:
-        raw = open(path, encoding="ascii").read().strip()
+        with open(path, encoding="ascii") as f:
+            raw = f.read().strip()
     except (FileNotFoundError, PermissionError):
         return None
     return None if raw == "max" else int(raw)
@@ -153,10 +155,11 @@ def cgroup_memory() -> dict:
         "swap_max": _read_int("/sys/fs/cgroup/memory.swap.max"),
     }
     try:
-        for line in open("/sys/fs/cgroup/memory.events", encoding="ascii"):
-            key, value = line.split()
-            if key in ("oom", "oom_kill", "max"):
-                out[f"events_{key}"] = int(value)
+        with open("/sys/fs/cgroup/memory.events", encoding="ascii") as f:
+            for line in f:
+                key, value = line.split()
+                if key in ("oom", "oom_kill", "max"):
+                    out[f"events_{key}"] = int(value)
     except FileNotFoundError:
         pass
     return out
@@ -195,7 +198,8 @@ def soak_env() -> dict:
 
     def read(p: str) -> str | None:
         try:
-            return open(p, encoding="ascii").read()
+            with open(p, encoding="ascii") as f:
+                return f.read()
         except (FileNotFoundError, PermissionError):
             return None
 

@@ -15,8 +15,10 @@ Django 뷰, ``--mode rawping`` 은 Django 앞에서 바로 답하는 경로만 �
 
 ``--report-every N`` 이면 soak 모드(#33)다. 같은 닫힌 루프로 ``--duration`` 동안 돌며 ``N`` 초마다
 구간 한 줄(처리량·p50·p99·오류 종류별 수·누적 요청 수 + ``/lab/soakprobe`` 표본)을 JSON 으로
-내보낸다. 구간마다 ``stop_reason`` 으로 안전 정지 조건(RSS 가 cgroup 메모리 한도의 일정 비율 이상,
-오류율이 연속 구간에서 높음, 표본 연속 실패, cgroup OOM kill)을 보고, 걸리면 그 자리에서 멈추고
+내보낸다. 끝나면 워커를 기다려 그 사이 끝난 요청을 ``"tail": true`` 줄로 한 번 더
+내보낸다(누적 집계에 들어간다). 구간마다 ``stop_reason`` 으로 안전 정지 조건(RSS 가 cgroup
+메모리 한도의 일정 비율 이상, 오류율이 연속 구간에서 높음, 표본 연속 실패, cgroup OOM kill)을
+보고, 걸리면 그 자리에서 멈추고
 사유를 마지막 줄에 남긴다. 지연 표본은 구간마다 버린다(장시간 실행에서 발생기 메모리가 늘지 않게).
 
 표준 라이브러리만 쓴다(이미지에 도구를 더 넣지 않는다).
@@ -208,6 +210,20 @@ def soak(args, target) -> None:
     threads = [threading.Thread(target=worker, args=(i,)) for i in range(args.concurrency)]
     for t in threads:
         t.start()
+
+    def take_probe() -> tuple[dict | None, str | None]:
+        conn = http.client.HTTPConnection(target.hostname, target.port, timeout=30)
+        try:
+            p0 = time.perf_counter()
+            conn.request("GET", "/lab/soakprobe")
+            probe = json.loads(conn.getresponse().read())
+            probe["probe_ms"] = round(1000 * (time.perf_counter() - p0), 1)
+            return probe, None
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            return None, f"{type(exc).__name__}: {str(exc)[:200]}"
+        finally:
+            conn.close()
+
     rows: list[dict] = []
     cum: dict = {}
     reason = None
@@ -221,17 +237,7 @@ def soak(args, target) -> None:
         with lock:
             done, bucket[:] = list(bucket), []
         now = time.monotonic()
-        probe = probe_error = None
-        conn = http.client.HTTPConnection(target.hostname, target.port, timeout=30)
-        try:
-            p0 = time.perf_counter()
-            conn.request("GET", "/lab/soakprobe")
-            probe = json.loads(conn.getresponse().read())
-            probe["probe_ms"] = round(1000 * (time.perf_counter() - p0), 1)
-        except (OSError, http.client.HTTPException, ValueError) as exc:
-            probe_error = f"{type(exc).__name__}: {str(exc)[:200]}"
-        finally:
-            conn.close()
+        probe, probe_error = take_probe()
         rows.append(interval_row(i, now - start, now - last, done, cum, probe, probe_error))
         last = now
         print(json.dumps(rows[-1]), flush=True)
@@ -244,15 +250,29 @@ def soak(args, target) -> None:
         if reason or now >= end:
             stop.set()
             break
+    # 종료 꼬리(#33 리뷰 1): 마지막 구간을 뗀 뒤 진행 중이던 요청이 끝난다(워커는 요청 하나를
+    # 마치고서야 멈춘다). 워커를 기다린 뒤 남은 것을 ``tail`` 구간 한 줄로 내보내 누적·오류
+    # 집계에 넣는다. 구간 지표(처리량·p99)에서는 분석기가 이 줄을 뺀다(길이가 일정하지 않다).
     for t in threads:
         t.join(timeout=60)
+    alive = sum(t.is_alive() for t in threads)
+    with lock:
+        done, bucket[:] = list(bucket), []
+    now = time.monotonic()
+    probe, probe_error = take_probe()
+    tail = interval_row(i + 1, now - start, now - last, done, cum, probe, probe_error)
+    tail["tail"] = True
+    rows.append(tail)
+    print(json.dumps(tail), flush=True)
     print(
         json.dumps(
             {
                 "final": True,
                 "stop_reason": reason,
                 "elapsed_s": round(time.monotonic() - start, 1),
-                "intervals": len(rows),
+                "intervals": len(rows) - 1,
+                "tail_requests": len(done),
+                "workers_alive": alive,
                 **{f"cum_{k}": v for k, v in cum.items()},
                 "error_sample": error_sample,
             }

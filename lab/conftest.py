@@ -6,7 +6,6 @@
 import json
 import os
 import sys
-import time
 from pathlib import Path
 
 import pytest
@@ -18,8 +17,8 @@ if os.environ.get("RUN_LAB") != "1":
 
 sys.path.insert(0, str(LAB_DIR))
 
-RUN_ID = os.environ.get("LAB_RUN_ID") or time.strftime("%Y%m%d-%H%M%S")
-OUT = Path(os.environ.get("LAB_OUT", LAB_DIR / ".out"))
+from _lab import OUT, RUN_ID  # noqa: E402 — 시나리오와 같은 값(_lab 이 정본)
+
 RESULTS = OUT / f"results-{RUN_ID}.jsonl"
 
 

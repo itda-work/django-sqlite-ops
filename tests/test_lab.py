@@ -12,6 +12,8 @@ import subprocess
 import sys
 from pathlib import Path
 
+import pytest
+
 ROOT = Path(__file__).resolve().parent.parent
 
 
@@ -710,3 +712,251 @@ def test_soak_nofile_limits_parses_proc_limits():
         "Max open files            1048576              1048576              files     \n"
     )
     assert s.nofile_limits(text) == (1048576, 1048576)
+
+
+# --- soak 리뷰 1(#33): 종료 꼬리 집계·발생기 실패·출력 없는 매달림 ---------------------------
+
+
+class _LateConn:
+    """요청마다 0.2초 뒤 HTTP 500. ``/lab/soakprobe`` 는 바로 표본을 준다."""
+
+    made = 0
+    lock = __import__("threading").Lock()
+
+    def __init__(self, *a, **kw):
+        self.path = None
+
+    def request(self, method, path, **kw):
+        self.path = path
+
+    def getresponse(self):
+        from types import SimpleNamespace
+
+        if self.path == "/lab/soakprobe":
+            body = json.dumps({"VmRSS": 1, "cgroup": {"max": 10**12}}).encode()
+            return SimpleNamespace(status=200, read=lambda: body)
+        import time as _t
+
+        _t.sleep(0.2)
+        with _LateConn.lock:
+            _LateConn.made += 1
+        return SimpleNamespace(status=500, read=lambda: b"late failure")
+
+    def close(self):
+        pass
+
+
+def test_soak_loadgen_counts_requests_finishing_after_the_last_interval(monkeypatch, capsys):
+    """리뷰 1 P2: 마지막 구간을 뗀 뒤 끝난 요청(성공·실패)도 최종 집계에 들어가야 한다."""
+    from types import SimpleNamespace
+
+    g = _loadgen()
+    _LateConn.made = 0
+    monkeypatch.setattr(g.http.client, "HTTPConnection", _LateConn)
+    args = SimpleNamespace(
+        duration=0.1,
+        report_every=0.1,
+        concurrency=2,
+        read=1.0,
+        sorted=0.0,
+        max_id=1,
+        write_rows=1,
+        seed=1,
+        stop_mem_frac=0.8,
+        stop_err_rate=0.5,
+        stop_err_intervals=3,
+    )
+    g.soak(args, SimpleNamespace(hostname="unused", port=80))
+    lines = [json.loads(x) for x in capsys.readouterr().out.splitlines()]
+    final = lines[-1]
+    rows = lines[:-1]
+    assert final["final"] is True
+    assert _LateConn.made == 2  # 워커 둘이 하나씩 보내고 끝(0.2초 > 0.1초)
+    assert final["cum_requests"] == _LateConn.made
+    assert final["cum_errors"] == _LateConn.made
+    assert sum(sum(r["error_kinds"].values()) for r in rows) == _LateConn.made
+    assert rows[-1]["cum_requests"] == _LateConn.made
+
+
+def _soak_module():
+    sys.path.insert(0, str(ROOT / "lab"))
+    try:
+        spec = importlib.util.spec_from_file_location(
+            "lab_test_soak", ROOT / "lab" / "test_soak.py"
+        )
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.pop(0)
+    return module
+
+
+class _FakeStack:
+    def down(self):
+        pass
+
+    def up_infra(self):
+        pass
+
+    def up_app(self, *a, **kw):
+        return 1
+
+    def compose(self, *a, **kw):
+        pass
+
+    def argv(self):
+        return ["unused"]
+
+    def state(self, *a):
+        return {"Status": "running", "ExitCode": 0, "OOMKilled": False}
+
+    def stop_app(self, *a):
+        pass
+
+    def logs(self, *a):
+        return ""
+
+
+class _BlockingPipe:
+    """``kill()`` 될 때까지(최대 ``hold`` 초 뒤 스스로 끝남) 아무것도 내지 않다가 EOF."""
+
+    def __init__(self, proc, text=""):
+        self.proc, self.text = proc, text
+
+    def __iter__(self):
+        self.proc.wait()
+        yield from self.text.splitlines(keepends=True)
+
+    def read(self):
+        self.proc.wait()
+        return self.text
+
+
+class _FakeProc:
+    def __init__(self, *, rc, hold=0.0, out="", err=""):
+        import threading
+
+        self.killed = threading.Event()
+        self.hold = hold
+        self.stdout = _BlockingPipe(self, out)
+        self.stderr = _BlockingPipe(self, err)
+        self.rc = rc
+        self.kill_calls = 0
+
+    def kill(self):
+        self.kill_calls += 1
+        self.killed.set()
+
+    def wait(self, timeout=None):
+        limit = self.hold if timeout is None else min(timeout, self.hold)
+        self.killed.wait(limit)
+        return -9 if self.kill_calls else self.rc
+
+    def poll(self):
+        return None if not self.killed.is_set() and self.hold else self.wait(0)
+
+
+def _patch_soak(monkeypatch, tmp_path, proc):
+    from types import SimpleNamespace
+
+    m = _soak_module()
+    monkeypatch.setattr(m, "OUT", tmp_path)
+    monkeypatch.setattr(m, "CMAS", ("0",))
+    monkeypatch.setattr(m.Volumes, "take", classmethod(lambda cls: "v01"))
+    limits = "Max open files            1048576              1048576              files     \n"
+    env = {
+        "conn_max_age": 0,
+        "self_limits": limits,
+        "pid1_limits": limits,
+        "nr_open": "1048576\n",
+        "cgroup": {"max": 2 * 1024**3, "swap_max": 0},
+    }
+    probe = _soak_row(0)["probe"]
+    monkeypatch.setattr(
+        m, "http_json", lambda method, port, path, **kw: env if path == "/lab/soakenv" else probe
+    )
+    import time as real_time
+
+    monkeypatch.setattr(
+        m, "time", SimpleNamespace(sleep=lambda s: None, monotonic=real_time.monotonic)
+    )
+    monkeypatch.setattr(m.subprocess, "Popen", lambda *a, **kw: proc)
+    return m
+
+
+def test_soak_harness_fails_when_loadgen_fails(monkeypatch, tmp_path):
+    """리뷰 1 P2: 발생기 rc 1·출력 없음이 정상 soak 로 통과하면 안 된다(CONN_MAX_AGE 무관)."""
+    proc = _FakeProc(rc=1, err="loadgen failed\n")
+    m = _patch_soak(monkeypatch, tmp_path, proc)
+    with pytest.raises(AssertionError, match="loadgen rc 1"):
+        m.test_soak(_FakeStack(), "rid", {})
+    summary = json.loads(next(tmp_path.glob("soak-*-summary.json")).read_text())
+    problems = summary["by_cma"]["0"]["harness_problems"]
+    assert "loadgen rc 1" in problems and "no final line" in problems and "no intervals" in problems
+
+
+def test_soak_harness_times_out_without_output(monkeypatch, tmp_path):
+    """리뷰 1 P2: 발생기가 아무것도 내지 않고 매달려도 기한에 kill 하고 사유를 남긴다."""
+    import time
+
+    proc = _FakeProc(rc=0, hold=5.0)
+    m = _patch_soak(monkeypatch, tmp_path, proc)
+    monkeypatch.setattr(m, "DURATION", 0.2)
+    monkeypatch.setattr(m, "HARNESS_GRACE", 0.3, raising=False)
+    t0 = time.monotonic()
+    with pytest.raises(AssertionError, match="harness timeout"):
+        m.test_soak(_FakeStack(), "rid", {})
+    assert proc.kill_calls >= 1
+    assert time.monotonic() - t0 < 3.0  # 5초 매달림을 기다리지 않았다
+    raw = [json.loads(x) for x in next(tmp_path.glob("soak-*[0-9].jsonl")).read_text().splitlines()]
+    summary = next(r for r in raw if r["kind"] == "summary")
+    assert summary["stop_reason"] == "harness timeout"
+    assert "harness timeout" in summary["harness_problems"]
+
+
+def test_soak_quantiles_are_defined():
+    """리뷰 1 P3: 중앙값은 짝수 개면 가운데 둘의 평균, p90 은 최근접 순위(보간 없음)."""
+    s = _soakstat()
+    assert s.describe([1, 2, 366, 369])["median"] == 184.0
+    values = list(range(1, 181))  # 180 개
+    assert s.quantile_nearest(values, 0.9) == 162  # ceil(0.9·180) = 162 번째
+    assert s.quantile_nearest([5], 0.9) == 5 and s.quantile_nearest([], 0.9) is None
+
+
+def test_soak_harness_problems_allow_safe_stop_but_not_loadgen_failure():
+    s = _soakstat()
+    kw = {"duration": 30, "interval": 10}
+    rows = [_soak_row(i) for i in range(1, 4)] + [{**_soak_row(4), "tail": True}]
+    final = {"final": True, "stop_reason": None, "workers_alive": 0}
+    assert s.harness_problems(rows, final, 0, **kw) == []
+    # 의도된 안전 정지로 짧게 끝난 것은 실패가 아니다
+    safe = {**final, "stop_reason": "rss ..."}
+    assert s.harness_problems(rows[:1], safe, 0, **kw) == []
+    assert s.harness_problems(rows[:2], final, 0, **kw) == ["short run: 2 < 3 intervals"]
+    assert s.harness_problems([], None, 1, **kw) == [
+        "loadgen rc 1",
+        "no final line",
+        "no intervals",
+    ]
+    assert "harness timeout" in s.harness_problems(rows, final, -9, timed_out=True, **kw)
+    assert s.harness_problems(rows, {**final, "workers_alive": 2}, 0, **kw) == ["workers alive 2"]
+    no_probe = [{**r, "probe": None} for r in rows]
+    assert s.harness_problems(no_probe, final, 0, **kw) == ["no probe samples"]
+
+
+def test_soak_analyze_counts_tail_but_keeps_it_out_of_interval_metrics():
+    s = _soakstat()
+    rows = [_soak_row(i) for i in range(1, 41)]
+    tail = _soak_row(41, n=1, errors=1)
+    tail.update({"tail": True, "rps": 9999.0, "p99_ms": 9999.0, "cum_requests": 40 * 100 + 2})
+    tail["cum_errors"] = 1
+    baseline = {"db_requests": 0}
+    tail["probe"]["db_requests"] = 4002
+    out = s.analyze([*rows, tail], fd_limit=None, mem_limit=None, baseline=baseline)
+    assert out["intervals"] == 40 and out["intervals_with_probe"] == 40
+    assert out["requests"] == 4002 and out["errors"] == 1
+    assert (out["tail_requests"], out["tail_errors"]) == (2, 1)
+    assert out["p99_ms_max"] == 20.0 and out["rps_mean"] == 10.0
+    assert out["error_kinds"] == {"http 500": 1}
+    assert out["server_minus_client_requests"] == 0
+    assert out["dist"]["fd_total"]["median"] == 28 and out["steady_mean"]["fd_total"] == 28

@@ -2,7 +2,11 @@
 
 입력은 ``loadgen.py --report-every`` 가 낸 구간 줄들이다(한 ``CONN_MAX_AGE`` 실행분). 구간 줄의
 ``probe`` 는 앱 프로세스의 ``/lab/soakprobe`` 표본(``notes/metrics.soak_snapshot``)이다. 표본이
-없는 구간(앱이 응답하지 못함)은 시계열에서 뺀다.
+없는 구간(앱이 응답하지 못함)은 시계열에서 뺀다. 마지막의 ``"tail": true`` 줄(측정 시간이 끝난 뒤
+진행 중이던 요청이 끝난 것)은 누적 요청·오류에만 넣고, 구간 지표(처리량·p99)와 시계열에서는 뺀다.
+
+분위수: 중앙값은 ``statistics.median``(짝수 개면 가운데 두 값의 평균), p90 은 최근접 순위법
+(정렬한 n 개 중 ``ceil(0.9 n)`` 번째, ``quantile_nearest``).
 
 여기서 내는 기울기·외삽은 모두 **추정**이다. 한 실행의 구간 표본에 최소제곱 직선을 맞춘 것이고,
 연결 하나당 메모리는 RSS 를 열린 DB 본체 fd 수(연결 하나가 본체를 하나 연다고 본다)에 회귀한
@@ -11,6 +15,7 @@
 
 from __future__ import annotations
 
+import math
 import statistics
 
 # 이 값보다 fd 가 적게 변하면 '평탄'으로 본다(요청 10만 건당 fd 1개 미만).
@@ -26,6 +31,64 @@ def nofile_limits(limits_text: str) -> tuple[int, int]:
             soft, hard = line.split()[3:5]
             return int(soft), int(hard)
     raise ValueError("no 'Max open files' line")
+
+
+def quantile_nearest(values: list[float], q: float) -> float | None:
+    """최근접 순위법 분위수: 정렬한 n 개 중 ``ceil(q·n)`` 번째(1부터). 보간하지 않는다."""
+    if not values:
+        return None
+    s = sorted(values)
+    return s[max(1, math.ceil(q * len(s))) - 1]
+
+
+def describe(values: list[float]) -> dict | None:
+    """최소·중앙값·p90(최근접 순위)·최대."""
+    if not values:
+        return None
+    return {
+        "min": min(values),
+        "median": statistics.median(values),
+        "p90": quantile_nearest(values, 0.9),
+        "max": max(values),
+    }
+
+
+def harness_problems(
+    rows: list[dict],
+    final: dict | None,
+    rc: int | None,
+    *,
+    duration: float,
+    interval: float,
+    timed_out: bool = False,
+) -> list[str]:
+    """하네스·발생기 실패(리뷰 1). 앱의 오류나 의도된 안전 정지(``stop_reason``)는 실패가 아니다.
+
+    - ``harness timeout``: 기한까지 발생기가 끝나지 않아 하네스가 죽였다.
+    - ``loadgen rc N``: 발생기(``docker compose run``)의 종료 코드가 0 이 아니다.
+    - ``no final line``·``no intervals``·``no probe samples``: 원자료가 없다.
+    - ``workers alive N``: 끝난 뒤에도 요청 스레드가 남았다(꼬리 집계가 완전하지 않다).
+    - ``short run``: 안전 정지가 아닌데 구간 수가 ``ceil(duration / interval)`` 보다 적다.
+    """
+    out = []
+    if timed_out:
+        out.append("harness timeout")
+    if rc != 0:
+        out.append(f"loadgen rc {rc}")
+    if not final:
+        out.append("no final line")
+    intervals = [r for r in rows if not r.get("tail")]
+    if not intervals:
+        out.append("no intervals")
+    elif not any(r.get("probe") for r in intervals):
+        out.append("no probe samples")
+    if final and final.get("workers_alive"):
+        out.append(f"workers alive {final['workers_alive']}")
+    if final and not final.get("stop_reason"):
+        want = math.ceil(duration / interval - 1e-9)
+        if len(intervals) < want:
+            out.append(f"short run: {len(intervals)} < {want} intervals")
+    return out
 
 
 def ols(xs: list[float], ys: list[float]) -> dict | None:
@@ -60,11 +123,14 @@ def points(rows: list[dict]) -> list[dict]:
                 "conn_created": p.get("conn_created"),
                 "fd_total": fds["total"],
                 "fd_db": fds["db"],
+                "fd_wal": fds["wal"],
                 "fd_dbfiles": fds["db"] + fds["wal"] + fds["shm"],
                 "fd_socket": fds["socket"],
                 "fd_other": fds["other"],
                 "scan_ms": fds.get("scan_ms"),
                 "rss": p.get("VmRSS"),
+                "hwm": p.get("VmHWM"),
+                "probe_ms": p.get("probe_ms"),
                 "threads": p.get("Threads"),
                 "py_threads": p.get("py_threads"),
                 "cgroup_current": (p.get("cgroup") or {}).get("current"),
@@ -129,21 +195,32 @@ def time_to(limit: float | None, current: float | None, per_second: float | None
     return max(0.0, (limit - current) / per_second)
 
 
-def analyze(rows: list[dict], *, fd_limit: int | None, mem_limit: int | None) -> dict:
-    """한 실행(한 ``CONN_MAX_AGE``)의 요약."""
-    pts = points(rows)
-    measured = [r for r in rows if r["n"] + r["errors"] > 0]
+STEADY_AFTER_S = 300.0
+DIST_KEYS = ("fd_total", "fd_db", "fd_wal", "rss", "threads", "cgroup_current", "scan_ms")
+STEADY_KEYS = ("fd_total", "fd_db", "rss", "cgroup_current")
+
+
+def analyze(
+    rows: list[dict], *, fd_limit: int | None, mem_limit: int | None, baseline: dict | None = None
+) -> dict:
+    """한 실행(한 ``CONN_MAX_AGE``)의 요약. ``baseline`` 은 부하 직전 ``/lab/soakprobe`` 표본."""
+    intervals = [r for r in rows if not r.get("tail")]
+    tail = [r for r in rows if r.get("tail")]
+    pts = points(intervals)
+    measured = [r for r in intervals if r["n"] + r["errors"] > 0]
     errors: dict[str, int] = {}
     for r in rows:
         for k, v in r.get("error_kinds", {}).items():
             errors[k] = errors.get(k, 0) + v
     p99s = [r["p99_ms"] for r in measured if r["n"]]
     out: dict = {
-        "intervals": len(rows),
+        "intervals": len(intervals),
         "intervals_with_probe": len(pts),
-        "elapsed_s": rows[-1]["t_s"] if rows else None,
+        "elapsed_s": intervals[-1]["t_s"] if intervals else None,
         "requests": rows[-1]["cum_requests"] if rows else 0,
         "errors": rows[-1]["cum_errors"] if rows else 0,
+        "tail_requests": sum(r["n"] + r["errors"] for r in tail),
+        "tail_errors": sum(r["errors"] for r in tail),
         "error_kinds": errors,
         "intervals_with_errors": sum(1 for r in rows if r["errors"]),
         "rps_mean": round(statistics.fmean(r["rps"] for r in measured), 1) if measured else None,
@@ -153,8 +230,23 @@ def analyze(rows: list[dict], *, fd_limit: int | None, mem_limit: int | None) ->
         "p99_ms_max": max(p99s) if p99s else None,
         "p99_ms_last": p99s[-1] if p99s else None,
     }
+    # 서버 카운터와 대조: 부하 직전 표본부터 마지막 표본(꼬리 포함)까지 DB 요청 증가 − 클라이언트가
+    # 센 요청 수. 랩 뷰는 모두 DB 요청이고 표본은 DB 요청이 아니므로 꼬리까지 모으면 0 이어야 한다.
+    last_probe = next((r["probe"] for r in reversed(rows) if r.get("probe")), None)
+    if baseline and last_probe and baseline.get("db_requests") is not None:
+        server = last_probe["db_requests"] - baseline["db_requests"]
+        out["server_db_requests"] = server
+        out["server_minus_client_requests"] = server - out["requests"]
     if not pts:
         return out
+    out["dist"] = {k: describe([p[k] for p in pts if p[k] is not None]) for k in DIST_KEYS}
+    steady = [p for p in pts if p["t_s"] > STEADY_AFTER_S]
+    out["steady_after_s"] = STEADY_AFTER_S
+    out["steady_mean"] = {
+        k: statistics.fmean(p[k] for p in steady) if steady else None for k in STEADY_KEYS
+    }
+    out["probe_ms_max"] = max(p["probe_ms"] or 0 for p in pts)
+    out["hwm_end"] = pts[-1]["hwm"]
     # fd·RSS 를 누적 DB 요청 수에 대해(요청에 비례하는가), 그리고 시간에 대해(외삽).
     out["fd_dbfiles_vs_db_requests"] = trend(pts, "db_requests", "fd_dbfiles")
     out["fd_total_vs_db_requests"] = trend(pts, "db_requests", "fd_total")

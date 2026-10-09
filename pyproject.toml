@@ -19,6 +19,12 @@ dev = ["pytest>=8", "pyyaml>=6", "ruff>=0.6"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]
+# 랩 마커(lab/conftest.py 와 같다). tests/test_lab.py 가 랩 모듈을 불러 검사할 때도 알려 둔다.
+markers = [
+  "bench: PRAGMA 벤치(scripts/lab.sh bench)",
+  "soak: fd·RSS 장시간 실행(scripts/lab.sh soak, #33)",
+  "profile: 배포 프로필 문서 compose 종단 검증",
+]
 
 [tool.ruff]
 target-version = "py313"

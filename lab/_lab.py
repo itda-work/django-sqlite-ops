@@ -7,6 +7,7 @@ Docker 는 ``docker compose -p <우리 프로젝트>`` 로만 다룬다. 컨테�
 
 from __future__ import annotations
 
+import collections
 import json
 import os
 import re
@@ -23,6 +24,10 @@ BUILD = ROOT / "lab" / ".build"
 PROJECT = os.environ.get("LAB_PROJECT", "dso-lab")
 TAG = os.environ.get("LAB_TAG", "dev")
 BUCKET = "dso-lab"
+# 실행 식별자와 결과 디렉터리. conftest 와 시나리오가 함께 쓴다(시나리오가 conftest 를 import 하지
+# 않아도 되게 — tests/ 에서 시나리오 모듈을 불러 검사한다).
+RUN_ID = os.environ.get("LAB_RUN_ID") or time.strftime("%Y%m%d-%H%M%S")
+OUT = Path(os.environ.get("LAB_OUT", ROOT / "lab" / ".out"))
 
 if not re.fullmatch(r"dso-lab(-[a-z0-9][a-z0-9-]*)?", PROJECT):
     raise SystemExit(f"LAB_PROJECT must be dso-lab or dso-lab-<suffix>: {PROJECT}")
@@ -328,6 +333,20 @@ def http_json(
     req = urllib.request.Request(f"http://127.0.0.1:{port}{path}", data=body, method=method)
     with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.loads(resp.read())
+
+
+def error_log(stack, results, service: str = "labapp") -> dict | None:
+    """오류가 난 단계가 있으면 앱 로그의 예외 줄(종류별 수)과 끝 부분을 돌려준다.
+
+    접근 로그가 많아 끝 부분만으로는 예외 줄이 밀려난다. 그래서 전체 로그에서 예외 줄을 센다.
+    """
+    if not any(r["errors"] for r in results):
+        return None
+    text = stack.logs(service)
+    exc = collections.Counter(
+        line.strip() for line in text.splitlines() if re.match(r"^[\w.]+(Error|Exception): ", line)
+    )
+    return {"exceptions": dict(exc.most_common(10)), "tail": text[-3000:]}
 
 
 def boot_lines(text: str) -> list[str]:
