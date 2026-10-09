@@ -90,3 +90,13 @@ def probe(request):
 def ping(request):
     """벤치(#26): DB 없이 Django 를 지나는 가장 가벼운 요청(부하 발생기·스택 한계 확인)."""
     return JsonResponse({"ok": True})
+
+
+def soakprobe(request):
+    """soak 표본(#33): fd 분류·RSS·스레드·cgroup 메모리·WAL 크기. DB 연결을 열지 않는다."""
+    return JsonResponse(metrics.soak_snapshot())
+
+
+def soakenv(request):
+    """soak 환경(#33): nr_open·적용된 한도 원문. DB 연결을 열지 않는다."""
+    return JsonResponse(metrics.soak_env())

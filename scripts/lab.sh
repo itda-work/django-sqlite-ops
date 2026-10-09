@@ -4,6 +4,7 @@
 #   scripts/lab.sh up                 # 이미지 빌드 + SeaweedFS·toxiproxy 기동(남겨 둔다)
 #   scripts/lab.sh run [L1..L8|P1|P2|all]   # 시나리오(끝나면 down -v)
 #   scripts/lab.sh bench [pytest 인자]   # PRAGMA 벤치(끝나면 down -v)
+#   scripts/lab.sh soak [pytest 인자]    # fd·RSS 장시간 실행(#33, 끝나면 down -v)
 #   scripts/lab.sh down               # 이 랩의 컨테이너·볼륨·네트워크만 지운다
 #
 # 프로젝트 이름은 LAB_PROJECT(기본 dso-lab, 또는 dso-lab-<suffix>)다. 같은 호스트의 다른
@@ -85,9 +86,9 @@ case "$cmd" in
     stamp="$(date +%Y%m%d-%H%M%S)"
     sel="${1:-all}"
     if [[ "$sel" == all ]]; then
-      pytest_lab -m "not bench" 2>&1 | tee "$OUT/run-$stamp.log"
+      pytest_lab -m "not bench and not soak" 2>&1 | tee "$OUT/run-$stamp.log"
     else
-      pytest_lab -m "not bench" -k "$sel" 2>&1 | tee "$OUT/run-$stamp.log"
+      pytest_lab -m "not bench and not soak" -k "$sel" 2>&1 | tee "$OUT/run-$stamp.log"
     fi
     ;;
   bench)
@@ -96,11 +97,17 @@ case "$cmd" in
     stamp="$(date +%Y%m%d-%H%M%S)"
     pytest_lab -m bench "$@" 2>&1 | tee "$OUT/bench-$stamp.log"
     ;;
+  soak)
+    trap down EXIT
+    build
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    pytest_lab -m soak "$@" 2>&1 | tee "$OUT/soak-$stamp.log"
+    ;;
   down)
     down
     ;;
   *)
-    echo "사용법: $0 up | run [L1..L8|P1|P2|all] | bench | down" >&2
+    echo "사용법: $0 up | run [L1..L8|P1|P2|all] | bench | soak | down" >&2
     exit 64
     ;;
 esac

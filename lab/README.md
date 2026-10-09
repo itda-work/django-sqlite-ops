@@ -8,6 +8,7 @@ Docker 로 Litestream·boot·헬스의 실패 경계(L1–L8, [DESIGN §10](../d
 scripts/lab.sh run all        # L1–L8, P1·P2 (약 8분). 끝나면 성공·실패와 관계없이 down -v
 scripts/lab.sh run L6         # pytest -k 로 좁힌다 (L1..L8, P1, P2)
 scripts/lab.sh bench          # PRAGMA 벤치 + 포화 측정 (약 50분). pytest 인자를 넘길 수 있다(-k saturation)
+scripts/lab.sh soak           # fd·RSS 장시간 실행, CONN_MAX_AGE None·0 각 30분 (약 70분, #33)
 scripts/lab.sh up             # 이미지 빌드 + SeaweedFS·toxiproxy 만 띄워 둔다(디버깅용)
 scripts/lab.sh down           # 이 랩의 자원만 지우고 남은 것을 보여 준다(비어 있어야 한다)
 ```
@@ -46,6 +47,7 @@ ubuntu-latest(amd64)에서 `scripts/lab.sh run <선택>` 을 그대로 돌리고
 | `s3` | `chrislusf/seaweedfs:4.48@sha256:4e61d15f…` | S3 대체. 버킷 `dso-lab` 하나를 시나리오별 prefix 로 나눈다. `-volume.max=200` |
 | `toxiproxy` | `ghcr.io/shopify/toxiproxy:2.12.0@sha256:9378ed52…` | 앱 ↔ S3. 프록시 `s3`(:18333, boot·replicate)와 `s3h`(:18334, L8b 의 헬스 조회만) |
 | `labapp` / `labapp-nv` | `dso-lab-app:<태그>` | 시나리오 앱. 볼륨 `LAB_VOLUME` 있음 / 없음(무상태). 재시작하지 않는다(종료 코드를 본다) |
+| `labapp-soak` | 같은 이미지 | soak 앱(#33). `labapp` + `nofile`·메모리 한도(스왑 없음) |
 | `tool` | 같은 이미지 | 볼륨 없이 복제본을 `/tmp` 로 복원해 TXID·행 수·`integrity_check` 를 낸다 |
 | `loadgen` | 같은 이미지 | 벤치 부하 발생기(`lab_tools/loadgen.py`) |
 | P1 `app` | 같은 이미지 | **single-server 문서의 compose.yaml 그대로** + `profile-override.yaml` |
@@ -118,6 +120,22 @@ L6 의 훅은 `LAB_RENAME_DELAY` 가 있을 때만 `os.rename` 뒤에 한 줄(`[
 
 환경 변수: `LAB_BENCH_REPS`(5), `LAB_BENCH_DURATION`(20), `LAB_BENCH_ROWS`(100000), `LAB_BENCH_CONCURRENCY`(16), `LAB_BENCH_VARIANTS`, `LAB_BENCH_CMA`(`0,none`), `LAB_BENCH_WRITE_SHARE`(0.7), `LAB_BENCH_WRITE_ROWS`(50), `LAB_BENCH_SAT_REPS`(2), `LAB_BENCH_SAT_DURATION`(10), `LAB_BENCH_SAT_LEVELS`(`4,16,48`). 결과: `lab/.out/bench-<시각>.json`, `saturation-<시각>.json`.
 
+## fd·RSS 장시간 실행 (soak, #33)
+
+`lab/test_soak.py` 의 `test_soak`(마커 `soak`)이다. `scripts/lab.sh soak` 으로만 돈다 — `run` 은 `-m "not bench and not soak"` 이고 GitHub 의 `lab.yml` 도 `run` 만 부르므로 기본 수집·CI 에 들어가지 않는다. 결과는 [`fd-soak-2026-10-09.md`](../docs/research/fd-soak-2026-10-09.md).
+
+- 앱은 `labapp-soak`(lab-compose.yaml)이다. `labapp` 과 같고 compose [`ulimits`](https://docs.docker.com/reference/compose-file/services/#ulimits) 로 `nofile` soft·hard 를 `LAB_SOAK_NOFILE`(기본 1048576 = 이 랩 VM 의 `fs.nr_open`, 컨테이너가 올릴 수 있는 최대)로, [`mem_limit`](https://docs.docker.com/reference/compose-file/services/#mem_limit)·[`memswap_limit`](https://docs.docker.com/reference/compose-file/services/#memswap_limit) 를 같은 값 `LAB_SOAK_MEM`(기본 `2g`, 스왑 없음)으로 둔다. 시작할 때 앱 프로세스의 `/proc/self/limits`·`/proc/1/limits`·`nr_open`·cgroup `memory.max` 를 원자료로 남기고, nofile 이 요청값과 다르거나 메모리 한도가 없으면 실패한다.
+- `CONN_MAX_AGE` 값마다 스택을 새로 띄워(`down -v` → `up`) 새 볼륨·prefix 로 `--init-new` 부팅 → 행 `LAB_SOAK_ROWS` 개 → 부하 직전 표본 → `loadgen --report-every`. 부하는 벤치 `mixed` 와 같다(읽기 70%·정렬 10%·1행 쓰기 20%, 동시 `LAB_SOAK_CONCURRENCY`). 두 값이 같은 부하다.
+- 구간(`LAB_SOAK_INTERVAL` 초)마다 한 줄: 처리량·p50·p99·오류 종류별 수·누적 요청 수, 그리고 앱 프로세스 안 `/lab/soakprobe`(DB 를 열지 않음) 표본 — `/proc/self/fd` readlink 로 나눈 fd(DB 본체·`-wal`·`-shm`·소켓·기타, 열거에 걸린 `scan_ms`), `VmRSS`·`VmHWM`, OS 스레드(`Threads`)·Python 스레드, cgroup `memory.current`·`memory.events`, `gc` 세대별 수집 횟수, WAL 크기, 연결 생성·DB 요청 카운터.
+- **종료 꼬리·대조**: 측정 시간이 끝나면 loadgen 은 워커를 기다리고, 그 사이 끝난 요청(워커마다 진행 중이던 하나)을 `"tail": true` 줄로 한 번 더 낸다. 누적 요청·오류에는 들어가고 구간 지표(처리량·p99)·시계열에서는 빠진다. 부하 직전 표본부터 마지막 표본까지 서버의 DB 요청 증가와 클라이언트가 센 요청 수의 차(`server_minus_client_requests`)를 남긴다(0 이어야 한다).
+- **하네스 실패**(`_soakstat.harness_problems`): 발생기 rc ≠ 0, `final` 줄 없음, 구간·표본 없음, 끝난 뒤 남은 워커, 안전 정지가 아닌데 구간 수 부족, 기한(`LAB_SOAK_DURATION` + 600초) 초과. 기한은 출력과 따로 잰다(stdout·stderr 를 스레드로 읽는다) — 출력이 없거나 JSON 이 아닌 줄만 나와도 기한에 발생기를 죽이고 `harness timeout` 으로 남긴다. 하나라도 있으면 `CONN_MAX_AGE` 와 관계없이 실패다.
+- **안전 정지**(loadgen 의 `stop_reason`, `tests/test_lab.py` 가 검사): 앱 RSS ≥ `memory.max` × `LAB_SOAK_STOP_MEM_FRAC`(0.8), cgroup `oom_kill` 이벤트, 오류율 ≥ `LAB_SOAK_STOP_ERR_RATE`(0.5)가 `LAB_SOAK_STOP_ERR_INTERVALS`(3) 구간 연속, 표본 3구간 연속 실패. 걸리면 그 실행을 멈추고 사유를 남긴다. 마지막 방어선은 컨테이너 메모리 한도라 OOM 이 나도 이 컨테이너 cgroup 안에서 끝난다(VM 의 다른 컨테이너를 흔들지 않는다).
+- 분석은 `_soakstat.py`(순수 함수, Docker 없이 `tests/test_lab.py` 가 검사): fd·RSS 의 누적 DB 요청 대비 기울기(전체·앞 절반·뒤 절반)와 모양(`flat`·`grows`·`slows`·`plateau`), 연결당 메모리 추정(RSS 를 DB 본체 fd 수에 회귀), 뒤 절반 시간 기울기로 한도·메모리 한도까지의 외삽(추정). `None` 의 오류·조기 정지는 기록만 하고 실패 판정은 `0` 에만 건다.
+
+환경 변수: `LAB_SOAK_DURATION`(1800초), `LAB_SOAK_INTERVAL`(10초), `LAB_SOAK_CONCURRENCY`(16), `LAB_SOAK_ROWS`(100000), `LAB_SOAK_CMA`(`none,0`), `LAB_SOAK_MEM`(`2g`), `LAB_SOAK_NOFILE`(1048576), `LAB_SOAK_STOP_MEM_FRAC`(0.8), `LAB_SOAK_STOP_ERR_RATE`(0.5), `LAB_SOAK_STOP_ERR_INTERVALS`(3). 짧게 확인할 때: `LAB_SOAK_DURATION=60 LAB_SOAK_INTERVAL=5 LAB_SOAK_ROWS=10000 scripts/lab.sh soak`.
+
+결과: `lab/.out/soak-<시각>.jsonl`(줄마다 `cma`·`kind` = `env`·`baseline`·`interval`·`final`·`summary`), `soak-<시각>-summary.json`(두 값 비교와 실행별 요약), 콘솔 `soak-<시각>.log`. 결과 문서의 표는 손으로 옮기지 않고 `uv run --no-project python lab/soak_report.py lab/.out/soak-<시각>.jsonl` 의 출력을 넣는다(중앙값은 `statistics.median`, p90 은 최근접 순위).
+
 ## 파일
 
 ```
@@ -130,9 +148,12 @@ lab/
 ├── _lab.py                 compose·toxiproxy·조사 도구
 ├── _checks.py              L6·L8a 판정(순수 함수, tests/test_lab.py 가 Docker 없이 검사)
 ├── _benchstat.py           벤치 집계·재현 판정(순수 함수, 같은 테스트가 검사)
+├── _soakstat.py            soak 분석(순수 함수, 같은 테스트가 검사)
 ├── conftest.py             RUN_LAB 게이트, 결과 기록
 ├── test_scenarios.py       P1·P2, L1–L8
 ├── test_bench.py           PRAGMA 벤치, 포화 측정
+├── test_soak.py            fd·RSS 장시간 실행(#33)
+├── soak_report.py          soak 원자료 → 결과 문서의 표(_soakstat 로 계산)
 └── app/                    랩 Django 프로젝트(문서 조각 밖의 것)
     ├── manage.py, proj/asgi.py(벤치 계측 래퍼), proj/*_tail.py, notes/(뷰·계측)
     ├── lab_tools/          inspect_data.py, replica.py, s3_objects.py, loadgen.py

@@ -26,16 +26,13 @@ LAB_BENCH_SAT_REPS(2), LAB_BENCH_SAT_DURATION(10초), LAB_BENCH_SAT_LEVELS("4,16
 
 from __future__ import annotations
 
-import collections
 import json
 import os
-import re
 import time
 
 import pytest
 from _benchstat import metric, summarize
-from _lab import http_json, log
-from conftest import OUT, RUN_ID
+from _lab import OUT, RUN_ID, error_log, http_json, log
 from test_scenarios import Volumes, env
 
 ALL_VARIANTS = {
@@ -145,20 +142,6 @@ def load(stack, e: dict, *, mode: str, duration: float, concurrency: int, seed_n
         "run", "--rm", "--no-deps", "-T", "loadgen", *argv, env=e, timeout=duration + 120
     )
     return json.loads(res.out.strip().splitlines()[-1])
-
-
-def error_log(stack, results) -> dict | None:
-    """오류가 난 단계가 있으면 앱 로그의 예외 줄(종류별 수)과 끝 부분을 돌려준다.
-
-    접근 로그가 많아 끝 부분만으로는 예외 줄이 밀려난다. 그래서 전체 로그에서 예외 줄을 센다.
-    """
-    if not any(r["errors"] for r in results):
-        return None
-    text = stack.logs("labapp")
-    exc = collections.Counter(
-        line.strip() for line in text.splitlines() if re.match(r"^[\w.]+(Error|Exception): ", line)
-    )
-    return {"exceptions": dict(exc.most_common(10)), "tail": text[-3000:]}
 
 
 def one_run(stack, run_id: str, cma: str, name: str, rep: int) -> dict:
