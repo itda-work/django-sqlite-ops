@@ -960,3 +960,42 @@ def test_soak_analyze_counts_tail_but_keeps_it_out_of_interval_metrics():
     assert out["error_kinds"] == {"http 500": 1}
     assert out["server_minus_client_requests"] == 0
     assert out["dist"]["fd_total"]["median"] == 28 and out["steady_mean"]["fd_total"] == 28
+
+
+def test_soak_report_builds_tables_from_raw_jsonl(tmp_path):
+    """리뷰 1 P3: 결과 문서의 표는 원자료에서 스크립트로 만든다(손으로 옮기지 않는다)."""
+    limits = "Max open files            1048576              1048576              files     \n"
+    lines = []
+    for cma, fds_db in (("none", 800), ("0", 32)):
+        env = {
+            "pid": 36,
+            "self_limits": limits,
+            "pid1_limits": limits,
+            "nr_open": "1048576\n",
+            "file_max": "9\n",
+            "cgroup": {"max": 2 * 1024**3, "swap_max": 0},
+            "conn_max_age": None if cma == "none" else 0,
+            "pid1_cmdline": "litestream replicate",
+        }
+        lines.append({"cma": cma, "kind": "env", **env})
+        lines.append({"cma": cma, "kind": "baseline", "probe": {**_soak_row(0)["probe"]}})
+        fds = {"db": fds_db, "wal": 10, "shm": 1, "socket": 20, "other": 5}
+        for i in range(1, 41):
+            row = _soak_row(i, fds=fds, rss=(400 if cma == "none" else 70) * 2**20)
+            lines.append({"cma": cma, "kind": "interval", **row})
+        lines.append({"cma": cma, "kind": "final", "final": True, "stop_reason": None})
+    raw = tmp_path / "soak-x.jsonl"
+    raw.write_text("".join(json.dumps(x) + "\n" for x in lines))
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "lab" / "soak_report.py"), str(raw)],
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = proc.stdout
+    assert "| 300 | 3,000 | 10.0 | 20.0 | 0 | 836 | 800 | 10 | 1 | 20 | 400 | 30 | 410 |" in out
+    assert (
+        "| fd 합계 최소 / 중앙값 / p90 / 최대 | 836 / 836 / 836 / 836 | 68 / 68 / 68 / 68 |" in out
+    )
+    assert "RSS 비 5.71" in out
