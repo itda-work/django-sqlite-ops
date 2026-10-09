@@ -17,6 +17,7 @@ from pathlib import Path
 import pytest
 from _litestream import needs_litestream, require_litestream
 
+from django_sqlite_ops import doctor as doctor_module
 from django_sqlite_ops.boot.litestream import parse_databases_json
 from django_sqlite_ops.database import sqlite_database
 from django_sqlite_ops.doctor import (
@@ -27,6 +28,8 @@ from django_sqlite_ops.doctor import (
     format_text,
     mount_output_fstype,
     mountinfo_fstype,
+    nofile_items,
+    to_json,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -255,7 +258,14 @@ def test_json_schema(tmp_path):
     for item in data["items"]:
         assert set(item) == {"section", "alias", "key", "level", "value", "expected", "message"}
         assert item["level"] in ("ok", "warn", "error", "unknown")
-        assert item["section"] in ("settings", "database", "mount", "litestream", "channels")
+        assert item["section"] in (
+            "settings",
+            "database",
+            "mount",
+            "litestream",
+            "channels",
+            "process",
+        )
 
 
 def test_text_output(tmp_path):
@@ -293,6 +303,99 @@ def test_format_text_summary_counts():
         ]
     )
     assert text.splitlines()[-1] == "summary: 1 warning(s), 1 error(s), 1 unknown -> exit 2"
+
+
+# --- 프로세스 fd 한도 ------------------------------------------------------------------
+
+
+def test_nofile_reports_this_process_limits(tmp_path):
+    resource = pytest.importorskip("resource")
+    soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    db = make_db(tmp_path / "app.sqlite3")
+    # 자식 프로세스는 한도를 물려받는다(getrlimit(2)). 보고만 하므로 종료 코드는 그대로 0.
+    rc, data = doctor({"default": sqlite_database(db)})
+
+    def shown(v):
+        return "unlimited" if v == resource.RLIM_INFINITY else v
+
+    assert one(data, "process", None, "nofile_soft")["value"] == shown(soft)
+    assert one(data, "process", None, "nofile_hard")["value"] == shown(hard)
+    assert {i["level"] for i in items(data, "process")} == {"ok"}
+    assert rc == 0
+
+
+class FakeResource:
+    RLIMIT_NOFILE = 7
+    RLIM_INFINITY = -1
+
+    def __init__(self, limits=None, exc=None):
+        self.limits, self.exc, self.asked = limits, exc, []
+
+    def getrlimit(self, which):
+        self.asked.append(which)
+        if self.exc is not None:
+            raise self.exc
+        return self.limits
+
+
+def test_nofile_soft_and_hard(monkeypatch):
+    fake = FakeResource((1024, 524288))
+    monkeypatch.setattr(doctor_module, "resource", fake)
+    found = nofile_items()
+    assert fake.asked == [FakeResource.RLIMIT_NOFILE]
+    assert [(i.section, i.alias, i.key, i.level, i.value, i.expected) for i in found] == [
+        ("process", None, "nofile_soft", "ok", 1024, None),
+        ("process", None, "nofile_hard", "ok", 524288, None),
+    ]
+    assert all("not judged" in i.message for i in found)
+
+
+def test_nofile_infinity_is_unlimited(monkeypatch):
+    monkeypatch.setattr(doctor_module, "resource", FakeResource((1048576, -1)))
+    soft, hard = nofile_items()
+    assert (soft.value, hard.value) == (1048576, "unlimited")
+
+
+@pytest.mark.parametrize(
+    ("fake", "reason"),
+    [
+        (None, "the resource module is not available on this platform"),
+        (FakeResource(exc=OSError("boom")), "OSError: boom"),
+        (FakeResource(exc=ValueError("bad")), "ValueError: bad"),
+    ],
+)
+def test_nofile_unavailable_is_reported_not_judged(monkeypatch, fake, reason):
+    monkeypatch.setattr(doctor_module, "resource", fake)
+    (item,) = nofile_items()
+    assert (item.section, item.key, item.level, item.value) == ("process", "nofile", "ok", None)
+    assert item.message == f"unavailable: {reason}"
+    assert exit_code([item]) == 0
+
+
+def test_nofile_output_formats(monkeypatch):
+    monkeypatch.setattr(doctor_module, "resource", FakeResource((1024, 524288)))
+    found = nofile_items()
+    lines = format_text(found).splitlines()
+    assert lines[0] == "[process]"
+    assert lines[1].split()[:4] == ["OK", "-", "nofile_soft", "1024"]
+    assert lines[2].split()[:4] == ["OK", "-", "nofile_hard", "524288"]
+    assert lines[-1] == "summary: 0 warning(s), 0 error(s), 0 unknown -> exit 0"
+    data = json.loads(to_json(found))
+    assert [(i["key"], i["value"]) for i in data["items"]] == [
+        ("nofile_soft", 1024),
+        ("nofile_hard", 524288),
+    ]
+    monkeypatch.setattr(doctor_module, "resource", None)
+    assert "nofile  -  — unavailable:" in format_text(nofile_items())
+
+
+def test_text_output_has_process_section(tmp_path):
+    db = make_db(tmp_path / "app.sqlite3")
+    rc, out = doctor({"default": sqlite_database(db)}, json_output=False)
+    lines = out.splitlines()
+    assert "[process]" in lines
+    assert lines.index("[process]") > lines.index("[channels]")
+    assert any(line.split()[:3] == ["OK", "-", "nofile_soft"] for line in lines)
 
 
 # --- 마운트 ----------------------------------------------------------------------------
