@@ -9,8 +9,6 @@ ALLOWED_HOSTS = ["*"]
 ROOT_URLCONF = "proj.urls"
 USE_TZ = True
 INSTALLED_APPS += ["notes"]  # noqa: F821
-# 벤치 계측(#26): 뷰 처리 시간 헤더. 문서 조각에 MIDDLEWARE 가 생기면 그 앞에 붙는다.
-MIDDLEWARE = ["notes.middleware.timing", *globals().get("MIDDLEWARE", [])]
 
 # 헬스 주기·grace 를 랩 시간에 맞게 줄인다(L8). 기본은 15초·60초.
 _health = SQLITE_OPS["HEALTH"]  # noqa: F821

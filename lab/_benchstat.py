@@ -1,10 +1,12 @@
 """PRAGMA 벤치 집계·판정(순수 함수). ``tests/test_lab.py`` 가 Docker 없이 검사한다.
 
 실행 기록 하나(run)는 ``{"cma", "variant", "rep", "phases": {phase: loadgen 결과}}`` 다. 지표 이름은
-loadgen 결과의 키 경로를 점으로 잇는다(예: ``svc.p50_ms``, ``server.conn_per_db_request``).
+loadgen 결과의 키 경로를 점으로 잇는다(예: ``view.p50_ms``, ``server.conn_per_db_request``).
 
 판정(#10 과 같다): 같은 반복·같은 ``CONN_MAX_AGE``·같은 단계의 기준(baseline)과 짝지어 차이(%)를
-내고, 모든 반복에서 같은 방향으로 ``threshold``% 이상일 때만 '재현'이다.
+내고, 모든 반복에서 같은 방향으로 ``threshold``% 이상일 때만 '재현'이다. 판정은 반올림하지 않은
+차이로 하고, 반올림은 결과 JSON 에 표시할 때만 한다(#26 리뷰 1: 4.96% 가 5.0 으로 올라가 재현으로
+판정되던 것).
 """
 
 from __future__ import annotations
@@ -25,7 +27,7 @@ def metric(run: dict, phase: str, name: str) -> float | None:
 
 
 def paired_deltas(runs: Iterable[dict], cma: str, variant: str, phase: str, name: str) -> list:
-    """반복마다 (변형 − 기준) / 기준 × 100. 기준이 0 이거나 값이 없는 반복은 뺀다."""
+    """반복마다 (변형 − 기준) / 기준 × 100(반올림 안 함). 기준이 0 이거나 값이 없는 반복은 뺀다."""
     runs = list(runs)
     base = {
         r["rep"]: metric(r, phase, name)
@@ -39,7 +41,7 @@ def paired_deltas(runs: Iterable[dict], cma: str, variant: str, phase: str, name
         v, b = metric(r, phase, name), base.get(r["rep"])
         if v is None or not b:
             continue
-        out.append(round(100 * (v - b) / b, 1))
+        out.append(100 * (v - b) / b)
     return out
 
 
@@ -89,7 +91,8 @@ def summarize(
                     entry[name] = describe(vals)
                     if variant != "baseline" and name in paired:
                         deltas = paired_deltas(runs, cma, variant, phase, name)
-                        entry[name]["delta_pct_per_rep"] = deltas
+                        # 표시용 반올림. 판정은 반올림 전 값으로 한다.
+                        entry[name]["delta_pct_per_rep"] = [round(d, 1) for d in deltas]
                         entry[name]["reproduced"] = reproduced(deltas, reps)
                 entry["errors"] = sum(int(metric(r, phase, "errors") or 0) for r in rows)
                 out[cma][phase][variant] = entry

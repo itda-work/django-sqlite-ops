@@ -99,19 +99,20 @@ L6 의 훅은 `LAB_RENAME_DELAY` 가 있을 때만 `os.rename` 뒤에 한 줄(`[
 
 반복 r 마다 모든 (CMA, 변형) 조합을 돌고 순서를 r 만큼 회전한다(시간에 따른 호스트 부하 변화를 고르게 나눈다). 반복이 끝나면 랩 스택을 `down -v` 로 내리고 다시 띄운다(볼륨 풀 40개를 다시 쓴다). Litestream 은 프로필 그대로 복제한다.
 
-**`test_saturation`** — 기준 설정에서 `rawping`(Django 앞 ASGI 래퍼가 바로 답함)·`ping`(DB 없는 Django 뷰) 동시 16·48 과 `mixed` 동시 4·16·48 을 잰다. 부하 발생기의 한계와 처리량 곡선(병목 위치)을 본다.
+**`test_saturation`** — 기준 설정에서 `rawping`(Django 앞 ASGI 래퍼가 바로 답함)·`ping`(DB 없는 Django 뷰) 동시 16·48 과 `mixed` 동시 4·16·48 을 잰다. 부하 발생기의 한계와 처리량 곡선(어디서 포화하는지)을 본다.
 
 **계측**(랩 앱에만 있고 패키지 코드는 그대로다)
 
 | 무엇 | 어디서 | 쓰임 |
 |---|---|---|
 | `connection_created` 횟수, DB 요청 수, 열린 DB fd 수, fd 한도 | `notes/metrics.py`, `/lab/probe`(DB 를 열지 않음) | 연결 재사용 여부(DB 요청당 연결 생성), 연결 누적 |
-| `-wal` 크기와 헤더의 체크포인트 순번 | `/lab/probe`, 0.5초마다 | WAL 시작·최대·끝, 재시작 횟수(순번 차이), 줄어든 횟수 |
-| `X-Lab-Svc-Us` | 첫 미들웨어 `notes.middleware.timing` | 요청 스레드 안의 뷰 처리 시간 |
+| `-wal` 크기와 헤더(체크포인트 순번·salt 둘) | `/lab/probe`, 0.5초마다 | WAL 시작·최대·끝(표본 최대), 줄어든 횟수, 시작·끝 헤더, 순번 차이(`wal_ckpt_seq_delta`), salt 가 바뀐 표본 간격 수(`wal_salt_changes`). 순번은 헤더를 쓴 연결의 카운터라 여러 연결이 재시작하면 **재시작 횟수가 아니다**(#26 리뷰 1). salt 변화 수는 0.5초 해상도의 하한이다. 정확한 재시작 횟수는 세지 않는다 |
+| `X-Lab-View-Us` | 랩 뷰를 감싼 `notes/timing.py` 의 `timed`(`urls_tail.py`) | 동기 뷰 함수 호출 하나의 시간(뷰·ORM·SQLite, 다른 스레드와 GIL 을 다툰 대기 포함). 미들웨어를 쓰지 않는다: #26 첫 실행의 `X-Lab-Svc-Us`(sync-only 미들웨어)에는 ASGI 의 sync/async 왕복과 뷰 스레드 배정 대기가 섞였고, 배포 프로필에 없는 왕복도 더했다 |
 | `X-Lab-App-Us` | `proj/asgi.py` 래퍼 | 요청을 받은 때부터 응답 시작까지(스레드 배정·대기 포함) |
+| 같은 요청 안의 차이 `gap.client_minus_app`, `gap.app_minus_view` | `loadgen.py` | 요청마다 뺀 값의 분포. 세 헤더의 중앙값끼리 빼서 구간을 나누지 않는다(중앙값의 차 ≠ 차의 중앙값) |
 | 서버 CPU, 발생기 CPU | `time.process_time` 차이 / 경과 시간 | 어느 쪽이 CPU 한계인지 |
 
-부하 발생기는 표준 라이브러리 Python(`lab_tools/loadgen.py`)이다. 같은 compose 네트워크의 별도 컨테이너에서 keep-alive 연결로 닫힌 루프를 돈다. 이미지를 더 받지 않고 요청 종류별 지연·서버 헤더를 그대로 모은다. #26 실측에서 이 발생기는 `rawping` 으로 10,000 req/s 이상을 냈고 혼합 부하(약 500 req/s)에서는 CPU 0.1 코어 미만이었다 — 이 랩의 한계는 앱 프로세스 CPU 다.
+부하 발생기는 표준 라이브러리 Python(`lab_tools/loadgen.py`)이다. 같은 compose 네트워크의 별도 컨테이너에서 keep-alive 연결로 닫힌 루프를 돈다. 이미지를 더 받지 않고 요청 종류별 지연·서버 헤더를 그대로 모은다. #26 실측에서 이 발생기는 `rawping` 으로 10,000 req/s 이상을 냈고 혼합 부하(약 500 req/s)에서는 CPU 0.1 코어 미만이었다 — 그 조건에서 처리량이 포화했고 발생기에는 여유가 있었다. 앱 CPU/GIL 병목이 의심되지만 원인은 미검증이다.
 
 판정: 같은 반복·같은 CMA·같은 단계의 기준과 짝지어 차이(%)를 내고, **모든 반복에서 같은 방향으로 5% 이상**일 때만 '재현'으로 본다(`_benchstat.py`, Docker 없이 `tests/test_lab.py` 가 검사). `CONN_MAX_AGE=None` 의 500 은 결과로 기록만 하고 실패로 보지 않는다(ASGI 에서 fd 가 쌓여 나는 것을 #26 에서 재현). `database.py` 기본값은 이 결과로 바꾸지 않는다(제안만).
 

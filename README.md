@@ -144,7 +144,7 @@ curl -s http://127.0.0.1:8000/internal/sqlite-health   # 본문 status 가 caugh
 | `synchronous` | `NORMAL` | WAL 에서 쓰기 비용을 줄인다. 체크포인트 전에 전원이 나가면 마지막 트랜잭션이 빠질 수 있다 |
 | `busy_timeout` | `5000` (밀리초) | 잠금을 만나면 바로 실패하지 않고 5초 기다린다. Python `sqlite3` 의 `timeout` 기본 5초와 같은 값 |
 
-건드리지 않는 것: `foreign_keys` 는 Django 가 이미 켠다. `wal_autocheckpoint` 는 Litestream 이 체크포인트를 관리하므로 바꾸지 않는다. `temp_store`, `mmap_size`, `cache_size`, `journal_size_limit` 는 기본값이 아니다. 회귀 랩 벤치에서 개선이 반복해서 재현된 것이 없고, `cache_size=-65536` 만 켜면 오히려 처리량·p99 가 반복해서 나빠졌다(`CONN_MAX_AGE` 기본 0, [결과](docs/research/lab-2026-10-08.md#pragma-벤치)). `CONN_MAX_AGE=None`·WAL 이 자라는 부하로 다시 잰 [재측정](docs/research/bench-2026-10-08.md)에서도 개선은 재현되지 않았다(이때는 `cache_size` 악화도 재현되지 않았다). `journal_size_limit` 은 Litestream 이 체크포인트 직후 자기 연결로 먼저 커밋하므로 앱에서 걸어도 WAL 크기를 거의 묶지 못한다. 필요하면 `pragmas` 로 직접 켜고 자기 부하로 잰다.
+건드리지 않는 것: `foreign_keys` 는 Django 가 이미 켠다. `wal_autocheckpoint` 는 Litestream 이 체크포인트를 관리하므로 바꾸지 않는다. `temp_store`, `mmap_size`, `cache_size`, `journal_size_limit` 는 기본값이 아니다. 회귀 랩 벤치에서 개선이 반복해서 재현된 것이 없고, `cache_size=-65536` 만 켜면 오히려 처리량·p99 가 반복해서 나빠졌다(`CONN_MAX_AGE` 기본 0, [결과](docs/research/lab-2026-10-08.md#pragma-벤치)). `CONN_MAX_AGE=None`·WAL 이 자라는 부하로 다시 잰 [재측정](docs/research/bench-2026-10-08.md)에서도 개선은 재현되지 않았다(이때는 `cache_size` 악화도 재현되지 않았다). `journal_size_limit` 은 Litestream 과 함께 쓰면 앱에서 걸어도 WAL 크기를 거의 묶지 못했다(64 MiB 로 잘린 뒤 다시 자람). SQLite 는 WAL 재시작 뒤 첫 커밋한 연결의 한도로만 자르고 Litestream 은 체크포인트 직후 자기 연결로 쓰기 때문으로 본다(구조는 소스로 확인, 어느 연결이 먼저 커밋했는지는 관측하지 않음). 필요하면 `pragmas` 로 직접 켜고 자기 부하로 잰다.
 
 #### 프로필
 

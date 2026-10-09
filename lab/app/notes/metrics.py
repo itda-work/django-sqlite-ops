@@ -2,9 +2,10 @@
 
 - ``connection_created`` 시그널 횟수와 DB 를 쓰는 요청 수: ``CONN_MAX_AGE`` 가 실제로 연결을
   재사용하는지 서버에서 센다(연결 수 / 요청 수가 1 에 가까우면 재사용하지 않는다).
-- ``-wal`` 헤더의 체크포인트 순번: SQLite 는 WAL 을 처음부터 다시 쓸 때(체크포인트가 끝난 뒤의
-  재시작) 이 값을 1 늘린다. 두 시점의 차이가 그 사이 WAL 재시작 횟수다
-  (sqlite.org/fileformat.html#walformat).
+- ``-wal`` 헤더의 체크포인트 순번(``ckpt_seq``)과 salt 두 개: 날것 그대로 돌려준다. ``ckpt_seq`` 는
+  헤더를 쓴 연결 핸들의 카운터라 여러 연결이 WAL 을 재시작하면 재시작 횟수가 아니다(#26 리뷰 1,
+  재현함). salt 는 WAL 헤더를 다시 쓸 때마다 바뀌므로, 두 표본 사이에 salt 가 바뀌었으면 그 사이
+  헤더가 한 번 이상 다시 쓰였다는 것만 말할 수 있다(sqlite.org/fileformat.html#walformat).
 
 DB 연결을 열지 않는다(``/lab/probe`` 가 연결 수를 늘리지 않게).
 """
@@ -55,8 +56,8 @@ def wal_header(path: str) -> dict | None:
         return None
     if len(head) < 32:
         return None
-    _magic, _version, page_size, ckpt_seq, salt1, _salt2 = struct.unpack(">6I", head[:24])
-    return {"page_size": page_size, "ckpt_seq": ckpt_seq, "salt1": salt1}
+    _magic, _version, page_size, ckpt_seq, salt1, salt2 = struct.unpack(">6I", head[:24])
+    return {"page_size": page_size, "ckpt_seq": ckpt_seq, "salt1": salt1, "salt2": salt2}
 
 
 def snapshot() -> dict:

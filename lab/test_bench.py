@@ -70,9 +70,11 @@ METRICS = (
     "rps",
     "p99_ms",
     "p50_ms",
-    "svc.p50_ms",
-    "svc.p99_ms",
+    "view.p50_ms",
+    "view.p99_ms",
     "app.p50_ms",
+    "gap.client_minus_app.p50_ms",
+    "gap.app_minus_view.p50_ms",
     "server.server_cpu_util",
     "gen_cpu_util",
     "server.conn_created",
@@ -82,10 +84,11 @@ METRICS = (
     "wal_start",
     "wal_max",
     "wal_end",
-    "server.wal_restarts",
+    "server.wal_ckpt_seq_delta",
+    "server.wal_salt_changes",
     "wal_shrinks",
 )
-PAIRED = ("rps", "p99_ms", "p50_ms", "svc.p50_ms", "wal_max", "wal_end")
+PAIRED = ("rps", "p99_ms", "p50_ms", "view.p50_ms", "wal_max", "wal_end")
 
 
 def recycle(stack) -> None:
@@ -184,10 +187,11 @@ def one_run(stack, run_id: str, cma: str, name: str, rep: int) -> dict:
     for phase in PHASES:
         log(
             f"bench {cma} {name} rep {rep} {phase}: rps={metric(run, phase, 'rps')} "
-            f"p99={metric(run, phase, 'p99_ms')} svc50={metric(run, phase, 'svc.p50_ms')} "
+            f"p99={metric(run, phase, 'p99_ms')} view50={metric(run, phase, 'view.p50_ms')} "
             f"conn/req={metric(run, phase, 'server.conn_per_db_request')} "
             f"wal={metric(run, phase, 'wal_start')}/{metric(run, phase, 'wal_max')}/"
-            f"{metric(run, phase, 'wal_end')} restarts={metric(run, phase, 'server.wal_restarts')} "
+            f"{metric(run, phase, 'wal_end')} "
+            f"salt_changes={metric(run, phase, 'server.wal_salt_changes')} "
             f"errors={metric(run, phase, 'errors')} {run['phases'][phase]['error_kinds']}"
         )
     return run
@@ -259,7 +263,7 @@ def test_saturation(stack, run_id, rec):
                 results.append(res)
                 log(
                     f"sat {cma} rep {rep} {mode} c={c}: rps={res['rps']} p50={res['p50_ms']} "
-                    f"svc50={res['svc']['p50_ms']} app50={res['app']['p50_ms']} "
+                    f"view50={res['view']['p50_ms']} app50={res['app']['p50_ms']} "
                     f"gen_cpu={res['gen_cpu_util']} "
                     f"srv_cpu={res['server'].get('server_cpu_util')} "
                     f"fds={res['server'].get('db_fds_max')} errors={res['errors']} "

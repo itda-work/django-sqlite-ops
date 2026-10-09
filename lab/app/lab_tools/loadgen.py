@@ -5,10 +5,13 @@
 ``/lab/sorted``, 나머지는 쓰기 ``POST /lab/write?n=<--write-rows>``). ``--mode ping`` 은 DB 없는
 Django 뷰, ``--mode rawping`` 은 Django 앞에서 바로 답하는 경로만 부른다(발생기·스택 한계 확인).
 
-요청마다 클라이언트 지연과 서버 헤더(``X-Lab-Svc-Us`` 뷰 처리, ``X-Lab-App-Us`` 응답 시작까지)를
-모은다. ``--sample`` 초마다 ``/lab/probe``(DB 를 열지 않음)로 ``-wal`` 크기·헤더와 서버 카운터를
-표본한다. 측정 구간의 시작·끝 표본으로 연결 생성 수·DB 요청 수·서버 CPU 시간·WAL 재시작 횟수의
-차이를 낸다. 발생기 자신의 CPU 시간도 잰다(여유 확인). 결과는 JSON 한 줄.
+요청마다 클라이언트 지연과 서버 헤더(``X-Lab-View-Us`` 뷰 본문, ``X-Lab-App-Us`` ASGI 래퍼에서
+응답 시작까지)를 모은다. 세 분포의 중앙값끼리 빼서 구간을 나누면 안 되므로(중앙값의 차 ≠ 차의
+중앙값), 같은 요청 안의 차이(``gap.client_minus_app``, ``gap.app_minus_view``)를 요청마다 계산해
+그 분포를 따로 낸다. ``--sample`` 초마다 ``/lab/probe``(DB 를 열지 않음)로 ``-wal`` 크기·헤더와
+서버 카운터를 표본한다. 측정 구간의 시작·끝 표본으로 연결 생성 수·DB 요청 수·서버 CPU 시간의
+차이를 내고, 시작·끝 WAL 헤더는 그대로 남긴다. 발생기 자신의 CPU 시간도 잰다(여유 확인).
+결과는 JSON 한 줄.
 
 표준 라이브러리만 쓴다(이미지에 도구를 더 넣지 않는다).
 """
@@ -58,8 +61,19 @@ def probe_delta(first: dict | None, last: dict | None, samples: list[dict]) -> d
     out["conn_per_db_request"] = (
         round(out["conn_created"] / out["db_requests"], 4) if out["db_requests"] else None
     )
+    # WAL 재시작 횟수는 세지 않는다. 헤더의 ckpt_seq 는 헤더를 쓴 연결 핸들의 카운터라 여러
+    # 연결(요청마다 새 앱 연결, Litestream)이 재시작하면 횟수가 아니다(#26 리뷰 1, 재현함).
+    # 날것의 차이와, salt 가 바뀐 표본 간격 수(그 사이 헤더가 한 번 이상 다시 쓰였다는 하한)만 낸다.
+    out["wal_head_start"] = first.get("wal")
+    out["wal_head_end"] = last.get("wal")
     if first.get("wal") and last.get("wal"):
-        out["wal_restarts"] = last["wal"]["ckpt_seq"] - first["wal"]["ckpt_seq"]
+        out["wal_ckpt_seq_delta"] = last["wal"]["ckpt_seq"] - first["wal"]["ckpt_seq"]
+    heads = [s["wal"] for s in [first, *samples] if s.get("wal")]
+    out["wal_salt_changes"] = sum(
+        1
+        for a, b in zip(heads, heads[1:], strict=False)
+        if (a["salt1"], a.get("salt2")) != (b["salt1"], b.get("salt2"))
+    )
     return out
 
 
@@ -84,8 +98,11 @@ def main() -> None:
     end = measure_from + args.duration
     kinds = ("read", "sorted", "write", "ping")
     lat: dict[str, list[float]] = {k: [] for k in kinds}
-    svc: dict[str, list[float]] = {k: [] for k in kinds}
+    view: dict[str, list[float]] = {k: [] for k in kinds}
     app: dict[str, list[float]] = {k: [] for k in kinds}
+    # 같은 요청 안의 차이(초). 헤더가 둘 다 있을 때만.
+    client_minus_app: dict[str, list[float]] = {k: [] for k in kinds}
+    app_minus_view: dict[str, list[float]] = {k: [] for k in kinds}
     errors: dict[str, int] = dict.fromkeys(kinds, 0)
     # 오류 종류(상태 코드 또는 예외 이름)별 수와 첫 응답 본문 일부
     error_kinds: dict[str, int] = {}
@@ -115,7 +132,7 @@ def main() -> None:
             kind, method, path = pick(rng)
             t0 = time.perf_counter()
             ok = True
-            s_us = a_us = None
+            v_us = a_us = None
             why = body = ""
             try:
                 conn.request(method, path, body=b"" if method == "POST" else None)
@@ -123,7 +140,7 @@ def main() -> None:
                 body = resp.read()[:300].decode("utf-8", "replace")
                 ok = resp.status == 200
                 why = f"http {resp.status}"
-                s_us = resp.getheader("X-Lab-Svc-Us")
+                v_us = resp.getheader("X-Lab-View-Us")
                 a_us = resp.getheader("X-Lab-App-Us")
             except (OSError, http.client.HTTPException) as exc:
                 ok = False
@@ -135,10 +152,15 @@ def main() -> None:
                 with lock:
                     if ok:
                         lat[kind].append(dt)
-                        if s_us is not None:
-                            svc[kind].append(int(s_us) / 1e6)
-                        if a_us is not None:
-                            app[kind].append(int(a_us) / 1e6)
+                        v = int(v_us) / 1e6 if v_us is not None else None
+                        a = int(a_us) / 1e6 if a_us is not None else None
+                        if v is not None:
+                            view[kind].append(v)
+                        if a is not None:
+                            app[kind].append(a)
+                            client_minus_app[kind].append(dt - a)
+                            if v is not None:
+                                app_minus_view[kind].append(a - v)
                     else:
                         errors[kind] += 1
                         error_kinds[why] = error_kinds.get(why, 0) + 1
@@ -181,26 +203,38 @@ def main() -> None:
     }
     total = 0
     every: list[float] = []
-    every_svc: list[float] = []
+    every_view: list[float] = []
     every_app: list[float] = []
+    every_cma: list[float] = []
+    every_amv: list[float] = []
     for kind in kinds:
         if not lat[kind] and not errors[kind]:
             continue
         total += len(lat[kind])
         every += lat[kind]
-        every_svc += svc[kind]
+        every_view += view[kind]
         every_app += app[kind]
+        every_cma += client_minus_app[kind]
+        every_amv += app_minus_view[kind]
         out["kinds"][kind] = {
             "n": len(lat[kind]),
             "errors": errors[kind],
             **dist_ms(lat[kind]),
-            "svc": dist_ms(svc[kind]),
+            "view": dist_ms(view[kind]),
             "app": dist_ms(app[kind]),
+            "gap": {
+                "client_minus_app": dist_ms(client_minus_app[kind]),
+                "app_minus_view": dist_ms(app_minus_view[kind]),
+            },
         }
     out["rps"] = round(total / args.duration, 1)
     out.update({k: v for k, v in dist_ms(every).items()})
-    out["svc"] = dist_ms(every_svc)
+    out["view"] = dist_ms(every_view)
     out["app"] = dist_ms(every_app)
+    out["gap"] = {
+        "client_minus_app": dist_ms(every_cma),
+        "app_minus_view": dist_ms(every_amv),
+    }
     out["errors"] = sum(errors.values())
     out["error_kinds"] = error_kinds
     out["error_sample"] = error_sample

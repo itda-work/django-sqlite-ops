@@ -322,11 +322,43 @@ def test_bench_reproduced_needs_every_rep_same_direction_over_threshold():
     assert not b.reproduced([], 0)
 
 
+def test_bench_threshold_uses_unrounded_deltas():
+    """#26 리뷰 1: 4.96% 차이가 표시용 반올림(5.0)으로 재현 판정되면 안 된다."""
+    b = _benchstat()
+
+    def runs(variant_rps):
+        return [
+            r
+            for rep in range(1, 6)
+            for r in (_run("0", "baseline", rep, 100.0), _run("0", "mmap_size", rep, variant_rps))
+        ]
+
+    def judge(variant_rps):
+        s = b.summarize(
+            runs(variant_rps),
+            cmas=["0"],
+            variants=["baseline", "mmap_size"],
+            phases=["mixed"],
+            metrics=["rps"],
+            paired=["rps"],
+            reps=5,
+        )
+        return s["0"]["mixed"]["mmap_size"]["rps"]
+
+    for rps, want in ((104.96, False), (95.04, False), (105.0, True), (95.0, True)):
+        deltas = b.paired_deltas(runs(rps), "0", "mmap_size", "mixed", "rps")
+        assert b.reproduced(deltas, 5) is want, (rps, deltas)
+        entry = judge(rps)
+        assert entry["reproduced"] is want, (rps, entry)
+    # 표시는 반올림한다(4.96 → 5.0)
+    assert judge(104.96)["delta_pct_per_rep"] == [5.0] * 5
+
+
 def test_bench_metric_reads_nested_keys_and_skips_missing():
     b = _benchstat()
-    run = _run("0", "baseline", 1, 10.0, server={"conn_per_db_request": 1.0}, svc={"p50_ms": None})
+    run = _run("0", "baseline", 1, 10.0, server={"conn_per_db_request": 1.0}, view={"p50_ms": None})
     assert b.metric(run, "mixed", "server.conn_per_db_request") == 1.0
-    assert b.metric(run, "mixed", "svc.p50_ms") is None
+    assert b.metric(run, "mixed", "view.p50_ms") is None
     assert b.metric(run, "write", "rps") is None
     assert b.metric(run, "mixed", "server.missing") is None
 
@@ -351,3 +383,53 @@ def test_bench_summary_marks_only_paired_metrics():
     assert "reproduced" not in s["baseline"]["rps"]
     assert "delta_pct_per_rep" not in s["mmap_size"]["p50_ms"]
     assert s["mmap_size"]["errors"] == 1
+
+
+def _loadgen():
+    path = ROOT / "lab" / "app" / "lab_tools" / "loadgen.py"
+    spec = importlib.util.spec_from_file_location("lab_loadgen", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _probe(t, ckpt_seq, salt1, salt2, **extra):
+    return {
+        "t": t,
+        "cpu_s": t / 2,
+        "conn_created": 0,
+        "db_requests": 0,
+        "db_fds": 3,
+        "threads": 2,
+        "wal": {"page_size": 4096, "ckpt_seq": ckpt_seq, "salt1": salt1, "salt2": salt2},
+        **extra,
+    }
+
+
+def test_loadgen_keeps_wal_headers_and_does_not_call_ckpt_seq_restarts():
+    """#26 리뷰 1: ckpt_seq 차이는 재시작 횟수가 아니다. 헤더를 남기고 salt 변화만 하한으로 센다."""
+    g = _loadgen()
+    first = _probe(0.0, 0, 10, 7)
+    # 리뷰 재현과 같은 모양: 두 연결이 번갈아 재시작하면 ckpt_seq 는 0,1,1,2 로,
+    # salt1 은 매번 오른다.
+    samples = [
+        _probe(1.0, 1, 11, 3),
+        _probe(2.0, 1, 12, 9),
+        _probe(3.0, 2, 13, 4),
+        _probe(4.0, 2, 13, 4),
+    ]
+    out = g.probe_delta(first, samples[-1], samples)
+    assert "wal_restarts" not in out
+    assert out["wal_ckpt_seq_delta"] == 2
+    assert out["wal_salt_changes"] == 3
+    assert out["wal_head_start"]["salt1"] == 10
+    assert out["wal_head_end"] == samples[-1]["wal"]
+
+
+def test_loadgen_paired_gaps_are_not_differences_of_medians():
+    """#26 리뷰 1: 중앙값의 차는 차의 중앙값이 아니다(client [10,100,101], app [1,99,2])."""
+    g = _loadgen()
+    client, app = [0.010, 0.100, 0.101], [0.001, 0.099, 0.002]
+    paired = g.dist_ms([c - a for c, a in zip(client, app, strict=True)])
+    assert paired["p50_ms"] == 9.0
+    assert g.dist_ms(client)["p50_ms"] - g.dist_ms(app)["p50_ms"] == 98.0
