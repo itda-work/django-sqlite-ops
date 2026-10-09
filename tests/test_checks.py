@@ -304,7 +304,7 @@ def test_w005_silenced(silenced):
         check=False,
     )
     assert result.returncode == 0, result.stderr
-    assert ("default: (sqlite_ops.W005)" in result.stdout) is not silenced
+    assert ("default: (sqlite_ops.W005)" in result.stdout) == (not silenced)
 
 
 @pytest.mark.parametrize(
