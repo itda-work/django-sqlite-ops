@@ -5,6 +5,7 @@
 """
 
 import importlib.util
+import json
 import os
 import re
 import subprocess
@@ -282,3 +283,254 @@ def test_l8a_clearly_young_stale_fails():
     timeline[3] = (timeline[3][0], "unknown", "stale", 5.0)
     problems = c.full_outage_problems(timeline, refresh=2)
     assert any("age 5.0 < 6" in p for p in problems), problems
+
+
+# --- PRAGMA 벤치 집계(#26, lab/_benchstat.py) ------------------------------------------------
+
+
+def _benchstat():
+    spec = importlib.util.spec_from_file_location("lab_benchstat", ROOT / "lab" / "_benchstat.py")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _run(cma, variant, rep, rps, **extra):
+    return {"cma": cma, "variant": variant, "rep": rep, "phases": {"mixed": {"rps": rps, **extra}}}
+
+
+def test_bench_pairs_within_rep_and_cma():
+    b = _benchstat()
+    runs = [
+        _run("0", "baseline", 1, 100.0),
+        _run("0", "baseline", 2, 200.0),
+        _run("none", "baseline", 1, 50.0),
+        _run("0", "cache_size", 2, 180.0),
+        _run("0", "cache_size", 1, 90.0),
+        _run("none", "cache_size", 1, 60.0),
+    ]
+    assert b.paired_deltas(runs, "0", "cache_size", "mixed", "rps") == [-10.0, -10.0]
+    assert b.paired_deltas(runs, "none", "cache_size", "mixed", "rps") == [20.0]
+
+
+def test_bench_reproduced_needs_every_rep_same_direction_over_threshold():
+    b = _benchstat()
+    assert b.reproduced([-6.0, -5.0, -9.1], 3)
+    assert b.reproduced([5.0, 7.0], 2)
+    assert not b.reproduced([-6.0, -4.9, -9.1], 3)  # 하나가 5% 미만
+    assert not b.reproduced([-6.0, 6.0], 2)  # 방향이 갈림
+    assert not b.reproduced([-6.0, -7.0], 3)  # 짝이 빠진 반복이 있음
+    assert not b.reproduced([], 0)
+
+
+def test_bench_threshold_uses_unrounded_deltas():
+    """#26 리뷰 1: 4.96% 차이가 표시용 반올림(5.0)으로 재현 판정되면 안 된다."""
+    b = _benchstat()
+
+    def runs(variant_rps):
+        return [
+            r
+            for rep in range(1, 6)
+            for r in (_run("0", "baseline", rep, 100.0), _run("0", "mmap_size", rep, variant_rps))
+        ]
+
+    def judge(variant_rps):
+        s = b.summarize(
+            runs(variant_rps),
+            cmas=["0"],
+            variants=["baseline", "mmap_size"],
+            phases=["mixed"],
+            metrics=["rps"],
+            paired=["rps"],
+            reps=5,
+        )
+        return s["0"]["mixed"]["mmap_size"]["rps"]
+
+    for rps, want in ((104.96, False), (95.04, False), (105.0, True), (95.0, True)):
+        deltas = b.paired_deltas(runs(rps), "0", "mmap_size", "mixed", "rps")
+        assert b.reproduced(deltas, 5) is want, (rps, deltas)
+        entry = judge(rps)
+        assert entry["reproduced"] is want, (rps, entry)
+    # 표시는 반올림한다(4.96 → 5.0)
+    assert judge(104.96)["delta_pct_per_rep"] == [5.0] * 5
+
+
+def test_bench_metric_reads_nested_keys_and_skips_missing():
+    b = _benchstat()
+    run = _run("0", "baseline", 1, 10.0, server={"conn_per_db_request": 1.0}, view={"p50_ms": None})
+    assert b.metric(run, "mixed", "server.conn_per_db_request") == 1.0
+    assert b.metric(run, "mixed", "view.p50_ms") is None
+    assert b.metric(run, "write", "rps") is None
+    assert b.metric(run, "mixed", "server.missing") is None
+
+
+def test_bench_summary_marks_only_paired_metrics():
+    b = _benchstat()
+    runs = [
+        _run("0", "baseline", 1, 100.0, p50_ms=2.0, errors=0),
+        _run("0", "mmap_size", 1, 94.0, p50_ms=3.0, errors=1),
+    ]
+    s = b.summarize(
+        runs,
+        cmas=["0"],
+        variants=["baseline", "mmap_size"],
+        phases=["mixed"],
+        metrics=["rps", "p50_ms"],
+        paired=["rps"],
+        reps=1,
+    )["0"]["mixed"]
+    assert s["mmap_size"]["rps"]["delta_pct_per_rep"] == [-6.0]
+    assert s["mmap_size"]["rps"]["reproduced"] is True
+    assert "reproduced" not in s["baseline"]["rps"]
+    assert "delta_pct_per_rep" not in s["mmap_size"]["p50_ms"]
+    assert s["mmap_size"]["errors"] == 1
+
+
+def _loadgen():
+    path = ROOT / "lab" / "app" / "lab_tools" / "loadgen.py"
+    spec = importlib.util.spec_from_file_location("lab_loadgen", path)
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    return module
+
+
+def _probe(t, ckpt_seq, salt1, salt2, **extra):
+    return {
+        "t": t,
+        "cpu_s": t / 2,
+        "conn_created": 0,
+        "db_requests": 0,
+        "db_fds": 3,
+        "threads": 2,
+        "wal": {"page_size": 4096, "ckpt_seq": ckpt_seq, "salt1": salt1, "salt2": salt2},
+        **extra,
+    }
+
+
+def test_loadgen_keeps_wal_headers_and_does_not_call_ckpt_seq_restarts():
+    """#26 리뷰 1: ckpt_seq 차이는 재시작 횟수가 아니다. 헤더를 남기고 salt 변화만 하한으로 센다."""
+    g = _loadgen()
+    first = _probe(0.0, 0, 10, 7)
+    # 리뷰 재현과 같은 모양: 두 연결이 번갈아 재시작하면 ckpt_seq 는 0,1,1,2 로,
+    # salt1 은 매번 오른다.
+    samples = [
+        _probe(1.0, 1, 11, 3),
+        _probe(2.0, 1, 12, 9),
+        _probe(3.0, 2, 13, 4),
+        _probe(4.0, 2, 13, 4),
+    ]
+    out = g.probe_delta(first, samples[-1], samples)
+    assert "wal_restarts" not in out
+    assert out["wal_ckpt_seq_delta"] == 2
+    assert out["wal_salt_changes"] == 3
+    assert out["wal_head_start"]["salt1"] == 10
+    assert out["wal_head_end"] == samples[-1]["wal"]
+
+
+def test_loadgen_paired_gaps_are_not_differences_of_medians():
+    """#26 리뷰 1: 중앙값의 차는 차의 중앙값이 아니다(client [10,100,101], app [1,99,2])."""
+    g = _loadgen()
+    client, app = [0.010, 0.100, 0.101], [0.001, 0.099, 0.002]
+    paired = g.dist_ms([c - a for c, a in zip(client, app, strict=True)])
+    assert paired["p50_ms"] == 9.0
+    assert g.dist_ms(client)["p50_ms"] - g.dist_ms(app)["p50_ms"] == 98.0
+
+
+_TIMED_COUNTER_SCRIPT = r"""
+import asyncio, json, sys, tempfile
+from pathlib import Path
+
+sys.path.insert(0, sys.argv[1])
+tmp = Path(tempfile.mkdtemp())
+import django
+from django.conf import settings
+
+settings.configure(
+    SECRET_KEY="x",
+    ROOT_URLCONF=__name__,
+    MIDDLEWARE=[],
+    ALLOWED_HOSTS=["testserver"],
+    DATABASES={
+        "default": {"ENGINE": "django.db.backends.sqlite3", "NAME": str(tmp / "ok.db")},
+        "bad": {"ENGINE": "django.db.backends.sqlite3", "NAME": str(tmp / "missing" / "x.db")},
+    },
+)
+django.setup()
+from asgiref.sync import ThreadSensitiveContext
+from django.core.handlers.base import BaseHandler
+from django.db import connections
+from django.db.backends.signals import connection_created
+from django.http import Http404, HttpResponse
+from django.test import RequestFactory
+from django.urls import path
+from notes import metrics
+from notes.timing import timed
+
+connection_created.connect(metrics.on_connection_created)
+
+
+def ok(request):
+    with connections["default"].cursor() as c:
+        c.execute("SELECT 1")
+    return HttpResponse("ok")
+
+
+def sql_error(request):
+    with connections["default"].cursor() as c:
+        c.execute("SELECT * FROM no_such_table")
+    return HttpResponse("unreachable")
+
+
+def connect_error(request):
+    with connections["bad"].cursor() as c:  # 디렉터리가 없어 연결 생성 자체가 실패
+        c.execute("SELECT 1")
+    return HttpResponse("unreachable")
+
+
+def not_found(request):
+    with connections["default"].cursor() as c:
+        c.execute("SELECT 1")
+    raise Http404
+
+
+urlpatterns = [path(n, timed(v)) for n, v in
+               (("ok", ok), ("sql", sql_error), ("connect", connect_error), ("404", not_found))]
+
+
+async def main():
+    handler = BaseHandler()
+    handler.load_middleware(is_async=True)
+    out = {}
+    for name in ("ok", "sql", "connect", "404"):
+        before = dict(metrics._counts)
+        async with ThreadSensitiveContext():
+            resp = await handler.get_response_async(RequestFactory().get("/" + name))
+        after = dict(metrics._counts)
+        out[name] = {"status": resp.status_code,
+                     **{k: after[k] - before[k] for k in after}}
+    print(json.dumps(out))
+
+
+asyncio.run(main())
+"""
+
+
+def test_lab_timed_view_counts_failed_db_requests():
+    """#26 리뷰 2: 예외로 끝난 DB 요청도 요청당 한 번 센다(연결 생성 비율의 분모)."""
+    proc = subprocess.run(
+        [sys.executable, "-c", _TIMED_COUNTER_SCRIPT, str(ROOT / "lab" / "app")],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        timeout=60,
+    )
+    assert proc.returncode == 0, proc.stderr
+    out = json.loads(proc.stdout.strip().splitlines()[-1])
+    # 정상: 연결 1, 요청 1
+    assert out["ok"] == {"status": 200, "conn_created": 1, "db_requests": 1}
+    # 연결 뒤 SQL 실패: 연결은 생겼고 요청도 센다(500, 예외는 그대로 전파돼 핸들러가 500 으로 바꿈)
+    assert out["sql"] == {"status": 500, "conn_created": 1, "db_requests": 1}
+    # 연결 생성 자체 실패: 시그널이 없으므로 연결 0, 요청 1
+    assert out["connect"] == {"status": 500, "conn_created": 0, "db_requests": 1}
+    # Http404: 쿼리 뒤 404
+    assert out["404"] == {"status": 404, "conn_created": 1, "db_requests": 1}

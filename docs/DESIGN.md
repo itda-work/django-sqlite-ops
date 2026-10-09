@@ -222,9 +222,9 @@ django_sqlite_ops/
   | `synchronous` | `NORMAL` | 실측 조건에 포함(같은 문서). WAL 에서 커밋 내구성은 체크포인트 전 전원 손실 시 마지막 트랜잭션이 빠질 수 있다 — 문서에 명시 | 켬 |
   | `busy_timeout` | 5000ms | 실측 조건에 포함(같은 문서). Python `timeout` 기본 5초와 같은 값으로 맞춘다 | 켬 |
   | `foreign_keys` | `ON` | Django sqlite3 백엔드가 이미 켠다 — 생성 함수는 건드리지 않는다 | 해당 없음 |
-  | `temp_store`, `mmap_size`, `cache_size`, `journal_size_limit` | 후보 | 랩 벤치(§10, 2026-10-08): 개선이 재현된 후보 없음. `cache_size=-65536` 단독은 반복마다 나빠짐(처리량 −8~−12%, p99 +17~+27%, `CONN_MAX_AGE=0`). `journal_size_limit` 의 WAL 효과는 관측 못 함([`lab-2026-10-08.md`](research/lab-2026-10-08.md#pragma-벤치)) | 끔 |
+  | `temp_store`, `mmap_size`, `cache_size`, `journal_size_limit` | 후보 | 랩 벤치(§10, 2026-10-08): 개선이 재현된 후보 없음. `cache_size=-65536` 단독은 반복마다 나빠짐(처리량 −8~−12%, p99 +17~+27%, `CONN_MAX_AGE=0`)([`lab-2026-10-08.md`](research/lab-2026-10-08.md#pragma-벤치)). 재측정(#26, `CONN_MAX_AGE` 0·None × WAL 이 자라는 부하): 재현된 차이 없음, `cache_size` 악화도 재현 안 됨(소음 큼, #27). `journal_size_limit` 은 Litestream 과 함께면 WAL 을 묶지 못함(관측: 그 변형의 `write` 10단계 중 4단계에서만 64 MiB 로 잘리고 다시 자람. SQLite 는 재시작 뒤 첫 커밋한 연결의 한도로만 자르고 Litestream 은 체크포인트 직후 자기 연결로 쓴다 — 구조는 코드상 확인, 대개 Litestream 이 먼저 커밋한다는 것은 추정)([`bench-2026-10-08.md`](research/bench-2026-10-08.md)) | 끔 |
   | `wal_autocheckpoint` | 건드리지 않음 | Litestream 이 체크포인트를 관리한다. 바꾸면 복제와 충돌할 수 있다 [확인 필요] | 끔 |
-  | `CONN_MAX_AGE` | 프로필별 | VFS 별칭은 `None` 필수(실측 1,008ms → 1.7ms, WSGI). ASGI 는 미검증 | 2단계(VFS 프로필) |
+  | `CONN_MAX_AGE` | 프로필별 | VFS 별칭은 `None` 필수(실측 1,008ms → 1.7ms, WSGI). ASGI 동기 뷰(일반 별칭)에서는 `None` 이어도 요청마다 새 연결이고(요청마다 새 스레드), 닫히지 않은 연결이 fd 를 쌓아 500 이 났다(재현함, [`bench-2026-10-08.md`](research/bench-2026-10-08.md#결과-연결-재사용)). ASGI 의 VFS 별칭은 미검증 | 2단계(VFS 프로필) |
 
 - `init_command` 는 연결마다 실행된다. 그래서 가벼운 PRAGMA 만 넣고, 데이터나 스키마를 바꾸는 문장은 넣지 않는다.
 
@@ -457,7 +457,7 @@ SQLITE_OPS = {
 
 배포 프로필 종단 검증(P1·P2): 문서의 Dockerfile·compose·entrypoint·settings 를 그대로 띄워 첫 배포·`check --deploy`·`sqlite_doctor`·`docker stop`(uvicorn 워커 1·2: exit 0, 대표 실행 0.47·0.72초, 400/400 복제)·재부팅·빈 볼륨 소유자 복사를 확인했다.
 
-- **PRAGMA 벤치**: §6-0 의 후보(`temp_store`, `mmap_size`, `cache_size`, `journal_size_limit`)를 켠 경우와 끈 경우의 처리량·p99·WAL 크기를 잰다. 차이가 재현될 때만 기본값으로 올린다. 2026-10-08 결과(반복 5): 넷 중 개선이 반복해서 재현된 것은 없고, `cache_size=-65536` 단독은 반복해서 나빠졌다. 기본값은 바꾸지 않는다([`lab-2026-10-08.md`](research/lab-2026-10-08.md#pragma-벤치)).
+- **PRAGMA 벤치**: §6-0 의 후보(`temp_store`, `mmap_size`, `cache_size`, `journal_size_limit`)를 켠 경우와 끈 경우의 처리량·p99·WAL 크기를 잰다. 차이가 재현될 때만 기본값으로 올린다. 2026-10-08 결과(반복 5): 넷 중 개선이 반복해서 재현된 것은 없고, `cache_size=-65536` 단독은 반복해서 나빠졌다. 기본값은 바꾸지 않는다([`lab-2026-10-08.md`](research/lab-2026-10-08.md#pragma-벤치)). 재측정(#26: `CONN_MAX_AGE` 0·None, WAL 이 자라는 쓰기 단계, 서버 시간·포화 곡선)에서도 재현된 차이는 없었다. 이 계측 조건에서 처리량이 포화했고 부하 발생기에는 여유가 있었다. 앱 CPU/GIL 병목이 의심되지만 원인은 미검증이다([`bench-2026-10-08.md`](research/bench-2026-10-08.md)).
 - 랩 자원은 compose 프로젝트명(`dso-lab*`)과 라벨(`io.itda.dso-lab=1`)로 구분하고, 끝나면 반드시 `down -v` 한다(실패해도 `trap`). 같은 호스트에 다른 프로젝트 컨테이너가 있다.
 - ASGI(uvicorn) 엔트리포인트로 돌린다. 스파이크는 WSGI(gunicorn)만 검증했다.
 - L6 의 kill 지점은 `lab_hooks/sitecustomize.py` 가 rename 뒤마다 잠들어 맞춘다(패키지 코드는 그대로). L7 은 SeaweedFS filer API 로 LTX 객체 본문을 뒤집는다.
@@ -470,7 +470,8 @@ SQLITE_OPS = {
 - "재현함 / 코드상 확인 / 미검증"을 구분해서 쓴다.
 
 ## 12. 미검증·확인 필요
-- ASGI 에서의 `CONN_MAX_AGE` 와 VFS 동작 (미검증)
+- ASGI 에서의 VFS 별칭 `CONN_MAX_AGE` 동작 (미검증). 일반 별칭은 확인함: 동기 뷰에서 `None` 은 재사용되지 않고 fd 를 쌓는다([`bench-2026-10-08.md`](research/bench-2026-10-08.md#결과-연결-재사용))
+- PRAGMA 후보의 5% 크기 효과: #26 실행은 반복 간 흔들림(약 7%)이 커서 검출하지 못했다. `cache_size` 단독 악화의 원인(#27)
 - 실제 클라우드 S3·R2·Tigris (미검증. 비용이 들어 마스터 승인 필요)
 - 회귀 랩은 SeaweedFS 4.48 + toxiproxy 2.12.0 으로만 돌았다(colima linux/arm64 와 GitHub Actions ubuntu-latest linux/amd64, 둘 다 11/11 통과 — [`lab-2026-10-08.md`](research/lab-2026-10-08.md#amd64-실행-github-actions-25)). 다른 S3 구현은 미검증
 - S3 단절이 `ltx` 타임아웃(30초)보다 길 때 헬스가 `stale` 에서 `remote_error` 로 넘어가는지(L8a 는 20초라 보지 못함), 분 단위 단절에서 Litestream 의 로그 변화 (미검증)

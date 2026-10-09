@@ -28,9 +28,18 @@ if os.environ.get("LAB_PRAGMAS"):
         pragmas=json.loads(os.environ["LAB_PRAGMAS"]),
     )
 
+# PRAGMA 벤치(#26): CONN_MAX_AGE 축. "none" 이면 None(연결 유지), 숫자면 그 초.
+if os.environ.get("LAB_CONN_MAX_AGE"):
+    _cma = os.environ["LAB_CONN_MAX_AGE"]
+    DATABASES["default"]["CONN_MAX_AGE"] = None if _cma == "none" else int(_cma)  # noqa: F821
+
 LOGGING = {
     "version": 1,
     "disable_existing_loggers": False,
     "handlers": {"console": {"class": "logging.StreamHandler"}},
-    "loggers": {"django_sqlite_ops": {"handlers": ["console"], "level": "WARNING"}},
+    "loggers": {
+        "django_sqlite_ops": {"handlers": ["console"], "level": "WARNING"},
+        # 벤치(#26): 500 의 원인을 컨테이너 로그에 남긴다(DEBUG=False 면 기본으로 안 찍힌다).
+        "django.request": {"handlers": ["console"], "level": "ERROR"},
+    },
 }

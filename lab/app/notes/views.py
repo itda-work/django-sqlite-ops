@@ -8,6 +8,7 @@ from django.db import connection
 from django.http import Http404, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
+from . import metrics
 from .models import Note
 
 _BODY = "x" * 200
@@ -71,4 +72,21 @@ def stats(request):
         ):
             cursor.execute(f"PRAGMA {p}")
             pragmas[p] = cursor.fetchone()[0]
-    return JsonResponse({"sizes": sizes, "pragmas": pragmas, "pid": os.getpid()})
+    return JsonResponse(
+        {
+            "sizes": sizes,
+            "pragmas": pragmas,
+            "conn_max_age": settings.DATABASES["default"].get("CONN_MAX_AGE", 0),
+            "pid": os.getpid(),
+        }
+    )
+
+
+def probe(request):
+    """벤치 표본(#26): 카운터·WAL 크기와 헤더·CPU 시간. DB 연결을 열지 않는다."""
+    return JsonResponse(metrics.snapshot())
+
+
+def ping(request):
+    """벤치(#26): DB 없이 Django 를 지나는 가장 가벼운 요청(부하 발생기·스택 한계 확인)."""
+    return JsonResponse({"ok": True})
