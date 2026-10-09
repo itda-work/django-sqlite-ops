@@ -25,6 +25,7 @@ RESULTS = OUT / f"results-{RUN_ID}.jsonl"
 
 def pytest_configure(config):
     config.addinivalue_line("markers", "bench: PRAGMA 벤치(scripts/lab.sh bench)")
+    config.addinivalue_line("markers", "soak: fd·RSS 장시간 실행(scripts/lab.sh soak, #33)")
     config.addinivalue_line("markers", "profile: 배포 프로필 문서 compose 종단 검증")
 
 

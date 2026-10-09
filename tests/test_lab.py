@@ -534,3 +534,179 @@ def test_lab_timed_view_counts_failed_db_requests():
     assert out["connect"] == {"status": 500, "conn_created": 0, "db_requests": 1}
     # Http404: 쿼리 뒤 404
     assert out["404"] == {"status": 404, "conn_created": 1, "db_requests": 1}
+
+
+# --- soak(#33) ----------------------------------------------------------------------------
+
+
+def _soakstat():
+    sys.path.insert(0, str(ROOT / "lab"))
+    try:
+        import _soakstat
+    finally:
+        sys.path.pop(0)
+    return _soakstat
+
+
+def _soak_row(i, *, n=100, errors=0, fds=None, rss=100_000_000, db_requests=None, kinds=None):
+    fds = fds if fds is not None else {"db": 1, "wal": 1, "shm": 1, "socket": 20, "other": 5}
+    probe = {
+        "fds": {**fds, "total": sum(fds.values()), "scan_ms": 1.0},
+        "VmRSS": rss,
+        "Threads": 30,
+        "py_threads": 5,
+        "cgroup": {"current": rss + 10_000_000, "max": 2 * 1024**3, "swap_max": 0},
+        "db_requests": db_requests if db_requests is not None else i * n,
+        "conn_created": db_requests if db_requests is not None else i * n,
+        "wal_bytes": 4_000_000,
+        "gc_collections": [i, 0, 0],
+    }
+    return {
+        "i": i,
+        "t_s": 10.0 * i,
+        "n": n,
+        "errors": errors,
+        "error_kinds": kinds or ({"http 500": errors} if errors else {}),
+        "rps": n / 10,
+        "p99_ms": 20.0,
+        "cum_requests": i * (n + errors),
+        "cum_errors": i * errors,
+        "probe": probe,
+    }
+
+
+def test_soak_stop_reason_rss_errors_probe_and_oom():
+    g = _loadgen()
+    kw = {"mem_frac": 0.8, "err_rate": 0.5, "err_intervals": 3}
+    ok = [_soak_row(i) for i in range(1, 6)]
+    assert g.stop_reason(ok, **kw) is None
+    assert g.stop_reason([], **kw) is None
+    # RSS 가 memory.max 의 80% 이상
+    big = _soak_row(6, rss=int(0.8 * 2 * 1024**3) + 1)
+    assert g.stop_reason([*ok, big], **kw).startswith("rss ")
+    # 메모리 한도가 없으면(max) RSS 로 멈추지 않는다
+    unlimited = _soak_row(6, rss=10**12)
+    unlimited["probe"]["cgroup"]["max"] = None
+    assert g.stop_reason([*ok, unlimited], **kw) is None
+    # OOM kill 이벤트
+    oom = _soak_row(6)
+    oom["probe"]["cgroup"]["events_oom_kill"] = 1
+    assert g.stop_reason([*ok, oom], **kw) == "oom_kill 1"
+    # 오류율: 연속 3구간이어야 멈춘다
+    bad = [_soak_row(i, n=10, errors=10) for i in range(6, 8)]
+    assert g.stop_reason([*ok, *bad], **kw) is None
+    bad.append(_soak_row(8, n=10, errors=10))
+    assert g.stop_reason([*ok, *bad], **kw).startswith("error rate")
+    # 요청이 하나도 끝나지 않은 구간은 오류율 1
+    stuck = [_soak_row(i, n=0) for i in range(6, 9)]
+    assert g.stop_reason([*ok, *stuck], **kw).startswith("error rate")
+    # 표본 연속 실패
+    gone = [{**_soak_row(i), "probe": None} for i in range(6, 9)]
+    assert g.stop_reason([*ok, *gone], **{**kw, "err_intervals": 99}).startswith("probe failed")
+
+
+def test_soak_interval_row_counts_errors_by_kind_and_accumulates():
+    g = _loadgen()
+    cum: dict = {}
+    done = [("read", 0.01, None), ("write", 0.02, "http 500"), ("read", 0.03, "RemoteDisconnected")]
+    row = g.interval_row(1, 10.0, 10.0, done, cum, {"x": 1}, None)
+    assert (row["n"], row["errors"], row["rps"]) == (1, 2, 0.1)
+    assert row["error_kinds"] == {"http 500": 1, "RemoteDisconnected": 1}
+    assert row["kinds"] == {"read": 2, "write": 1}
+    row2 = g.interval_row(2, 20.0, 10.0, [("read", 0.01, None)], cum, None, "OSError: x")
+    assert (row2["cum_requests"], row2["cum_ok"], row2["cum_errors"]) == (4, 2, 2)
+    assert row2["probe"] is None and row2["probe_error"] == "OSError: x"
+
+
+def test_soak_metrics_classify_fds_and_read_proc_status(tmp_path):
+    sys.path.insert(0, str(ROOT / "lab" / "app"))
+    try:
+        from django.conf import settings
+
+        if not settings.configured:
+            settings.configure()
+        from notes import metrics
+    finally:
+        sys.path.pop(0)
+    db = "/data/app.sqlite3"
+    assert metrics.classify_fd(db, db) == "db"
+    assert metrics.classify_fd(db + "-wal", db) == "wal"
+    assert metrics.classify_fd(db + "-shm", db) == "shm"
+    assert metrics.classify_fd("socket:[1234]", db) == "socket"
+    assert metrics.classify_fd("/dev/null", db) == "other"
+    assert metrics.classify_fd("/data/app.sqlite3-journal", db) == "other"
+    fd_dir = tmp_path / "fd"
+    fd_dir.mkdir()
+    for i, target in enumerate([db, db, db + "-wal", db + "-shm", "socket:[1]", "/dev/null"]):
+        (fd_dir / str(i)).symlink_to(target)
+    got = metrics.fd_breakdown(db, str(fd_dir))
+    assert {k: got[k] for k in ("db", "wal", "shm", "socket", "other", "total")} == {
+        "db": 2,
+        "wal": 1,
+        "shm": 1,
+        "socket": 1,
+        "other": 1,
+        "total": 6,
+    }
+    status = tmp_path / "status"
+    status.write_text("Name:\tpython\nVmHWM:\t  2048 kB\nVmRSS:\t  1024 kB\nThreads:\t7\n")
+    assert metrics.proc_status(str(status)) == {"VmHWM": 2097152, "VmRSS": 1048576, "Threads": 7}
+
+
+def test_soak_ols_and_shapes():
+    s = _soakstat()
+    fit = s.ols([0, 1, 2, 3], [1, 3, 5, 7])
+    assert fit["slope"] == 2 and fit["intercept"] == 1 and fit["r2"] == 1
+    assert s.ols([1, 1, 1], [1, 2, 3]) is None
+    assert s.ols([1, 2], [1, 2]) is None
+
+    def pts(ys):
+        return [{"t_s": 10 * i, "x": 1000 * i, "y": y} for i, y in enumerate(ys)]
+
+    assert s.trend(pts([30] * 10), "x", "y")["shape"] == "flat"
+    grows = s.trend(pts([30 + 3 * i for i in range(10)]), "x", "y")
+    assert grows["shape"] == "grows" and grows["max"] == 57 and grows["t_max_s"] == 90
+    plateau = s.trend(pts([30, 300, 600, 900, 1200, 1210, 1210, 1210, 1210, 1210]), "x", "y")
+    assert plateau["shape"] == "plateau"
+
+
+def test_soak_analyze_none_like_growth_and_extrapolation():
+    """None 모양: DB 본체 fd 가 요청마다 쌓이고 RSS 가 같이 는다 → 연결당 메모리·한도 도달 추정."""
+    s = _soakstat()
+    rows = []
+    for i in range(1, 31):
+        conns = 10 * i  # 구간마다 연결 10개 누적
+        fds = {"db": conns, "wal": conns, "shm": 1, "socket": 20, "other": 5}
+        rows.append(_soak_row(i, fds=fds, rss=50_000_000 + 200_000 * conns))
+    out = s.analyze(rows, fd_limit=1_048_576, mem_limit=2 * 1024**3)
+    assert out["fd_dbfiles_vs_db_requests"]["shape"] == "grows"
+    assert out["rss_vs_db_requests"]["shape"] == "grows"
+    assert out["rss_per_connection_est"]["bytes"] == 200_000
+    assert out["rss_per_connection_est"]["r2"] == 1.0
+    assert out["fd_per_s_last_half"] == 2.0  # 10초에 fd 20
+    # 2 GiB 까지: (2147483648 - 110000000) / 200000 B/s
+    assert round(out["eta_mem_limit_s_est"]) == round((2 * 1024**3 - 110_000_000) / 200_000)
+    assert out["fd_end"]["fd_dbfiles"] == 601
+    assert out["conn_per_db_request"] == 1.0
+
+
+def test_soak_analyze_flat_run_has_no_per_connection_estimate_or_eta():
+    s = _soakstat()
+    rows = [_soak_row(i) for i in range(1, 31)]
+    rows[3] = {**rows[3], "probe": None}  # 표본 실패 구간은 뺀다
+    out = s.analyze(rows, fd_limit=1_048_576, mem_limit=2 * 1024**3)
+    assert out["intervals_with_probe"] == 29
+    assert out["fd_dbfiles_vs_db_requests"]["shape"] == "flat"
+    assert out["rss_per_connection_est"] is None
+    assert out["eta_fd_limit_s_est"] is None and out["eta_mem_limit_s_est"] is None
+    assert s.time_to(100, 50, 0) is None and s.time_to(100, 50, 5) == 10
+
+
+def test_soak_nofile_limits_parses_proc_limits():
+    s = _soakstat()
+    text = (
+        "Limit                     Soft Limit           Hard Limit           Units     \n"
+        "Max processes             unlimited            unlimited            processes \n"
+        "Max open files            1048576              1048576              files     \n"
+    )
+    assert s.nofile_limits(text) == (1048576, 1048576)

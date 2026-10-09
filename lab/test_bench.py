@@ -147,14 +147,14 @@ def load(stack, e: dict, *, mode: str, duration: float, concurrency: int, seed_n
     return json.loads(res.out.strip().splitlines()[-1])
 
 
-def error_log(stack, results) -> dict | None:
+def error_log(stack, results, service: str = "labapp") -> dict | None:
     """오류가 난 단계가 있으면 앱 로그의 예외 줄(종류별 수)과 끝 부분을 돌려준다.
 
     접근 로그가 많아 끝 부분만으로는 예외 줄이 밀려난다. 그래서 전체 로그에서 예외 줄을 센다.
     """
     if not any(r["errors"] for r in results):
         return None
-    text = stack.logs("labapp")
+    text = stack.logs(service)
     exc = collections.Counter(
         line.strip() for line in text.splitlines() if re.match(r"^[\w.]+(Error|Exception): ", line)
     )

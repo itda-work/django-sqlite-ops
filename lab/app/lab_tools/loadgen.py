@@ -13,6 +13,12 @@ Django 뷰, ``--mode rawping`` 은 Django 앞에서 바로 답하는 경로만 �
 차이를 내고, 시작·끝 WAL 헤더는 그대로 남긴다. 발생기 자신의 CPU 시간도 잰다(여유 확인).
 결과는 JSON 한 줄.
 
+``--report-every N`` 이면 soak 모드(#33)다. 같은 닫힌 루프로 ``--duration`` 동안 돌며 ``N`` 초마다
+구간 한 줄(처리량·p50·p99·오류 종류별 수·누적 요청 수 + ``/lab/soakprobe`` 표본)을 JSON 으로
+내보낸다. 구간마다 ``stop_reason`` 으로 안전 정지 조건(RSS 가 cgroup 메모리 한도의 일정 비율 이상,
+오류율이 연속 구간에서 높음, 표본 연속 실패, cgroup OOM kill)을 보고, 걸리면 그 자리에서 멈추고
+사유를 마지막 줄에 남긴다. 지연 표본은 구간마다 버린다(장시간 실행에서 발생기 메모리가 늘지 않게).
+
 표준 라이브러리만 쓴다(이미지에 도구를 더 넣지 않는다).
 """
 
@@ -78,6 +84,183 @@ def probe_delta(first: dict | None, last: dict | None, samples: list[dict]) -> d
     return out
 
 
+def interval_row(
+    i: int,
+    t_s: float,
+    span_s: float,
+    done: list[tuple[str, float, str | None]],
+    cum: dict,
+    probe: dict | None,
+    probe_error: str | None,
+) -> dict:
+    """soak 구간 하나. ``done`` 은 (종류, 지연 초, 오류 사유 또는 None). ``cum`` 은 갱신한다."""
+    ok = [dt for _, dt, why in done if why is None]
+    kinds: dict[str, int] = {}
+    error_kinds: dict[str, int] = {}
+    for kind, _, why in done:
+        kinds[kind] = kinds.get(kind, 0) + 1
+        if why is not None:
+            error_kinds[why] = error_kinds.get(why, 0) + 1
+    errors = len(done) - len(ok)
+    cum["requests"] = cum.get("requests", 0) + len(done)
+    cum["ok"] = cum.get("ok", 0) + len(ok)
+    cum["errors"] = cum.get("errors", 0) + errors
+    return {
+        "i": i,
+        "t_s": round(t_s, 2),
+        "span_s": round(span_s, 3),
+        "n": len(ok),
+        "errors": errors,
+        "error_kinds": error_kinds,
+        "kinds": kinds,
+        "rps": round(len(ok) / span_s, 1) if span_s > 0 else None,
+        **dist_ms(ok),
+        "cum_requests": cum["requests"],
+        "cum_ok": cum["ok"],
+        "cum_errors": cum["errors"],
+        "probe": probe,
+        "probe_error": probe_error,
+    }
+
+
+def stop_reason(
+    rows: list[dict],
+    *,
+    mem_frac: float,
+    err_rate: float,
+    err_intervals: int,
+    probe_fail_intervals: int = 3,
+) -> str | None:
+    """soak 안전 정지 판정(순수 함수, ``tests/test_lab.py`` 가 검사). 멈출 사유 또는 None.
+
+    - ``rss``: 앱 RSS ≥ cgroup ``memory.max`` × ``mem_frac``. 한도가 없으면(``max``) 보지 않는다.
+    - ``oom_kill``: cgroup 의 ``oom_kill`` 이벤트가 1 이상(컨테이너 안 어떤 프로세스든).
+    - ``errors``: 마지막 ``err_intervals`` 구간 모두 오류율 ≥ ``err_rate``. 요청이 없는 구간은
+      오류율 1 로 본다(앱이 응답하지 못함).
+    - ``probe_failed``: 마지막 ``probe_fail_intervals`` 구간 모두 표본 실패(앱이 죽었거나 멈춤).
+    """
+    if not rows:
+        return None
+    probe = rows[-1].get("probe")
+    if probe:
+        cg = probe.get("cgroup") or {}
+        limit, rss = cg.get("max"), probe.get("VmRSS")
+        if limit and rss is not None and rss >= mem_frac * limit:
+            return f"rss {rss} >= {mem_frac} x memory.max {limit}"
+        if cg.get("events_oom_kill"):
+            return f"oom_kill {cg['events_oom_kill']}"
+    tail = rows[-err_intervals:]
+    if len(tail) == err_intervals:
+
+        def rate(r: dict) -> float:
+            total = r["n"] + r["errors"]
+            return r["errors"] / total if total else 1.0
+
+        if all(rate(r) >= err_rate for r in tail):
+            return f"error rate >= {err_rate} for {err_intervals} intervals"
+    tail = rows[-probe_fail_intervals:]
+    if len(tail) == probe_fail_intervals and all(r.get("probe") is None for r in tail):
+        return f"probe failed for {probe_fail_intervals} intervals"
+    return None
+
+
+def soak(args, target) -> None:
+    """``--report-every`` 모드(#33). 구간마다 JSON 한 줄, 끝에 ``{"final": true, ...}`` 한 줄."""
+    start = time.monotonic()
+    end = start + args.duration
+    stop = threading.Event()
+    lock = threading.Lock()
+    bucket: list[tuple[str, float, str | None]] = []
+    error_sample: dict[str, str] = {}
+
+    def pick(rng: random.Random) -> tuple[str, str, str]:
+        r = rng.random()
+        if r < args.read:
+            return "read", "GET", f"/lab/read/{rng.randint(1, args.max_id)}"
+        if r < args.read + args.sorted:
+            return "sorted", "GET", "/lab/sorted"
+        return "write", "POST", f"/lab/write?n={args.write_rows}"
+
+    def worker(i: int) -> None:
+        rng = random.Random(args.seed * 1000 + i)
+        conn = http.client.HTTPConnection(target.hostname, target.port, timeout=30)
+        while not stop.is_set() and time.monotonic() < end:
+            kind, method, path = pick(rng)
+            t0 = time.perf_counter()
+            why = None
+            try:
+                conn.request(method, path, body=b"" if method == "POST" else None)
+                resp = conn.getresponse()
+                body = resp.read()[:300].decode("utf-8", "replace")
+                if resp.status != 200:
+                    why = f"http {resp.status}"
+            except (OSError, http.client.HTTPException) as exc:
+                why, body = type(exc).__name__, str(exc)[:300]
+                conn.close()
+                conn = http.client.HTTPConnection(target.hostname, target.port, timeout=30)
+            dt = time.perf_counter() - t0
+            with lock:
+                bucket.append((kind, dt, why))
+                if why is not None:
+                    error_sample.setdefault(why, body)
+        conn.close()
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(args.concurrency)]
+    for t in threads:
+        t.start()
+    rows: list[dict] = []
+    cum: dict = {}
+    reason = None
+    last = start
+    i = 0
+    while True:
+        i += 1
+        due = min(start + i * args.report_every, end)
+        while time.monotonic() < due and not stop.is_set():
+            time.sleep(min(0.2, max(0.0, due - time.monotonic())))
+        with lock:
+            done, bucket[:] = list(bucket), []
+        now = time.monotonic()
+        probe = probe_error = None
+        conn = http.client.HTTPConnection(target.hostname, target.port, timeout=30)
+        try:
+            p0 = time.perf_counter()
+            conn.request("GET", "/lab/soakprobe")
+            probe = json.loads(conn.getresponse().read())
+            probe["probe_ms"] = round(1000 * (time.perf_counter() - p0), 1)
+        except (OSError, http.client.HTTPException, ValueError) as exc:
+            probe_error = f"{type(exc).__name__}: {str(exc)[:200]}"
+        finally:
+            conn.close()
+        rows.append(interval_row(i, now - start, now - last, done, cum, probe, probe_error))
+        last = now
+        print(json.dumps(rows[-1]), flush=True)
+        reason = stop_reason(
+            rows,
+            mem_frac=args.stop_mem_frac,
+            err_rate=args.stop_err_rate,
+            err_intervals=args.stop_err_intervals,
+        )
+        if reason or now >= end:
+            stop.set()
+            break
+    for t in threads:
+        t.join(timeout=60)
+    print(
+        json.dumps(
+            {
+                "final": True,
+                "stop_reason": reason,
+                "elapsed_s": round(time.monotonic() - start, 1),
+                "intervals": len(rows),
+                **{f"cum_{k}": v for k, v in cum.items()},
+                "error_sample": error_sample,
+            }
+        ),
+        flush=True,
+    )
+
+
 def main() -> None:
     p = argparse.ArgumentParser()
     p.add_argument("--url", default="http://labapp:8000")
@@ -91,9 +274,15 @@ def main() -> None:
     p.add_argument("--write-rows", type=int, default=1)
     p.add_argument("--sample", type=float, default=0.5)
     p.add_argument("--seed", type=int, default=1)
+    p.add_argument("--report-every", type=float, default=0, help="soak 모드(#33) 구간 초")
+    p.add_argument("--stop-mem-frac", type=float, default=0.8)
+    p.add_argument("--stop-err-rate", type=float, default=0.5)
+    p.add_argument("--stop-err-intervals", type=int, default=3)
     args = p.parse_args()
 
     target = urlsplit(args.url)
+    if args.report_every > 0:
+        return soak(args, target)
     start = time.monotonic()
     measure_from = start + args.warmup
     end = measure_from + args.duration

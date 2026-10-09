@@ -12,4 +12,6 @@ urlpatterns += [  # noqa: F821
     path("lab/stats", timed(lab_views.stats)),  # noqa: F821
     path("lab/probe", timed(lab_views.probe, db=False)),  # noqa: F821
     path("lab/ping", timed(lab_views.ping, db=False)),  # noqa: F821
+    path("lab/soakprobe", timed(lab_views.soakprobe, db=False)),  # noqa: F821
+    path("lab/soakenv", timed(lab_views.soakenv, db=False)),  # noqa: F821
 ]

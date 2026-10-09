@@ -52,6 +52,21 @@ services:
     ports: ["127.0.0.1::8000"]
     volumes: ["${LAB_VOLUME:-v01}:/data"]
 
+  # soak(#33): labapp 과 같고, 열린 파일 한도를 올리고 메모리를 막는다. 한도는
+  # compose `ulimits`·`mem_limit`·`memswap_limit`(docs.docker.com/reference/compose-file/services/).
+  # nofile 기본 1048576 은 이 랩 VM 의 fs.nr_open(컨테이너가 올릴 수 있는 최대)이다. memswap_limit
+  # 를 mem_limit 와 같게 두어 스왑을 막는다. 한도에 닿으면 이 컨테이너 cgroup 안에서만 OOM 이 난다.
+  labapp-soak:
+    <<: *app
+    ports: ["127.0.0.1::8000"]
+    volumes: ["${LAB_VOLUME:-v01}:/data"]
+    ulimits:
+      nofile:
+        soft: ${LAB_SOAK_NOFILE:-1048576}
+        hard: ${LAB_SOAK_NOFILE:-1048576}
+    mem_limit: ${LAB_SOAK_MEM:-2g}
+    memswap_limit: ${LAB_SOAK_MEM:-2g}
+
   # 볼륨 없는 앱(무상태 교체, L1).
   labapp-nv:
     <<: *app
