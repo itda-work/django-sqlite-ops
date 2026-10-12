@@ -305,6 +305,8 @@ class Sample:
     ``observed`` 는 monotonic 초(지속 시간 계산), ``checked_at`` 은 UNIX 초(표시용).
     ``error`` 는 조회 전에 판정이 끝난 사유(경로 규칙 위반, 파일 DB 가 아님, 갱신 중 예외)이고,
     있으면 다른 필드와 무관하게 ``unknown`` 이다. 응답에 나가므로 고정 문장만 넣는다.
+    ``db_file`` 은 DB 본 파일 상태의 사유 코드(``_DB_FILE_REASONS``)다. ``None`` 이면 내용 있는
+    정규 파일이거나(정상) 그 전에 판정이 끝나 보지 않았다.
     """
 
     observed: float
@@ -321,6 +323,7 @@ class Sample:
     pending_since: Since | None = None
     wal: WalEvidence | None = None
     backwards: bool = False
+    db_file: str | None = None
 
 
 def read_boot_state(db_path: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -503,6 +506,10 @@ def _verdict(
         )
     if sample.error is not None:
         return UNKNOWN, sample.error_code or "error", sample.error
+    if sample.db_file is not None:
+        # WAL·TXID 가 맞아도 그것이 붙을 DB 본 파일이 없거나 비면 정상이라 할 수 없다(#40).
+        template = _DB_FILE_REASONS.get(sample.db_file, _DB_FILE_REASONS["db_not_regular"])
+        return UNKNOWN, sample.db_file, template.format(path=sample.path)
     if sample.boot_state is not None and sample.boot_state.get("unknown_at_boot") is True:
         return (
             UNKNOWN,
@@ -630,7 +637,8 @@ def alias_status(
     """별칭 하나의 상태(응답의 ``databases[alias]``). ``now`` 는 monotonic 초다.
 
     판정 순서(처음 맞는 것): 조회 전 · 오래된 결과(``REFRESH × 3`` 초과) · 사전 오류 ·
-    ``unknown_at_boot`` · 원격 실패 · 원격 빈 목록 · 로컬 메타 없음 · 원격이 앞섬 → ``unknown``.
+    DB 본 파일 없음·0바이트·정규 파일 아님·조회 실패 · ``unknown_at_boot`` · 원격 실패 ·
+    원격 빈 목록 · 로컬 메타 없음 · 원격이 앞섬 → ``unknown``.
     로컬 TXID 가 앞선 지속 시간 ≥ ``grace`` → ``backlog``. 그다음 WAL 위치(주 근거)로 판단할 수
     없으면: 파일 시각 역행 → ``unknown``, 파일 시각(보조)이 grace 이상 L0 보다 새로움 →
     ``backlog``, 그 밖 → ``unknown``(``caught_up`` 으로 단정하지 않는다). WAL 에 L0 뒤 커밋이
@@ -680,6 +688,39 @@ def _check_real(path: str, what: str) -> tuple[str | None, str | None]:
     if os.path.islink(real):
         return None, f"{what} {real} is a symbolic link; use the real path (D-15)"
     return str(real), None
+
+
+_DB_FILE_REASONS = {
+    "db_missing": (
+        "the database file {path} does not exist; check the boot log and --on-unknown restore "
+        "(it can be missing briefly while boot quarantines or installs a restore)"
+    ),
+    "db_empty": (
+        "the database file {path} is empty (0 bytes); check the boot log (empty_db) and "
+        "--on-unknown restore (it can be empty briefly while boot installs a restore)"
+    ),
+    "db_not_regular": "the database path {path} is not a regular file",
+    "db_stat_failed": (
+        f"cannot stat the database file {{path}}; details are in the {LOGGER_NAME} log"
+    ),
+}
+
+
+def _db_file(path: str) -> tuple[str | None, str | None]:
+    """DB 본 파일 상태(#40). ``(사유 코드, 원문 진단)``. 내용 있는 정규 파일이면 코드가 ``None``.
+
+    ``lstat`` 한 번만 한다. 열지 않으므로 DB·``-wal``·``-shm`` 을 만들거나 바꾸지 않는다. 마지막
+    요소의 링크는 ``_check_real`` 이 이미 거부했다. 원문 진단은 로그에만 쓴다.
+    """
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        return "db_missing", None
+    except (OSError, ValueError) as exc:
+        return "db_stat_failed", f"cannot stat the database file {path}: {exc}"
+    if not stat.S_ISREG(st.st_mode):
+        return "db_not_regular", None
+    return ("db_empty" if st.st_size == 0 else None), None
 
 
 def _mtime(path: str) -> float | None:
@@ -761,7 +802,7 @@ class Monitor:
     monotonic: Callable[[], float] = time.monotonic
     samples: dict[str, Sample] = field(default_factory=dict, init=False)
     refreshes: int = field(default=0, init=False)
-    _logged: dict[str, str] = field(default_factory=dict, init=False)
+    _logged: dict[tuple[str, str], str] = field(default_factory=dict, init=False)
     _pid: int | None = field(default=None, init=False)
     _thread: threading.Thread | None = field(default=None, init=False)
     _stop: threading.Event = field(default_factory=threading.Event, init=False)
@@ -772,11 +813,11 @@ class Monitor:
     def _now(self) -> tuple[float, float]:
         return self.monotonic(), self.clock()
 
-    def _log_once(self, alias: str, message: str) -> None:
+    def _log_once(self, alias: str, message: str, key: str = "remote") -> None:
         """원문 진단은 로그로만(가린 뒤). 같은 메시지를 갱신마다 반복하지 않는다."""
         message = redact(message)
-        if self._logged.get(alias) != message:
-            self._logged[alias] = message
+        if self._logged.get((alias, key)) != message:
+            self._logged[(alias, key)] = message
             _log.warning("health %r: %s", alias, message)
 
     def _sample(self, cfg: AliasConfig, prev: Sample | None) -> Sample:
@@ -801,11 +842,18 @@ class Monitor:
                 error_code="path_not_real",
                 error=problem,
             )
+        # DB 본 파일이 없거나 비어도 아래 조회와 타이머 갱신은 그대로 한다: boot 격리·설치 사이처럼
+        # 잠깐일 때 끊으면 이후 backlog 감지가 늦어진다. 판정만 unknown 이다(_verdict).
+        db_file, db_detail = _db_file(real)
+        if db_detail is not None:
+            self._log_once(cfg.alias, db_detail, "db_file")
+        else:
+            self._logged.pop((cfg.alias, "db_file"), None)
         remote = self.remote(cfg, real)
         if type(remote) is RemoteError:
             self._log_once(cfg.alias, f"remote lookup failed: {remote.message}")
         else:
-            self._logged.pop(cfg.alias, None)
+            self._logged.pop((cfg.alias, "remote"), None)
         local = self.local(real, meta)
         wal = self.wal(real, meta)
         files = self.files(real, meta)
@@ -834,6 +882,7 @@ class Monitor:
             pending_since=pending,
             wal=wal,
             backwards=backwards,
+            db_file=db_file,
         )
 
     def refresh_once(self) -> None:

@@ -131,6 +131,7 @@ def sample(
     boot=None,
     error=None,
     code=None,
+    db_file=None,
 ):
     return Sample(
         at,
@@ -147,6 +148,7 @@ def sample(
         since(pending, key=L1) if pending is not None else None,
         wal,
         backwards,
+        db_file=db_file,
     )
 
 
@@ -230,6 +232,36 @@ def sample(
             1000.0,
             UNKNOWN,
             "remote_empty",
+            "",
+        ),
+        # #40: DB 본 파일 상태. WAL·TXID 가 맞아도 unknown 이다
+        (sample(db_file="db_missing"), 1000.0, UNKNOWN, "db_missing", "does not exist"),
+        (sample(db_file="db_empty"), 1000.0, UNKNOWN, "db_empty", "0 bytes"),
+        (sample(db_file="db_not_regular"), 1000.0, UNKNOWN, "db_not_regular", "not a regular"),
+        (sample(db_file="db_stat_failed"), 1000.0, UNKNOWN, "db_stat_failed", "cannot stat"),
+        # 우선순위: 오래된 결과 > 경로 오류 > DB 파일 > unknown_at_boot > remote_error > backlog
+        (sample(db_file="db_missing"), 1100.0, UNKNOWN, "stale", "stuck"),
+        (
+            sample(db_file="db_missing", error="path x", code="path_not_real"),
+            1000.0,
+            UNKNOWN,
+            "path_not_real",
+            "path x",
+        ),
+        (sample(db_file="db_empty", boot=BOOT_KEEP), 1000.0, UNKNOWN, "db_empty", ""),
+        (
+            sample(db_file="db_missing", remote=RemoteError("boom")),
+            1000.0,
+            UNKNOWN,
+            "db_missing",
+            "",
+        ),
+        (sample(db_file="db_missing", local=6, backlog=900.0), 1000.0, UNKNOWN, "db_missing", ""),
+        (
+            sample(db_file="db_empty", wal=W_PEND, pending=900.0),
+            1000.0,
+            UNKNOWN,
+            "db_empty",
             "",
         ),
     ],
@@ -452,7 +484,10 @@ class Fakes:
 
 
 def monitor(tmp_path, *, refresh=0.05, grace=60.0, clock=time.time, monotonic=time.monotonic, **kw):
-    fakes = Fakes(str(tmp_path / "app.sqlite3"), **kw)
+    db = tmp_path / "app.sqlite3"
+    if not db.exists():
+        db.write_bytes(b"x" * 4096)  # DB 본 파일이 있어야 판정한다(#40). 열지는 않는다
+    fakes = Fakes(str(db), **kw)
     config = HealthConfig((AliasConfig("default", "/etc/litestream.yml"),), refresh, grace)
     m = Monitor(
         config,
@@ -714,6 +749,10 @@ out["connections"] = {a: connections[a].connection is None for a in connections}
 out["db_exists"] = {
     a: os.path.exists(c["NAME"]) for a, c in settings.DATABASES.items()
 }
+out["sidecars"] = {
+    a: [os.path.exists(c["NAME"] + s) for s in ("-wal", "-shm", "-journal")]
+    for a, c in settings.DATABASES.items()
+}
 out["log"] = LOG
 print(json.dumps(out))
 """
@@ -743,8 +782,15 @@ def health_settings(config_path, **extra):
     }
 
 
+def _db_snapshot(db: Path) -> tuple[bytes, int]:
+    st = db.stat()
+    return db.read_bytes(), st.st_mtime_ns
+
+
 def test_view_caught_up_and_strict(tmp_path):
     db = tmp_path / "app.sqlite3"
+    db.write_bytes(b"not opened by health" * 100)  # #40: 본 파일이 있어야 caught_up 이다
+    before = _db_snapshot(db)
     out = run_view(
         {"default": {**SQLITE, "NAME": str(db)}},
         fake={"local": 7, "remote": 7},
@@ -782,13 +828,34 @@ def test_view_caught_up_and_strict(tmp_path):
     assert entry["code"] == "in_sync"
     assert entry["path"] == str(db) and entry["local_txid"] == "0000000000000007"
     assert "sqlite-ops-health" in out["threads"]
-    # DB 연결을 열지 않았고 DB 파일도 생기지 않았다
+    # DB 연결을 열지 않았고 DB 파일·-wal·-shm 을 만들거나 바꾸지 않았다
+    assert out["connections"] == {"default": True}
+    assert out["sidecars"] == {"default": [False, False, False]}
+    assert _db_snapshot(db) == before
+
+
+def test_view_missing_db_is_unknown_and_strict_503(tmp_path):
+    """#40: 원격·로컬·WAL 이 맞아도 DB 본 파일이 없으면 unknown. 기본 200, strict 503."""
+    db = tmp_path / "app.sqlite3"
+    out = run_view(
+        {"default": {**SQLITE, "NAME": str(db)}},
+        fake={"local": 7, "remote": 7},
+        SQLITE_OPS=health_settings(tmp_path / "litestream.yml"),
+    )
+    second, second_strict = out["second"]
+    assert second["code"] == 200 and second_strict["code"] == 503
+    entry = second["body"]["databases"]["default"]
+    assert (entry["status"], entry["code"]) == (UNKNOWN, "db_missing"), entry
+    assert second["body"]["status"] == UNKNOWN and second["body"]["version"] == 1
     assert out["connections"] == {"default": True}
     assert out["db_exists"] == {"default": False}
+    assert out["sidecars"] == {"default": [False, False, False]}
 
 
 def test_view_real_lookup_failure_is_unknown_with_200(tmp_path):
     db = tmp_path / "app.sqlite3"
+    db.write_bytes(b"x" * 4096)
+    before = _db_snapshot(db)
     out = run_view(
         {"default": {**SQLITE, "NAME": str(db)}},
         SQLITE_OPS=health_settings(
@@ -803,7 +870,8 @@ def test_view_real_lookup_failure_is_unknown_with_200(tmp_path):
     assert second_strict["code"] == 503
     assert "remote lookup failed" in second["body"]["databases"]["default"]["reason"]
     assert out["connections"] == {"default": True}
-    assert out["db_exists"] == {"default": False}
+    assert out["sidecars"] == {"default": [False, False, False]}
+    assert _db_snapshot(db) == before
 
 
 def test_view_not_a_file_database_is_unknown(tmp_path):
@@ -1004,6 +1072,7 @@ def test_view_is_outside_atomic_requests_for_every_alias(tmp_path):
 def test_remote_error_text_is_not_in_response_or_log(tmp_path, litestream_binary):
     """review-1 P2: Litestream stderr 의 자격 증명이 응답·로그에 나오지 않는다."""
     db = tmp_path / "app.sqlite3"
+    db.write_bytes(b"x" * 4096)  # #40: 본 파일이 없으면 db_missing 이 remote_error 보다 먼저다
     config = tmp_path / "bad.yml"
     config.write_text(
         f"dbs:\n  - path: {db}\n    replica:\n      type: s3\n      bucket: dummy\n"
@@ -1736,3 +1805,189 @@ def test_real_checkpoint_between_wal_reads_is_not_in_sync(
         assert len(conn.execute("SELECT x FROM t").fetchall()) > 1
     finally:
         conn.close()
+
+
+# --- #40: DB 본 파일 상태 -------------------------------------------------------------
+
+
+def _dir_snapshot(directory: Path) -> dict[str, tuple[int, int, int]]:
+    """디렉터리 바로 아래 항목의 (종류, 크기, mtime_ns). 링크를 따라가지 않는다."""
+    out = {}
+    for entry in os.scandir(directory):
+        st = entry.stat(follow_symlinks=False)
+        out[entry.name] = (st.st_mode, st.st_size, st.st_mtime_ns)
+    return out
+
+
+def test_monitor_db_file_states(tmp_path):
+    """없음 → db_missing, 0바이트 → db_empty, 디렉터리 → db_not_regular. 다른 조회는 그대로 돈다."""
+    m, fakes = monitor(tmp_path)
+    db = Path(fakes.db)
+    m.refresh_once()
+    assert m.report()["databases"]["default"]["code"] == "in_sync"
+
+    db.unlink()
+    m.refresh_once()
+    entry = m.report()["databases"]["default"]
+    assert (entry["status"], entry["code"]) == (UNKNOWN, "db_missing"), entry
+    assert str(db) in entry["reason"] and "--on-unknown restore" in entry["reason"]
+    assert entry["path"] == str(db) and entry["local_txid"] == "0000000000000005"
+    assert not db.exists()  # 만들지 않는다
+
+    db.write_bytes(b"")
+    m.refresh_once()
+    entry = m.report()["databases"]["default"]
+    assert (entry["status"], entry["code"]) == (UNKNOWN, "db_empty"), entry
+    assert db.stat().st_size == 0
+
+    db.unlink()
+    db.mkdir()
+    m.refresh_once()
+    entry = m.report()["databases"]["default"]
+    assert (entry["status"], entry["code"]) == (UNKNOWN, "db_not_regular"), entry
+    assert fakes.calls == 4  # 원격 조회는 매번 했다(타이머 유지)
+
+    db.rmdir()
+    db.write_bytes(b"x")
+    m.refresh_once()
+    entry = m.report()["databases"]["default"]
+    assert (entry["status"], entry["code"]) == (CAUGHT_UP, "in_sync"), entry
+
+
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="no mkfifo")
+def test_monitor_db_fifo_is_not_regular(tmp_path):
+    lab = tmp_path / "lab"
+    lab.mkdir()
+    m, fakes = monitor(tmp_path)
+    fifo = lab / "app.sqlite3"
+    os.mkfifo(fifo)
+    fakes.db = str(fifo)
+    m.refresh_once()  # 열지 않으므로 FIFO 에서 막히지 않는다
+    entry = m.report()["databases"]["default"]
+    assert (entry["status"], entry["code"]) == (UNKNOWN, "db_not_regular"), entry
+
+
+def test_monitor_db_stat_failure_is_unknown(tmp_path, monkeypatch, caplog):
+    m, fakes = monitor(tmp_path)
+    real_lstat = os.lstat
+
+    def lstat(path, *args, **kwargs):
+        if os.fspath(path) == fakes.db:
+            raise PermissionError(13, "Permission denied", fakes.db)
+        return real_lstat(path, *args, **kwargs)
+
+    monkeypatch.setattr(health.os, "lstat", lstat)
+    with caplog.at_level("WARNING", logger=health.LOGGER_NAME):
+        m.refresh_once()
+        m.refresh_once()
+    entry = m.report()["databases"]["default"]
+    assert (entry["status"], entry["code"]) == (UNKNOWN, "db_stat_failed"), entry
+    assert "Permission denied" not in entry["reason"]  # 원문은 로그로만, 한 번만
+    assert [r.getMessage() for r in caplog.records if "Permission denied" in r.getMessage()] == [
+        f"health 'default': cannot stat the database file {fakes.db}: "
+        f"[Errno 13] Permission denied: '{fakes.db}'"
+    ]
+    assert fakes.calls == 2  # 원격 조회는 그대로 한다
+
+
+def test_monitor_db_missing_keeps_backlog_and_pending_timers(tmp_path):
+    """DB 가 잠깐 없어도(boot 격리·설치 사이) backlog·pending 타이머를 끊지 않는다."""
+    now = [1000.0]
+    m, fakes = monitor(
+        tmp_path, refresh=15.0, grace=60.0, clock=lambda: now[0], monotonic=lambda: now[0], local=6
+    )
+    db = Path(fakes.db)
+    m.refresh_once()
+    entry = m.report()["databases"]["default"]
+    assert entry["status"] == CAUGHT_UP and entry["backlog_since"] == "1970-01-01T00:16:40.000Z"
+
+    held = tmp_path / "held.sqlite3"
+    db.rename(held)
+    now[0] = 1030.0
+    m.refresh_once()
+    entry = m.report()["databases"]["default"]
+    assert (entry["status"], entry["code"]) == (UNKNOWN, "db_missing"), entry
+    assert entry["backlog_since"] == "1970-01-01T00:16:40.000Z"
+
+    held.rename(db)
+    now[0] = 1060.0
+    m.refresh_once()
+    entry = m.report()["databases"]["default"]
+    assert (entry["status"], entry["code"]) == (BACKLOG, "local_ahead"), entry
+
+    # WAL pending 도 같다
+    fakes.remote, fakes.wal = RemoteTxid(6), W_PEND
+    now[0] = 1100.0
+    m.refresh_once()
+    assert m.report()["databases"]["default"]["code"] == "db_changed_within_grace"
+    pending = m.report()["databases"]["default"]["pending_since"]
+    db.write_bytes(b"")
+    now[0] = 1130.0
+    m.refresh_once()
+    entry = m.report()["databases"]["default"]
+    assert (entry["code"], entry["pending_since"]) == ("db_empty", pending), entry
+    db.write_bytes(b"x")
+    now[0] = 1160.0
+    m.refresh_once()
+    entry = m.report()["databases"]["default"]
+    assert (entry["status"], entry["code"]) == (BACKLOG, "db_not_replicated"), entry
+
+    fakes.wal = W_SYNC
+    now[0] = 1161.0
+    m.refresh_once()
+    entry = m.report()["databases"]["default"]
+    assert (entry["status"], entry["code"]) == (CAUGHT_UP, "in_sync"), entry
+
+
+def _move_aside(path: Path, hold: Path) -> None:
+    if path.exists():
+        path.rename(hold / path.name)
+
+
+@needs_litestream
+@pytest.mark.parametrize(
+    ("db_state", "keep_wal", "code"),
+    [
+        ("normal", True, "in_sync"),
+        ("missing", True, "db_missing"),  # 수정 전: caught_up/in_sync
+        ("missing", False, "db_missing"),  # 수정 전: unknown/no_wal_evidence
+        ("empty", False, "db_empty"),  # 수정 전: unknown/no_wal_evidence
+        ("empty", True, "db_empty"),  # 수정 전: caught_up/in_sync
+    ],
+)
+def test_real_db_file_states(tmp_path, litestream_binary, monkeypatch, db_state, keep_wal, code):
+    """#40 재현: replicate -once 뒤 DB 본 파일만 없애거나 비운다(-wal·로컬 메타·복제본 유지)."""
+    lab = tmp_path / "lab"
+    lab.mkdir()
+    hold = tmp_path / "hold"
+    hold.mkdir()
+    db = lab / "app.sqlite3"
+    config = _config(lab, "a", db, lab / "replica")
+    _write(db, 1)
+    _replicate_once(litestream_binary, config)
+    wal = Path(str(db) + "-wal")
+    assert wal.exists()  # replicate -once 는 -wal 을 남긴다(실측)
+    cfg = HealthConfig((AliasConfig("default", str(config), None, litestream_binary),), 15.0, 60.0)
+    m = Monitor(cfg, path_of=lambda alias: (str(db), None))
+    m.refresh_once()
+    entry = m.report()["databases"]["default"]
+    assert (entry["status"], entry["code"]) == (CAUGHT_UP, "in_sync"), entry
+
+    if db_state != "normal":
+        _move_aside(db, hold)
+    if db_state == "empty":
+        db.write_bytes(b"")
+    if not keep_wal:
+        _move_aside(wal, hold)
+        _move_aside(Path(str(db) + "-shm"), hold)
+
+    def no_connect(*args, **kwargs):
+        raise AssertionError("health must not open the database")
+
+    monkeypatch.setattr(sqlite3, "connect", no_connect)
+    before = _dir_snapshot(lab)
+    m.refresh_once()
+    entry = m.report()["databases"]["default"]
+    assert _dir_snapshot(lab) == before  # DB·-wal·-shm 을 만들거나 바꾸지 않았다
+    status = CAUGHT_UP if code == "in_sync" else UNKNOWN
+    assert (entry["status"], entry["code"]) == (status, code), entry
