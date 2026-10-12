@@ -611,6 +611,7 @@ urlpatterns = [
 | `backlog` | `db_not_replicated` | `-wal` 에 최신 L0 뒤의 커밋이 `BACKLOG_GRACE` 이상 남아 있음(또는 WAL 근거가 없을 때 파일 시각이 그만큼 L0 보다 새로움). `litestream replicate` 가 죽었거나 멈췄을 수 있다 |
 | `unknown` | `no_wal_evidence` | `-wal` 로 판정할 수 없음: `-wal` 이 없거나(마지막 연결이 닫혀 지워짐) 비었음, L0 이후 WAL 이 다시 시작됐는데 아직 커밋이 없음 등. **이때는 `caught_up` 으로 단정하지 않는다** |
 | `unknown` | `file_time_backwards` | WAL 근거가 없는데 DB·`-wal`·L0 의 파일 시각이 앞선 관측보다 뒤로 감(시계 변경 등) |
+| `unknown` | `db_missing` · `db_empty` · `db_not_regular` · `db_stat_failed` | DB 본 파일이 없음 · 0바이트 · 정규 파일이 아님(디렉터리 등) · 상태를 읽을 수 없음. `-wal`·Litestream 메타·복제본이 맞아도 그것이 붙을 DB 가 없으므로 정상이 아니다. 아래 [DB 본 파일](#db-본-파일-상태) 참고 |
 | `unknown` | `remote_error` · `remote_empty` · `no_local_meta` · `remote_ahead` · `unknown_at_boot` · `path_not_real` · `not_file_db` · `refresh_failed` · `not_checked` · `stale` | 판정할 수 없음: 원격 조회 실패, 복제본이 빈 목록(경로·prefix 오타와 구분되지 않는다), 로컬 메타 없음(`litestream replicate` 가 돌지 않음), **복제본이 로컬보다 앞섬**(다른 기계가 같은 복제본에 쓰는 중일 수 있다), 부팅 상태 파일의 `unknown_at_boot`(boot 가 `--on-unknown keep-local` 로 진행함), [경로 규칙](#경로-규칙) 위반, 파일 DB 가 아님, 갱신 중 예외, 아직 첫 조회 전, 마지막 결과가 `REFRESH × 3` 보다 오래됨(갱신 스레드가 멈춤) |
 
 `local_ahead` 의 backlog 시간은 **처음 관측한 미업로드 로컬 TXID 가 원격에 올라가기까지 기다린 시간**이다. 가장 오래된 미업로드 커밋의 엄밀한 나이나 로컬·원격의 총 격차가 아니다.
@@ -638,6 +639,19 @@ urlpatterns = [
 - 부팅 상태 파일 `<db>.boot-state.json`([boot CLI](#boot-cli)가 씀)을 `boot_state` 로 보여 준다. 파일이 없거나 형식이 틀리면 `boot_state_error` 에 그 사실만 적고 상태는 바꾸지 않는다(boot 를 쓰지 않는 배포도 있다). `unknown_at_boot` 가 참이면 다음 정상 부팅까지 `unknown` 이다.
 - DB 경로는 Django 가 실제로 여는 경로(`OPTIONS["database"]` 포함, [`sqlite_doctor`](#sqlite_doctor)와 같은 방식)다. boot 와 같은 [경로 규칙](#경로-규칙)을 따른다: 부모 경로에 심볼릭 링크·`..` 가 있거나 DB 파일 자체가 링크면 그 별칭은 `unknown`(`path_not_real`)이다. `meta_path` 도 같다(`..` 를 접지 않고 쓴 그대로 검사한다. 상대 경로는 작업 디렉터리만 앞에 붙인다).
 - 설정이 잘못되면 `manage.py check` 가 `sqlite_ops.E002` 를 내고, 뷰는 `unknown` 과 사유를 돌려준다.
+
+#### DB 본 파일 상태
+
+헬스는 DB 연결을 열지 않고 DB 본 파일을 `lstat` 한 번으로 본다(파일을 만들거나 바꾸지 않는다). 아래는 모두 `unknown` 이므로 기본은 HTTP 200, `?strict=1` 이면 503 이다.
+
+| `code` | 뜻 | 대처 |
+|---|---|---|
+| `db_missing` | DB 파일이 없다(`-wal`·메타는 남아 있을 수 있다) | boot 로그를 본다. 부팅 중 boot 가 격리·복원하는 사이라면 곧 사라진다. 계속되면 DB 를 지운 원인을 찾고, 복제본이 정본이면 앱을 멈춘 뒤 다시 부팅한다. boot 는 이 상태를 [`orphan_sidecars`·`stale_meta`](#거부됐을-때-exit-2-사유-코드별-대처)(사이드카·메타만 남음)로 거부하므로 그 대처대로 `--on-unknown restore` 를 쓴다 |
+| `db_empty` | DB 파일이 0바이트다 | 위와 같다. boot 는 메타가 남은 0바이트 DB 를 [`empty_db`](#0바이트-db-복구-empty_db) 로 거부하므로 그 절차를 따른다 |
+| `db_not_regular` | DB 경로가 디렉터리·FIFO 등이다 | 설정의 `NAME` 과 실제 파일을 확인한다 |
+| `db_stat_failed` | 권한 등으로 상태를 읽을 수 없다 | `django_sqlite_ops.health` 로그(WARNING)의 원문을 보고 권한을 고친다 |
+
+원격·로컬 조회와 `backlog_since`·`pending_since` 추적은 이 동안에도 계속한다. 그래서 DB 가 잠깐 없다가 돌아오면 그 사이의 backlog 시간도 이어서 센다.
 
 **HTTP 상태는 항상 200 이다.** 헬스 엔드포인트를 로드밸런서의 헬스 체크로 쓰면, 복제가 뒤처지거나 S3 가 끊겼다는 이유로 앱이 서비스에서 빠진다. 복제 지연은 데이터 손실 위험이지 요청을 못 받는 상태가 아니므로 앱을 내리면 안 된다. 모니터링은 **본문의 `status`** 로 알람을 건다(`backlog` 나 `unknown` 이 몇 분 이어지면 경보). HTTP 코드로만 판정할 수 있는 모니터를 쓴다면 `?strict=1` 을 붙인다. 그러면 `caught_up` 이 아닐 때 503 이다. **로드밸런서 헬스 체크에는 `strict` 를 쓰지 않는다.**
 
@@ -791,6 +805,7 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 | 헬스가 `backlog` 인데 HTTP 200 이다 | 설계상 항상 200 이다. 복제 지연으로 로드밸런서가 앱을 빼면 안 된다 | 본문 `status` 로 알람. HTTP 코드만 보는 모니터는 `?strict=1`(로드밸런서에는 쓰지 않는다) | 코드상 확인(`health.py`) |
 | 헬스가 `unknown`(`no_wal_evidence`) | `-wal` 이 없거나 비어 WAL 위치로 판정할 수 없다. Litestream 이 돌면 `-wal` 이 남는다 | `litestream replicate` 가 도는지 본다 | 코드상 확인(`health.py`) |
 | 헬스가 `unknown`(`remote_ahead`) | 복제본이 로컬보다 앞섰다. 다른 머신이 같은 복제본에 쓰는 중일 수 있다 | 쓰는 머신이 1대인지 확인한다. 두 머신이 쓰면 나중 쪽이 경고 없이 이긴다 | 실측(scenarios S2b) |
+| 헬스가 `unknown`(`db_missing`·`db_empty`) | DB 본 파일이 없거나 0바이트다. `-wal`·메타가 남아 예전에는 `caught_up` 으로 보였다 | [DB 본 파일 상태](#db-본-파일-상태)의 대처를 따른다 | 재현함(#40, 실제 Litestream 0.5.17) |
 | 헬스가 계속 `unknown`(`unknown_at_boot`) | boot 가 `--on-unknown keep-local` 로 진행했다 | 원인을 푼 뒤 옵션 없이 다시 부팅한다 | 코드상 확인(`health.py`) |
 
 ### 채널 레이어
