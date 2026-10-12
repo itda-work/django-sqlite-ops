@@ -499,7 +499,8 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 
 1. DB 파일이 정말 비어야 하는 것이 아닌지(다른 곳에 옮겨 둔 원본이 있는지) 확인한다.
 2. 복제본이 정본이면 `--on-unknown restore` 로 한 번 부팅한다. 빈 파일·사이드카·메타는 `<db>.stale-<ts>/` 로 옮겨지고 복제본이 복원된다. 복제본 조회가 실패하면 이 경우에도 거부한다([D-12](docs/DECISIONS.md)).
-3. 이미 빈 DB 로 앱이 돌아 복제까지 됐다면 최신 복제본에는 원래 데이터가 없다. `litestream restore -txid <이전 TXID>` 로 사고 이전 시점을 따로 복원해 확인한다.
+3. `--on-unknown keep-local` 은 쓰지 않는다. 원격 조회가 성공하면 이 거부를 우회해 빈 DB 로 앱을 띄우고, 그 상태에서 앱이 쓰면 복제본 최신본에서 기존 데이터가 사라진다. `empty_db` 에서는 `restore` 를 쓴다.
+4. 이미 빈 DB 로 앱이 돌아 복제까지 됐다면 최신 복제본에는 원래 데이터가 없다. `litestream restore -txid <이전 TXID>` 로 사고 이전 시점을 따로 복원해 확인한다.
 
 메타가 없는 0바이트 파일은 이 규칙 밖이다. 지금처럼 `no_local_meta`(복제본이 비었고 `--adopt-existing` 이면 `adopt`)로 판정된다([D-16](docs/DECISIONS.md)).
 
