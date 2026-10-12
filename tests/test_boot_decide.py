@@ -307,16 +307,16 @@ EVERY_INPUT = [
     ("local", "empty", "txid", "remote", "policy", "adopt", "init_new"), EVERY_INPUT
 )
 def test_invariant_empty_db_never_keeps_local(local, empty, txid, remote, policy, adopt, init_new):
-    # D-17: 0바이트 DB 는 keep-local 로도 넘기지 않는다.
+    # D-17·D-18: 0바이트 DB 는 메타 유무와 무관하게 keep-local 로도 넘기지 않는다.
     got = _decide(
         local, txid, remote, policy, local_empty=empty, adopt_existing=adopt, init_new=init_new
     )
-    if got.reason_code is C.EMPTY_DB:
+    if empty:
         assert got.action is not Action.KEEP_LOCAL
 
 
 def test_keep_local_still_applies_to_other_unknown_reasons():
-    # D-17 은 empty_db 만 바꾼다. 다른 unknown 사유의 keep-local 은 그대로다.
+    # D-17·D-18 은 0바이트 DB 만 바꾼다. 0바이트가 아닌 DB 의 keep-local 은 그대로다.
     kept = {
         _decide(local, txid, remote, "keep-local").reason_code
         for local, txid, remote, _ in ALL_INPUTS
@@ -327,13 +327,14 @@ def test_keep_local_still_applies_to_other_unknown_reasons():
 
 # local_empty=True 이고 로컬 메타가 없는 행(#44, D-18).
 # 원격 → (state, reason_code, refuse·restore·keep-local 각각의 action)
-# adopt_existing·init_new 는 이 표에 영향이 없다. --adopt-existing 은 0바이트를 도입하지 않는다.
+# adopt_existing·init_new 는 이 표에 영향이 없다. --adopt-existing 은 0바이트를 도입하지 않고,
+# keep-local 도 거부한다(D-18). 지킬 로컬 데이터가 없다.
 EMPTY_NO_META_TABLE = {
     "err": (U, C.REMOTE_ERROR, NO, NO, NO),  # D-12
-    "empty": (U, C.NO_LOCAL_META, NO, NO, KEEP),  # D-18: adopt 아님
-    "3": (U, C.NO_LOCAL_META, NO, QR, KEEP),
-    "5": (U, C.NO_LOCAL_META, NO, QR, KEEP),
-    "7": (U, C.NO_LOCAL_META, NO, QR, KEEP),
+    "empty": (U, C.NO_LOCAL_META, NO, NO, NO),  # D-18: adopt·keep-local 아님
+    "3": (U, C.NO_LOCAL_META, NO, QR, NO),  # D-18
+    "5": (U, C.NO_LOCAL_META, NO, QR, NO),  # D-18
+    "7": (U, C.NO_LOCAL_META, NO, QR, NO),  # D-18
 }
 EMPTY_NO_META_CASES = [
     pytest.param(
@@ -381,9 +382,12 @@ def test_invariant_empty_db_is_never_adopted(local, empty, txid, remote, policy,
 
 
 @pytest.mark.parametrize(("txid", "remote", "policy", "adopt", "init_new"), EMPTY_INPUTS)
-def test_empty_db_without_meta_differs_only_in_adopt_row(txid, remote, policy, adopt, init_new):
-    # 메타 없는 0바이트와 비어 있지 않은 DB 의 판정은 adopt 행(원격 빈 목록 + adopt_existing)
-    # 하나에서만 다르다(D-18). 사유 문구는 0바이트를 드러내므로 비교하지 않는다.
+def test_empty_db_without_meta_differs_only_in_adopt_and_keep_local(
+    txid, remote, policy, adopt, init_new
+):
+    # 메타 없는 0바이트와 비어 있지 않은 DB 의 판정은 adopt 행(원격 빈 목록 + adopt_existing)과
+    # keep-local 의 KEEP_LOCAL 에서만 다르다(D-18). 둘 다 0바이트면 REFUSE 다.
+    # 사유 문구는 0바이트를 드러내므로 비교하지 않는다.
     if txid is not None:
         return
     kw = {"adopt_existing": adopt, "init_new": init_new}
@@ -395,8 +399,9 @@ def test_empty_db_without_meta_differs_only_in_adopt_row(txid, remote, policy, a
             C.ADOPT_EXISTING,
             Action.PROCEED,
         )
-        expected = KEEP if policy == "keep-local" else NO
-        assert (on.state, on.reason_code, on.action) == (U, C.NO_LOCAL_META, expected)
+        assert (on.state, on.reason_code, on.action) == (U, C.NO_LOCAL_META, NO)
+    elif off.action is Action.KEEP_LOCAL:
+        assert (on.state, on.reason_code, on.action) == (off.state, off.reason_code, NO)
     else:
         assert (on.state, on.reason_code, on.action) == (off.state, off.reason_code, off.action)
 

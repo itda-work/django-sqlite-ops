@@ -1401,6 +1401,29 @@ def test_empty_db_without_meta_restore_policy_quarantines_and_restores(lab, fake
     )
 
 
+@pytest.mark.parametrize("remote", [None, 0x19], ids=["remote-empty", "remote-txid"])
+def test_empty_db_without_meta_keep_local_refuses(lab, fake, no_exec, capsys, remote):
+    # D-18: 메타 없는 0바이트도 keep-local 로 넘기지 않는다(D-17 확장).
+    db = lab / "app.db"
+    db.touch()
+    (lab / "app.db-wal").write_bytes(b"wal")
+    fake.remote_txid(remote)
+    before = snapshot(lab)
+    assert (
+        main_inproc(boot_args(lab, fake, "--on-unknown", "keep-local"), no_exec) == cli.EXIT_REFUSE
+    )
+    err = capsys.readouterr().err
+    assert "action=refuse reason_code=no_local_meta" in err
+    assert "local db is 0 bytes (-wal present) and local meta is missing" in err
+    assert "hint:" in err and "keep-local is refused too" in err
+    assert "unknown_at_boot" not in err
+    assert snapshot(lab, skip=("app.db.boot.lock",)) == before
+    assert db.stat().st_size == 0
+    assert not cli.state_path(db).exists()
+    assert "restore" not in fake.calls()
+    assert not no_exec[0]
+
+
 def test_non_empty_db_without_meta_hint_is_unchanged(lab, fake, no_exec, capsys):
     # 비어 있지 않은 DB 의 no_local_meta 힌트는 D-14 restore / D-11 adopt 안내 그대로다.
     make_db(lab / "app.db", 2)
@@ -1844,6 +1867,28 @@ def test_l8_empty_db_with_meta_keep_local_refuses(real):
     assert result.returncode == 2, result.stderr
     assert "reason_code=empty_db" in result.stderr
     assert "D-17" in result.stderr
+    assert "unknown_at_boot" not in result.stderr
+    assert read_marker(data) is None
+    assert snapshot(replica) == before_replica
+    assert snapshot(data, skip=("app.db.boot.lock",)) == before_data
+    assert db.stat().st_size == 0
+    assert not cli.state_path(db).exists()
+
+
+def test_l8_empty_db_without_meta_keep_local_refuses(real):
+    # D-18: L8 준비에서 메타까지 치운 볼륨. 원격에 TXID 가 있어도 keep-local 은 거부한다.
+    data, db, config = real("vol")
+    aside = _empty_db_volume(data, db)
+    (data / ".app.db-litestream").rename(aside / ".app.db-litestream")
+    replica = config.parent / "replica"
+    before_replica, before_data = snapshot(replica), snapshot(data)
+    result = run_boot(
+        real_args(db, config, "--on-unknown", "keep-local", cmd=marker_command(data, db))
+    )
+    assert result.returncode == 2, result.stderr
+    assert "local_txid=None remote=txid" in result.stderr
+    assert "action=refuse reason_code=no_local_meta" in result.stderr
+    assert "0 bytes" in result.stderr and "D-18" in result.stderr
     assert "unknown_at_boot" not in result.stderr
     assert read_marker(data) is None
     assert snapshot(replica) == before_replica

@@ -749,15 +749,16 @@ _HINTS = {
 # 원격 조회 실패는 remote_error 로 먼저 가므로 여기 오지 않는다.
 _EMPTY_NO_META_HINTS = {
     RemoteTxid: (
-        "the db file is 0 bytes and has no litestream meta; check that the file is really "
-        "empty, then rerun with --on-unknown restore to quarantine the empty file and sidecars "
-        "and restore from the replica"
+        "the db file is 0 bytes and has no litestream meta, so --on-unknown keep-local is "
+        "refused too (D-18); check that the file is really empty, then rerun with "
+        "--on-unknown restore to quarantine the empty file and sidecars and restore from the "
+        "replica"
     ),
     RemoteEmpty: (
         "the db file is 0 bytes and has no litestream meta, and the replica is empty; "
-        "--adopt-existing does not adopt a 0-byte file (D-18); check the replica path/prefix, "
-        "then inspect and remove the empty file and sidecars yourself and boot once with "
-        "--init-new (D-13)"
+        "--adopt-existing does not adopt a 0-byte file and --on-unknown keep-local is refused "
+        "too (D-18); check the replica path/prefix, then inspect and remove the empty file and "
+        "sidecars yourself and boot once with --init-new (D-13)"
     ),
 }
 

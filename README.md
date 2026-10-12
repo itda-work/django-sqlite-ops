@@ -395,7 +395,7 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 |---|---|---|
 | `--db PATH` | (필수) | SQLite DB 경로. Litestream 설정의 `path` 와 같아야 한다 |
 | `--config PATH` | (필수) | Litestream 설정 파일 |
-| `--on-unknown` | `refuse` | 판정할 수 없을 때: `refuse`(거부) · `restore`(로컬을 격리하고 복원) · `keep-local`(로컬 유지, 헬스에 `unknown_at_boot`. 원격 조회 실패([D-12](docs/DECISIONS.md))와 [`empty_db`](#0바이트-db-복구-empty_db)([D-17](docs/DECISIONS.md))는 이 값이어도 거부) |
+| `--on-unknown` | `refuse` | 판정할 수 없을 때: `refuse`(거부) · `restore`(로컬을 격리하고 복원) · `keep-local`(로컬 유지, 헬스에 `unknown_at_boot`. 원격 조회 실패([D-12](docs/DECISIONS.md))와 [0바이트 DB](#0바이트-db-복구-empty_db)(메타가 있으면 `empty_db` [D-17](docs/DECISIONS.md), 없으면 `no_local_meta` [D-18](docs/DECISIONS.md))는 이 값이어도 거부) |
 | `--init-new` | 꺼짐 | 생애 첫 배포에서 새 DB 로 시작. [한 번 쓰고 끈다](#생애-첫-배포---init-new-를-한-번-쓰고-끈다) |
 | `--adopt-existing` | 꺼짐 | 기존 DB 를 처음 Litestream 에 올린다. 0바이트 파일은 도입하지 않는다([D-18](docs/DECISIONS.md)). [한 번 쓰고 끈다](#기존-db-도입---adopt-existing-을-한-번-쓰고-끈다) |
 | `--meta-path PATH` | `<db 디렉터리>/.<db 이름>-litestream` | Litestream 설정에 `meta-path` 를 바꿨다면 같은 값을 준다 |
@@ -505,7 +505,7 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 4. `--on-unknown keep-local` 도 거부된다([D-17](docs/DECISIONS.md)). 빈 DB 로 앱을 띄우면 그 상태의 쓰기가 복제돼 복제본 최신본에서 기존 데이터가 사라지기 때문이다. 빈 DB 로 다시 시작하는 별도 옵션은 없다.
 5. 이미 빈 DB 로 앱이 돌아 복제까지 됐다면 최신 복제본에는 원래 데이터가 없다. `litestream restore -txid <이전 TXID>` 로 사고 이전 시점을 따로 복원해 확인한다.
 
-**메타가 없을 때.** 메타 없는 0바이트 파일은 `empty_db` 가 아니라 `no_local_meta` 다([D-16](docs/DECISIONS.md)). 사유에 0바이트임과 남은 사이드카가 나오고, `--adopt-existing` 이 있어도 도입하지 않는다([D-18](docs/DECISIONS.md)).
+**메타가 없을 때.** 메타 없는 0바이트 파일은 `empty_db` 가 아니라 `no_local_meta` 다([D-16](docs/DECISIONS.md)). 사유에 0바이트임과 남은 사이드카가 나오고, `--adopt-existing` 이 있어도 도입하지 않으며 `--on-unknown keep-local` 도 거부한다([D-18](docs/DECISIONS.md)).
 
 ```text
 [boot] inputs: local_exists=True local_empty=True local_txid=None remote=empty
@@ -514,7 +514,6 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 
 - 복제본에 TXID 가 있으면(`remote=txid N`) `--on-unknown restore` 로 한 번 부팅한다. 빈 파일·사이드카는 `<db>.stale-<ts>/` 로 옮겨지고 복제본이 복원된다.
 - 복제본이 비었으면(`remote=empty`) 먼저 복제본 경로·prefix 가 맞는지 확인한다(빈 목록은 경로 오타와 구분되지 않는다, [D-13](docs/DECISIONS.md)). 맞다면 빈 파일·사이드카를 확인해 직접 치운 뒤 `--init-new` 로 한 번 부팅한다. 0바이트 파일이 남아 있으면 `--init-new` 도 거부된다.
-- 이 경우 `--on-unknown keep-local` 은 지금 `KEEP_LOCAL` 로 진행된다(`no_local_meta` 의 기존 동작). 빈 DB 로 앱이 뜨므로 복구 절차로 쓰지 않는다.
 
 #### 함정
 
