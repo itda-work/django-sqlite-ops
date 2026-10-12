@@ -72,6 +72,10 @@ ORPHAN_SIDECARS = "orphan_sidecars"
 _MANIFEST = "manifest.json"
 # 원자적 쓰기의 임시 파일 이름: <이름>.tmp-<rand>
 _TMP_INFIX = ".tmp-"
+# boot 가 DB 디렉터리에 만드는 디렉터리 이름: 임시 복원 <db>.restore-<ts>-<rand>/,
+# 격리 <db>.stale-<ts>.partial/ → <db>.stale-<ts>/. 이름 규칙은 여기 한 곳에 둔다(#39).
+_RESTORE_INFIX = ".restore-"
+_STALE_INFIX = ".stale-"
 _STATE_VERSION = 1
 
 
@@ -141,11 +145,61 @@ def _overlaps(a: Path, b: Path) -> bool:
     return a == b or a in b.parents or b in a.parents
 
 
-def check_no_overlap(db: Path, meta: Path) -> None:
-    """격리 대상끼리, 그리고 대상과 격리 목적지(DB 디렉터리 안의 .partial·final·임시 복원)가
-    같은 경로이거나 한쪽이 다른 쪽의 조상이면 거부한다(exit 2). 예: 메타가 DB 의 부모면 DB 를
-    옮긴 뒤 메타를 자기 안으로 옮기려다 실패하고, 재개도 같은 오류를 반복한다.
+_META_HINT = (
+    "set --meta-path to the meta-path in the litestream config: a directory of its own "
+    "(default .<db>-litestream next to the db)"
+)
+
+
+def _boot_owned_name(db: Path, name: str) -> bool:
+    """DB 디렉터리 안에서 boot 가 만드는 임시 복원·격리·상태 임시 파일의 이름이면 참."""
+    return name.startswith(
+        (
+            db.name + _RESTORE_INFIX,
+            db.name + _STALE_INFIX,
+            state_path(db).name + _TMP_INFIX,
+        )
+    )
+
+
+def meta_conflict(db: Path, meta: Path, config: Path | None = None) -> str | None:
+    """``--meta-path`` 가 boot 소유 경로와 겹치면 사유, 아니면 ``None`` (#39).
+
+    boot 소유 경로: DB 와 사이드카, 잠금 파일, 상태 파일, ``config`` (주어지면 원문과 실제 경로),
+    DB 디렉터리 안의 임시 복원·격리 디렉터리와 상태 임시 파일 이름. 같거나 한쪽이 다른 쪽의
+    조상이면 겹친다. 메타는 격리 대상이므로 이것들과 겹치면 boot 가 자기 잠금·상태·DB 를 옮긴다.
+    메타가 DB 의 조상(격리 목적지를 품음)인 경우도 여기서 걸린다. 인자 해석(exit 64)과
+    ``check_no_overlap``(exit 2)이 이 판정 하나를 쓴다.
     """
+    owned = [
+        *quarantine_roles(db, meta)[:-1],
+        ("boot lock", lock_path(db)),
+        ("boot state file", state_path(db)),
+    ]
+    if config is not None:
+        text = os.path.normpath(os.path.abspath(config))
+        owned += [("--config", Path(text)), ("--config", Path(os.path.realpath(text)))]
+    for what, path in owned:
+        if _overlaps(meta, path):
+            return f"--meta-path {meta} overlaps the {what} {path}; {_META_HINT}"
+    for p in (meta, *meta.parents):
+        if p.parent == db.parent and _boot_owned_name(db, p.name):
+            return (
+                f"--meta-path {meta} is inside boot's restore/quarantine area {p} "
+                f"({db.name}{_RESTORE_INFIX}*, {db.name}{_STALE_INFIX}*); {_META_HINT}"
+            )
+    return None
+
+
+def check_no_overlap(db: Path, meta: Path) -> None:
+    """메타가 boot 소유 경로와 겹치거나(``meta_conflict``), 격리 대상끼리, 그리고 대상과 격리
+    목적지(DB 디렉터리 안의 .partial·final·임시 복원)가 같은 경로이거나 한쪽이 다른 쪽의
+    조상이면 거부한다(exit 2). 예: 메타가 DB 의 부모면 DB 를 옮긴 뒤 메타를 자기 안으로 옮기려다
+    실패하고, 재개도 같은 오류를 반복한다. 메타가 잠금 파일이면 boot 가 자기 잠금을 옮긴다(#39).
+    """
+    conflict = meta_conflict(db, meta)
+    if conflict is not None:
+        raise _Exit(EXIT_REFUSE, f"cannot quarantine: {conflict}")
     targets = quarantine_targets(db, meta)
     for i, a in enumerate(targets):
         for b in targets[i + 1 :]:
@@ -191,7 +245,7 @@ def _timestamp() -> str:
 
 
 def _partial_re(db: Path) -> re.Pattern[str]:
-    return re.compile(re.escape(db.name) + r"\.stale-([0-9T.Z]+)\.partial")
+    return re.compile(re.escape(db.name + _STALE_INFIX) + r"([0-9T.Z]+)\.partial")
 
 
 # --- 내구화 -------------------------------------------------------------------------------
@@ -300,6 +354,31 @@ def _reserved(name: str) -> bool:
     return name == _MANIFEST or name.startswith(_MANIFEST + _TMP_INFIX)
 
 
+def check_meta_kind(meta: Path) -> None:
+    """있는 메타 경로가 디렉터리인지 ``os.stat``(링크를 따라감)으로 본다. 아니면 exit 2 (#39).
+
+    없으면 통과한다(새 볼륨). 디렉터리를 가리키는 링크도 통과한다(조회 규약, DESIGN §4-3; 격리
+    시 링크 거부는 ``check_quarantinable`` 이 따로 한다). 끊어진 링크·stat 실패는 무엇인지
+    판정할 수 없으므로 거부한다.
+    """
+    try:
+        st = os.stat(meta)
+    except FileNotFoundError:
+        if os.path.lexists(meta):
+            raise _Exit(
+                EXIT_REFUSE, f"--meta-path {meta} is a broken symbolic link; {_META_HINT}"
+            ) from None
+        return
+    except OSError as exc:
+        raise _Exit(EXIT_REFUSE, f"cannot stat --meta-path {meta}: {exc}") from None
+    if not stat.S_ISDIR(st.st_mode):
+        raise _Exit(
+            EXIT_REFUSE,
+            f"--meta-path {meta} exists but is not a directory; boot does not quarantine it; "
+            f"{_META_HINT}",
+        )
+
+
 def check_quarantinable(db: Path, meta: Path) -> None:
     """격리를 시작하기 전에(복원보다도 먼저) 옮길 수 있는지 본다. 아니면 exit 2.
 
@@ -308,9 +387,11 @@ def check_quarantinable(db: Path, meta: Path) -> None:
       (판정·PROCEED·KEEP_LOCAL 에서 메타 디렉터리 링크를 따라가는 조회 규약과는 별개다.)
     - 대상 이름이 서로 겹치거나 격리 디렉터리의 예약 이름(manifest)과 겹치면 거부한다.
     - rename 은 같은 파일시스템 안에서만 원자적이다. 다른 파일시스템이면 거부한다.
+    - 메타가 있는데 디렉터리가 아니면 거부한다. 정규 파일·FIFO 를 메타로 격리하지 않는다(#39).
     """
     db, meta = _real_pair(db, meta)
     check_no_overlap(db, meta)
+    check_meta_kind(meta)
     names = [p.name for _, p in quarantine_roles(db, meta)]
     if len(set(names)) != len(names):
         raise _Exit(EXIT_REFUSE, f"cannot quarantine: duplicate target names {names}")
@@ -370,8 +451,8 @@ def quarantine(db: Path, meta: Path) -> Path | None:
         return None
     while True:
         ts = _timestamp()
-        partial = db.with_name(f"{db.name}.stale-{ts}.partial")
-        final = db.with_name(f"{db.name}.stale-{ts}")
+        partial = db.with_name(f"{db.name}{_STALE_INFIX}{ts}.partial")
+        final = db.with_name(f"{db.name}{_STALE_INFIX}{ts}")
         if os.path.lexists(final):
             continue
         try:
@@ -448,6 +529,7 @@ def resume_quarantine(db: Path, meta: Path) -> None:
     전체를 먼저 검증하고, 하나라도 어긋나면 아무것도 옮기지 않고 exit 2 다. 둘 이상이면 거부.
     """
     db, meta = _real_pair(db, meta)
+    check_no_overlap(db, meta)
     pattern = _partial_re(db)
     try:
         found = sorted(n for n in os.listdir(db.parent) if pattern.fullmatch(n))
@@ -463,7 +545,6 @@ def resume_quarantine(db: Path, meta: Path) -> None:
         )
     partial = db.parent / found[0]
     final = db.with_name(found[0].removesuffix(".partial"))
-    check_no_overlap(db, meta)
     if not stat.S_ISDIR(os.lstat(partial).st_mode):
         raise _refuse_resume(partial, "it is not a directory (or is a symlink)")
     contents = set(os.listdir(partial))
@@ -535,7 +616,7 @@ def restore_to_temp(db: Path, args: argparse.Namespace) -> tuple[Path, int]:
 
     실패한 임시 디렉터리는 조사용으로 남긴다. 다음 부팅은 이 디렉터리를 판정에 쓰지 않는다.
     """
-    tmpdir = db.with_name(f"{db.name}.restore-{_timestamp()}-{secrets.token_hex(4)}")
+    tmpdir = db.with_name(f"{db.name}{_RESTORE_INFIX}{_timestamp()}-{secrets.token_hex(4)}")
     try:
         os.mkdir(tmpdir, 0o755)
     except OSError as exc:
@@ -689,6 +770,10 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
         args.meta_path = real_path(meta)
     except ValueError as exc:
         parser.error(str(exc))
+    # 잠금 파일을 만들기 전에 거부한다. 메타가 잠금 파일이면 격리가 boot 의 잠금을 옮긴다(#39).
+    conflict = meta_conflict(args.db, args.meta_path, args.config)
+    if conflict is not None:
+        parser.error(conflict)
     return args, command
 
 
@@ -848,6 +933,8 @@ def run(args: argparse.Namespace, command: list[str]) -> int:
 def _run_locked(args: argparse.Namespace, command: list[str], lock_fd: int) -> int:
     db = args.db
     log(f"lock: {lock_path(db)}")
+    # 재개·판정보다 먼저. 정규 파일·FIFO 메타를 판정 입력이나 격리 대상으로 쓰지 않는다(#39).
+    check_meta_kind(args.meta_path)
     try:
         resume_quarantine(db, args.meta_path)
     except OSError as exc:
