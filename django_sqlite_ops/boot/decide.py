@@ -238,7 +238,7 @@ def _classify(inp: _Inputs) -> tuple[State, ReasonCode, str]:
         )
     # 0바이트 DB 에 메타 TXID 가 남았으면 TXID 비교는 의미가 없다(#38, D-16).
     # 원격 실패보다 먼저 본다(조치 표가 원격 실패면 어차피 거부한다, D-12).
-    # 메타 없는 0바이트는 아래 규칙(no_local_meta·adopt_existing) 그대로다.
+    # 메타 없는 0바이트는 아래 no_local_meta 로 간다. adopt 하지 않는다(#44, D-18).
     if inp.local_empty and local_txid is not None:
         return (
             State.UNKNOWN,
@@ -270,11 +270,18 @@ def _classify(inp: _Inputs) -> tuple[State, ReasonCode, str]:
         )
 
     if local_txid is None:
-        if inp.adopt_existing and remote.kind is _Kind.EMPTY:
+        # D-18: 0바이트 파일은 도입할 데이터가 없다. 도입하면 빈 DB 가 첫 세대가 된다.
+        if inp.adopt_existing and remote.kind is _Kind.EMPTY and not inp.local_empty:
             return (
                 State.ADOPT,
                 ReasonCode.ADOPT_EXISTING,
                 "local db exists without meta and remote is empty; adopting existing db",
+            )
+        if inp.local_empty:
+            return (
+                State.UNKNOWN,
+                ReasonCode.NO_LOCAL_META,
+                f"local db is 0 bytes and local meta is missing; remote {remote.text}",
             )
         return (
             State.UNKNOWN,

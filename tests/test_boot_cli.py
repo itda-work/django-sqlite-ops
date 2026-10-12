@@ -1333,15 +1333,83 @@ def test_empty_db_with_meta_keep_local_refuses(lab, fake, no_exec, capsys, remot
     assert not no_exec[0]
 
 
-def test_empty_db_without_meta_keeps_existing_rules(lab, fake, no_exec, capsys):
-    # 메타 없는 0바이트는 D-16 범위 밖이다. no_local_meta / adopt_existing 그대로.
-    (lab / "app.db").touch()
-    fake.remote_txid(0x19)
-    assert main_inproc(boot_args(lab, fake), no_exec) == cli.EXIT_REFUSE
-    assert "reason_code=no_local_meta" in capsys.readouterr().err
+# --- 0바이트 DB + 메타 없음 (#44, D-18) ---
+
+
+def test_empty_db_without_meta_adopt_existing_refuses(lab, fake, no_exec, capsys):
+    # D-18: --adopt-existing 은 0바이트 파일을 도입하지 않는다.
+    db = lab / "app.db"
+    db.touch()
     fake.remote_txid(None)
-    assert main_inproc(boot_args(lab, fake, "--adopt-existing"), no_exec) == "exec"
-    assert state(lab)["state"] == "adopt"
+    before = snapshot(lab)
+    assert main_inproc(boot_args(lab, fake, "--adopt-existing"), no_exec) == cli.EXIT_REFUSE
+    err = capsys.readouterr().err
+    assert "local_empty=True" in err
+    assert "state=unknown action=refuse reason_code=no_local_meta" in err
+    assert "local db is 0 bytes and local meta is missing; remote empty" in err
+    assert "hint:" in err and "--init-new" in err and "D-18" in err
+    assert "use --adopt-existing once" not in err
+    assert "turn off --adopt-existing" not in err
+    assert snapshot(lab, skip=("app.db.boot.lock",)) == before
+    assert db.stat().st_size == 0
+    assert not cli.state_path(db).exists()
+    assert "restore" not in fake.calls()
+    assert not no_exec[0]
+
+
+def test_empty_db_without_meta_remote_txid_hints_restore(lab, fake, no_exec, capsys):
+    db = lab / "app.db"
+    db.touch()
+    fake.remote_txid(0x19)
+    for flags in ((), ("--adopt-existing",)):
+        assert main_inproc(boot_args(lab, fake, *flags), no_exec) == cli.EXIT_REFUSE
+        err = capsys.readouterr().err
+        assert "reason_code=no_local_meta" in err
+        assert "local db is 0 bytes and local meta is missing; remote txid 25" in err
+        assert "hint:" in err and "--on-unknown restore" in err
+        assert "use --adopt-existing once" not in err
+    assert db.stat().st_size == 0
+    assert not cli.state_path(db).exists()
+    assert not no_exec[0]
+
+
+def test_empty_db_without_meta_names_sidecars(lab, fake, no_exec, capsys):
+    db = lab / "app.db"
+    db.touch()
+    (lab / "app.db-wal").write_bytes(b"wal")
+    fake.remote_txid(None)
+    assert main_inproc(boot_args(lab, fake, "--adopt-existing"), no_exec) == cli.EXIT_REFUSE
+    err = capsys.readouterr().err
+    assert "reason_code=no_local_meta" in err
+    assert "local db is 0 bytes (-wal present) and local meta is missing" in err
+    assert "orphan_sidecars" not in err
+
+
+def test_empty_db_without_meta_restore_policy_quarantines_and_restores(lab, fake, no_exec):
+    db = lab / "app.db"
+    db.touch()
+    fake.remote_txid(0x19)
+    assert main_inproc(boot_args(lab, fake, "--on-unknown", "restore"), no_exec) == "exec"
+    assert count_rows(db) == 7
+    (final,) = stale_dirs(lab)
+    assert (final / "app.db").stat().st_size == 0
+    s = state(lab)
+    assert (s["state"], s["action"], s["reason_code"]) == (
+        "unknown",
+        "quarantine_and_restore",
+        "no_local_meta",
+    )
+
+
+def test_non_empty_db_without_meta_hint_is_unchanged(lab, fake, no_exec, capsys):
+    # 비어 있지 않은 DB 의 no_local_meta 힌트는 D-14 restore / D-11 adopt 안내 그대로다.
+    make_db(lab / "app.db", 2)
+    fake.remote_txid(None)
+    assert main_inproc(boot_args(lab, fake), no_exec) == cli.EXIT_REFUSE
+    err = capsys.readouterr().err
+    assert "local db exists but local meta is missing; remote empty" in err
+    assert "use --adopt-existing once (D-11)" in err
+    assert "0 bytes" not in err
 
 
 def test_local_db_size_input(lab):
@@ -1798,6 +1866,28 @@ def test_first_deploy_needs_init_new(litestream_binary, tmp_path):
     assert read_marker(data) is not None
     assert not db.exists()
     assert "turn off --init-new" in result.stderr
+
+
+def test_empty_db_without_meta_adopt_existing_refuses_on_empty_replica(litestream_binary, tmp_path):
+    # #44, D-18: 빈 복제본 + 메타 없는 0바이트 + --adopt-existing 은 도입하지 않고 거부한다.
+    root = tmp_path.resolve()
+    data = root / "data"
+    data.mkdir()
+    replica = root / "replica"
+    db = data / "app.db"
+    db.touch()
+    config = write_config(root, db, f"      type: file\n      path: {replica}\n")
+    before_data = snapshot(data)
+    result = run_boot(real_args(db, config, "--adopt-existing", cmd=marker_command(data, db)))
+    assert result.returncode == 2, result.stderr
+    assert "reason_code=no_local_meta" in result.stderr
+    assert "0 bytes" in result.stderr
+    assert "--init-new" in result.stderr and "D-18" in result.stderr
+    assert read_marker(data) is None
+    assert not replica.exists() or not any(replica.rglob("*"))
+    assert snapshot(data, skip=("app.db.boot.lock",)) == before_data
+    assert db.stat().st_size == 0
+    assert not cli.state_path(db).exists()
 
 
 def test_lock_held_by_execd_command_blocks_second_boot(real):

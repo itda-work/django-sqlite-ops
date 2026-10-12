@@ -397,7 +397,7 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 | `--config PATH` | (필수) | Litestream 설정 파일 |
 | `--on-unknown` | `refuse` | 판정할 수 없을 때: `refuse`(거부) · `restore`(로컬을 격리하고 복원) · `keep-local`(로컬 유지, 헬스에 `unknown_at_boot`. 원격 조회 실패([D-12](docs/DECISIONS.md))와 [`empty_db`](#0바이트-db-복구-empty_db)([D-17](docs/DECISIONS.md))는 이 값이어도 거부) |
 | `--init-new` | 꺼짐 | 생애 첫 배포에서 새 DB 로 시작. [한 번 쓰고 끈다](#생애-첫-배포---init-new-를-한-번-쓰고-끈다) |
-| `--adopt-existing` | 꺼짐 | 기존 DB 를 처음 Litestream 에 올린다. [한 번 쓰고 끈다](#기존-db-도입---adopt-existing-을-한-번-쓰고-끈다) |
+| `--adopt-existing` | 꺼짐 | 기존 DB 를 처음 Litestream 에 올린다. 0바이트 파일은 도입하지 않는다([D-18](docs/DECISIONS.md)). [한 번 쓰고 끈다](#기존-db-도입---adopt-existing-을-한-번-쓰고-끈다) |
 | `--meta-path PATH` | `<db 디렉터리>/.<db 이름>-litestream` | Litestream 설정에 `meta-path` 를 바꿨다면 같은 값을 준다 |
 | `--litestream BIN` | `litestream` | 실행 파일 |
 | `--ltx-timeout S` | `30` | 원격 TXID 조회 제한 시간(초). 넘으면 거부한다 |
@@ -462,6 +462,8 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 
 이미 운영 중인 DB 를 처음 Litestream 에 올리면 로컬 메타가 없고 복제본은 비어 있다. 이때만 `--adopt-existing` 을 붙인다. 정확히 (로컬 DB 있음, 로컬 메타 없음, 원격 빈 목록) 일 때만 통과시키고 다른 조합에는 효과가 없다. 첫 복제가 끝나면 지운다([D-11](docs/DECISIONS.md)). `--on-unknown keep-local` 을 도입 절차로 쓰지 않는다.
 
+DB 파일이 0바이트면 도입할 데이터가 없으므로 `--adopt-existing` 이 있어도 `no_local_meta` 로 거부한다([D-18](docs/DECISIONS.md)). 도입하면 빈 DB 가 복제본의 첫 세대가 되고, 복제본 경로가 틀려 진짜 복제본이 다른 곳에 있을 때도 구분할 수 없다. 대처는 아래 '0바이트 DB 복구'의 '메타가 없을 때'를 따른다.
+
 #### 거부됐을 때 (exit 2): 사유 코드별 대처
 
 로그의 `decision: ... reason_code=...` 와 그 아래 `hint:` 줄을 본다.
@@ -471,7 +473,7 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 | `no_replica_no_local` | 볼륨도 복제본도 비었다 | 첫 배포면 `--init-new` 를 한 번. 아니면 설정의 복제본 경로·prefix 를 확인한다 |
 | `remote_error` | 복제본 조회 실패·타임아웃 | 네트워크·자격 증명·endpoint(평문 HTTP 면 `http://` 를 붙인다)를 고친다. 이 경우는 `--on-unknown` 과 무관하게 거부한다([D-12](docs/DECISIONS.md)) |
 | `remote_ahead` | 복제본이 이 볼륨보다 새롭다(옛 볼륨으로 재부팅) | 복제본이 정본이면 `--on-unknown restore` 로 한 번 부팅한다. 로컬은 `<db>.stale-<ts>/` 에 남는다 |
-| `no_local_meta` | DB 는 있는데 Litestream 메타가 없다 | 아래 '복원 직후 크래시 복구'. 기존 DB 를 처음 올리는 중이고 복제본이 비었으면 `--adopt-existing` |
+| `no_local_meta` | DB 는 있는데 Litestream 메타가 없다 | 아래 '복원 직후 크래시 복구'. 기존 DB 를 처음 올리는 중이고 복제본이 비었으면 `--adopt-existing`. 사유에 `local db is 0 bytes` 가 있으면 아래 '0바이트 DB 복구'의 '메타가 없을 때'([D-18](docs/DECISIONS.md)) |
 | `stale_meta` | DB 없이 메타만 남았다 | `--on-unknown restore` 로 메타를 격리하고 복원한다 |
 | `empty_db` | DB 파일이 0바이트인데 메타는 복제된 적이 있다고 말한다 | 아래 '0바이트 DB 복구'. 기존 파일이 정말 비었는지 확인하고 `--on-unknown restore` 로 한 번 부팅한다. `keep-local` 도 거부된다([D-17](docs/DECISIONS.md)) |
 | `remote_empty` | 복제한 적 있는 DB 인데 복제본이 비었다 | 복제본 경로·prefix·버킷을 확인한다. 로컬을 그대로 쓰려면 `--on-unknown keep-local` |
@@ -503,7 +505,16 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 4. `--on-unknown keep-local` 도 거부된다([D-17](docs/DECISIONS.md)). 빈 DB 로 앱을 띄우면 그 상태의 쓰기가 복제돼 복제본 최신본에서 기존 데이터가 사라지기 때문이다. 빈 DB 로 다시 시작하는 별도 옵션은 없다.
 5. 이미 빈 DB 로 앱이 돌아 복제까지 됐다면 최신 복제본에는 원래 데이터가 없다. `litestream restore -txid <이전 TXID>` 로 사고 이전 시점을 따로 복원해 확인한다.
 
-메타가 없는 0바이트 파일은 이 규칙 밖이다. 지금처럼 `no_local_meta`(복제본이 비었고 `--adopt-existing` 이면 `adopt`)로 판정된다([D-16](docs/DECISIONS.md)).
+**메타가 없을 때.** 메타 없는 0바이트 파일은 `empty_db` 가 아니라 `no_local_meta` 다([D-16](docs/DECISIONS.md)). 사유에 0바이트임과 남은 사이드카가 나오고, `--adopt-existing` 이 있어도 도입하지 않는다([D-18](docs/DECISIONS.md)).
+
+```text
+[boot] inputs: local_exists=True local_empty=True local_txid=None remote=empty
+[boot] decision: state=unknown action=refuse reason_code=no_local_meta reason=local db is 0 bytes and local meta is missing; remote empty
+```
+
+- 복제본에 TXID 가 있으면(`remote=txid N`) `--on-unknown restore` 로 한 번 부팅한다. 빈 파일·사이드카는 `<db>.stale-<ts>/` 로 옮겨지고 복제본이 복원된다.
+- 복제본이 비었으면(`remote=empty`) 먼저 복제본 경로·prefix 가 맞는지 확인한다(빈 목록은 경로 오타와 구분되지 않는다, [D-13](docs/DECISIONS.md)). 맞다면 빈 파일·사이드카를 확인해 직접 치운 뒤 `--init-new` 로 한 번 부팅한다. 0바이트 파일이 남아 있으면 `--init-new` 도 거부된다.
+- 이 경우 `--on-unknown keep-local` 은 지금 `KEEP_LOCAL` 로 진행된다(`no_local_meta` 의 기존 동작). 빈 DB 로 앱이 뜨므로 복구 절차로 쓰지 않는다.
 
 #### 함정
 

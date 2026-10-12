@@ -30,7 +30,16 @@ from pathlib import Path
 from urllib.parse import quote
 
 from . import litestream as ls
-from .decide import Action, OnUnknown, ReasonCode, RemoteError, RemoteTxid, State, decide
+from .decide import (
+    Action,
+    OnUnknown,
+    ReasonCode,
+    RemoteEmpty,
+    RemoteError,
+    RemoteTxid,
+    State,
+    decide,
+)
 
 try:
     import fcntl
@@ -692,6 +701,8 @@ class _Plan:
     action: str
     reason_code: str
     reason: str
+    # 사유 코드의 기본 힌트 대신 쓸 힌트. 같은 사유 코드라도 입력에 따라 안내가 다를 때만 쓴다.
+    hint: str | None = None
 
 
 _HINTS = {
@@ -734,6 +745,22 @@ _HINTS = {
     ),
 }
 
+# 0바이트 + 메타 없음(no_local_meta)의 힌트. 원격 결과로 고른다(#44, D-18).
+# 원격 조회 실패는 remote_error 로 먼저 가므로 여기 오지 않는다.
+_EMPTY_NO_META_HINTS = {
+    RemoteTxid: (
+        "the db file is 0 bytes and has no litestream meta; check that the file is really "
+        "empty, then rerun with --on-unknown restore to quarantine the empty file and sidecars "
+        "and restore from the replica"
+    ),
+    RemoteEmpty: (
+        "the db file is 0 bytes and has no litestream meta, and the replica is empty; "
+        "--adopt-existing does not adopt a 0-byte file (D-18); check the replica path/prefix, "
+        "then inspect and remove the empty file and sidecars yourself and boot once with "
+        "--init-new (D-13)"
+    ),
+}
+
 
 def _plan(args: argparse.Namespace) -> _Plan:
     db, meta = args.db, args.meta_path
@@ -770,17 +797,21 @@ def _plan(args: argparse.Namespace) -> _Plan:
         init_new=args.init_new,
     )
     reason = d.reason
-    if d.reason_code is ReasonCode.EMPTY_DB and orphans:
+    empty_reason = d.reason_code in (ReasonCode.EMPTY_DB, ReasonCode.NO_LOCAL_META)
+    if local_empty and empty_reason and orphans:
         # 0바이트 DB 옆에 남은 사이드카는 격리 대상이다. 무엇이 있는지 사유에 남긴다.
         present = ", ".join(name.removeprefix(db.name) for name in orphans)
         reason = reason.replace("0 bytes", f"0 bytes ({present} present)", 1)
-    return _Plan(d.state, d.action, d.reason_code, reason)
+    hint = None
+    if local_empty and d.reason_code is ReasonCode.NO_LOCAL_META:
+        hint = _EMPTY_NO_META_HINTS.get(type(remote))
+    return _Plan(d.state, d.action, d.reason_code, reason, hint)
 
 
 def _act(args: argparse.Namespace, plan: _Plan) -> None:
     db, meta = args.db, args.meta_path
     if plan.action == Action.REFUSE:
-        hint = _HINTS.get(plan.reason_code)
+        hint = plan.hint or _HINTS.get(plan.reason_code)
         if hint:
             log(f"hint: {hint}")
         raise _Exit(EXIT_REFUSE, f"refused ({plan.reason_code}): {plan.reason}")
