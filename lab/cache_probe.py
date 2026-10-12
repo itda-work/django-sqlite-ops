@@ -6,7 +6,8 @@
     python lab/cache_probe.py --db-dir <새 디렉터리> --out <결과.jsonl> [--quick]
 
 - 조건: DB 크기(``small`` 행 100,000 / ``large`` 64 MiB 를 넘는 행 수) × 스레드(1, 16) × 연결
-  패턴(``perconn`` 요청마다 열고 닫기 / ``reuse`` 스레드마다 한 연결).
+  패턴(``perconn`` 요청마다 열고 닫기 / ``perconn10`` 연결 하나에서 요청 10개 뒤 닫기(Django 요청
+  하나가 쿼리 여러 개를 내는 경우, 리뷰 1) / ``reuse`` 스레드마다 한 연결).
 - 조건마다 템플릿 DB 를 새 하위 디렉터리로 복사하고, 버리는 워밍업 칸 하나 뒤에 블록 ``--blocks``
   개를 돈다. 블록마다 변형 순서를 무작위로 섞는다(블록 번호로 시드 고정). 칸 하나는 ``--cell``
   초 동안 닫힌 루프로 요청을 낸다.
@@ -16,6 +17,9 @@
 - 조건 내내 baseline PRAGMA 로 연 연결 하나(holder)를 열어 둔다(랩의 Litestream 대역). 없으면
   단일 스레드 ``perconn`` 의 close 가 매번 마지막 연결 닫기가 되어 체크포인트·``-wal`` 삭제가
   끼어든다(``--no-holder`` 로 끈다).
+- 처리량(``ops``)은 요청(쿼리) 수로 센다. 지연은 ``perconn``·``perconn10`` 에서는 연결 한 바퀴,
+  ``reuse`` 에서는 요청 하나다. SQLite 오류(busy 등)는 ``errors`` 에 세고 계속하고, 그 밖의 워커
+  예외는 칸을 실패로 올려 실행을 멈춘다(리뷰 1).
 - 출력은 JSON 한 줄씩: ``meta`` 한 줄, 칸마다 ``cell``. 집계·판정은 ``_cachestat.py``,
   표는 ``cache_report.py`` 가 만든다.
 
@@ -63,7 +67,10 @@ VARIANTS = {
 }
 SIZES = {"small": 100_000, "large": 400_000}  # large: 약 100 MiB(> 64 MiB 캐시), meta 에 실제 크기
 THREADS = (1, 16)
-MODES = ("perconn", "reuse")
+MODES = ("perconn", "perconn10", "reuse")
+# 연결 하나에서 처리하는 요청(쿼리) 수. perconn10 은 Django 요청 하나가 쿼리 여러 개를 내는 경우
+# (#27 리뷰 1 반례). 여기 없는 모드(reuse)는 스레드마다 연결 하나를 칸 내내 쓴다.
+PER_CONN = {"perconn": 1, "perconn10": 10}
 READ_SHARE, SORT_SHARE = 0.7, 0.1  # 나머지 0.2 는 1행 쓰기
 BODY = "x" * 200
 PHASES = ("open", "pragma", "query", "close")
@@ -223,45 +230,76 @@ def request(conn: sqlite3.Connection, rng: random.Random, max_id: int) -> str:
 # --- 칸 하나 --------------------------------------------------------------------------------
 
 
-def _worker(path, variant, mode, clock, seed_, max_id, barrier, out):
+def _worker(path, variant, mode, clock, seed_, max_id, barrier, out, failures):
+    """칸 하나의 워커. SQLite 오류(busy 등)는 세고 계속한다. 그 밖의 예외는 ``failures`` 에 넣고
+    barrier 를 깨서 다른 워커가 기다리지 않게 한다(``run_cell`` 이 칸을 실패로 올린다, #27 리뷰 1).
+    """
     rng = random.Random(seed_)
     lat: list[float] = []
     phases = {p: [] for p in PHASES}
     kinds = {"read": 0, "sort": 0, "write": 0}
     errors: dict[str, int] = {}
+
+    def count(e):
+        key = type(e).__name__ + ": " + str(e)[:60]
+        errors[key] = errors.get(key, 0) + 1
+
     conn = None
-    if mode == "reuse":
-        conn, _, _ = connect(path, variant)
-    barrier.wait()  # 모든 워커가 준비되면 barrier 의 action 이 출발·마감 시각을 정한다
-    deadline = clock["deadline"]
+    per_conn = PER_CONN.get(mode)
     try:
+        if per_conn is None:
+            conn, _, _ = connect(path, variant)
+        barrier.wait()  # 모든 워커가 준비되면 barrier 의 action 이 출발·마감 시각을 정한다
+        deadline = clock["deadline"]
         while time.perf_counter() < deadline:
             t0 = time.perf_counter()
+            if per_conn is None:
+                try:
+                    kinds[request(conn, rng, max_id)] += 1
+                except sqlite3.Error as e:
+                    count(e)
+                    continue
+                lat.append(time.perf_counter() - t0)
+                continue
+            # 연결 하나 = 요청(쿼리) per_conn 개. 지연은 연결 한 바퀴(open → 쿼리들 → close).
             try:
-                if mode == "perconn":
-                    c, t_open, t_pragma = connect(path, variant)
-                    t1 = time.perf_counter()
+                c, t_open, t_pragma = connect(path, variant)
+            except sqlite3.Error as e:
+                count(e)
+                continue
+            t1 = time.perf_counter()
+            try:
+                for _ in range(per_conn):
                     try:
                         kinds[request(c, rng, max_id)] += 1
-                        t2 = time.perf_counter()
-                    finally:
-                        c.close()
-                    t3 = time.perf_counter()
-                    phases["open"].append(t_open)
-                    phases["pragma"].append(t_pragma)
-                    phases["query"].append(t2 - t1)
-                    phases["close"].append(t3 - t2)
-                else:
-                    kinds[request(conn, rng, max_id)] += 1
-            except sqlite3.Error as e:
-                key = type(e).__name__ + ": " + str(e)[:60]
-                errors[key] = errors.get(key, 0) + 1
-                continue
-            lat.append(time.perf_counter() - t0)
+                    except sqlite3.Error as e:
+                        count(e)
+                t2 = time.perf_counter()
+            finally:
+                c.close()
+            t3 = time.perf_counter()
+            phases["open"].append(t_open)
+            phases["pragma"].append(t_pragma)
+            phases["query"].append(t2 - t1)
+            phases["close"].append(t3 - t2)
+            lat.append(t3 - t0)
+        out.append({"lat": lat, "phases": phases, "kinds": kinds, "errors": errors})
+    except BaseException as e:
+        failures.append(e)
+        barrier.abort()
     finally:
         if conn is not None:
             conn.close()
-    out.append({"lat": lat, "phases": phases, "kinds": kinds, "errors": errors})
+
+
+def raise_worker_failures(failures: list[BaseException]) -> None:
+    """워커 예외가 있으면 칸을 실패로 올린다. barrier 가 깨져 따라 실패한 것보다 원인을 앞세운다."""
+    if not failures:
+        return
+    causes = [e for e in failures if not isinstance(e, threading.BrokenBarrierError)] or failures
+    raise RuntimeError(
+        f"{len(failures)} worker(s) failed: {type(causes[0]).__name__}: {causes[0]}"
+    ) from causes[0]
 
 
 def quantile(sorted_values: list[float], q: float) -> float | None:
@@ -287,10 +325,11 @@ def run_cell(path: Path, variant: str, mode: str, threads: int, seconds: float, 
 
     barrier = threading.Barrier(threads, action=go)
     out: list[dict] = []
+    failures: list[BaseException] = []
     ts = [
         threading.Thread(
             target=_worker,
-            args=(path, variant, mode, clock, seed_ * 1000 + i, max_id, barrier, out),
+            args=(path, variant, mode, clock, seed_ * 1000 + i, max_id, barrier, out, failures),
         )
         for i in range(threads)
     ]
@@ -298,6 +337,7 @@ def run_cell(path: Path, variant: str, mode: str, threads: int, seconds: float, 
         t.start()
     for t in ts:
         t.join()
+    raise_worker_failures(failures)
     wall = time.perf_counter() - clock["start"]
     lat = sorted(v for o in out for v in o["lat"])
     phases = {p: sorted(v for o in out for v in o["phases"][p]) for p in PHASES}
@@ -306,10 +346,11 @@ def run_cell(path: Path, variant: str, mode: str, threads: int, seconds: float, 
     for o in out:
         for k, v in o["errors"].items():
             errors[k] = errors.get(k, 0) + v
+    ops = sum(kinds.values())
     return {
-        "ops": len(lat),
+        "ops": ops,
         "wall_s": wall,
-        "ops_per_s": len(lat) / wall,
+        "ops_per_s": ops / wall,
         "p50_us": _us(quantile(lat, 0.5)),
         "p99_us": _us(quantile(lat, 0.99)),
         "mean_us": _us(sum(lat) / len(lat)) if lat else None,

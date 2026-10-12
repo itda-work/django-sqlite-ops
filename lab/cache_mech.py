@@ -4,6 +4,8 @@
 
 - H1(연결당 많이 읽는 요청): ``perconn``(요청마다 열고 닫기) × 요청 종류(``read`` pk 1행 /
   ``sort`` 인덱스 없는 정렬, 약 2,000 페이지) × 스레드(1, 16).
+- H3(리뷰 1 반례, 한 연결에서 쿼리 여러 개): ``perconn`` × (``sort10same`` 같은 구간 정렬 10회 /
+  ``sort10diff`` 다른 구간 10회) × 스레드(1, 16).
 - H2(WAL 변경이 재사용 연결의 캐시를 비움): ``reuse`` 16 스레드 × (``sort`` 쓰기 없음 /
   ``sortwrite`` 정렬 80%·1행 쓰기 20%).
 - 설정: ``cache_size`` (기본 -2000 / -8192 / -65536) × ``mmap_size`` (0 / 256 MiB).
@@ -12,6 +14,7 @@
   fault(``getrusage``, 프로세스 전체), Linux 에서는 ``sqlite3_status`` 의 MEMORY_USED·
   PAGECACHE_OVERFLOW(pcache 가 malloc 으로 받은 바이트)·MALLOC_COUNT 최고치를 남긴다.
 
+워커 예외는 칸을 실패로 올리고 실행을 멈춘다(``cache_probe.raise_worker_failures``).
 출력 형식은 ``cache_probe.py`` 와 같아서(``meta``·``warmup``·``cell``·``end``, 조건 =
 ``size``·``threads``·``mode``) ``cache_report.py`` 로 표를 만든다. 기본 ``pytest``·CI 에서
 돌지 않는다.
@@ -50,6 +53,10 @@ CONDITIONS = (
     ("perconn", "sort", 1),
     ("perconn", "read", 16),
     ("perconn", "sort", 16),
+    ("perconn", "sort10same", 1),
+    ("perconn", "sort10diff", 1),
+    ("perconn", "sort10same", 16),
+    ("perconn", "sort10diff", 16),
     ("reuse", "sort", 16),
     ("reuse", "sortwrite", 16),
 )
@@ -69,7 +76,11 @@ def open_conn(path: Path, config: str) -> sqlite3.Connection:
     return conn
 
 
-def one(conn: sqlite3.Connection, kind: str, rng: random.Random, max_id: int) -> None:
+# 연결 하나에서 내는 쿼리 수(perconn). 리뷰 1 반례: 한 연결에서 정렬 여러 번.
+QUERIES_PER_CONN = {"sort10same": 10, "sort10diff": 10}
+
+
+def one(conn: sqlite3.Connection, kind: str, rng: random.Random, max_id: int, lo=None) -> None:
     if kind == "read":
         conn.execute(cp.SQL_READ, (rng.randrange(1, max_id + 1),)).fetchall()
         return
@@ -78,7 +89,8 @@ def one(conn: sqlite3.Connection, kind: str, rng: random.Random, max_id: int) ->
         conn.execute(cp.SQL_WRITE, (cp.BODY, rng.randrange(1_000_000), "2026-10-12")).fetchall()
         conn.execute("COMMIT")
         return
-    lo = rng.randrange(1_000_000)
+    if lo is None:
+        lo = rng.randrange(1_000_000)
     conn.execute(cp.SQL_SORT, (lo, lo + 20_000)).fetchall()
 
 
@@ -93,31 +105,47 @@ def status(reset: bool) -> dict | None:
     return out
 
 
-def worker(path, config, mode, kind, clock, seed_, max_id, barrier, out):
+def worker(path, config, mode, kind, clock, seed_, max_id, barrier, out, failures):
+    """어떤 예외든 ``failures`` 에 넣고 barrier 를 깬다. ``run_cell`` 이 칸을 실패로 올린다(리뷰 1).
+
+    ``perconn`` 은 연결 하나에 쿼리 ``QUERIES_PER_CONN[kind]``(기본 1)개. ``sort10same`` 은 같은
+    구간을 10번, ``sort10diff`` 는 매번 다른 구간을 정렬한다.
+    """
     rng = random.Random(seed_)
-    q, cl, n = 0.0, 0.0, 0
-    conn = open_conn(path, config) if mode == "reuse" else None
-    barrier.wait()
-    deadline = clock["deadline"]
+    q, cl, n, nc = 0.0, 0.0, 0, 0
+    per_conn = QUERIES_PER_CONN.get(kind, 1)
+    conn = None
     try:
+        if mode == "reuse":
+            conn = open_conn(path, config)
+        barrier.wait()
+        deadline = clock["deadline"]
         while time.perf_counter() < deadline:
             if mode == "perconn":
                 c = open_conn(path, config)
-                t1 = time.perf_counter()
-                one(c, kind, rng, max_id)
-                t2 = time.perf_counter()
-                c.close()
+                try:
+                    same = rng.randrange(1_000_000) if kind == "sort10same" else None
+                    t1 = time.perf_counter()
+                    for _ in range(per_conn):
+                        one(c, kind, rng, max_id, lo=same)
+                    t2 = time.perf_counter()
+                finally:
+                    c.close()
                 cl += time.perf_counter() - t2
+                nc += 1
             else:
                 t1 = time.perf_counter()
                 one(conn, kind, rng, max_id)
                 t2 = time.perf_counter()
             q += t2 - t1
-            n += 1
+            n += per_conn if mode == "perconn" else 1
+        out.append((n, q, cl, nc))
+    except BaseException as e:
+        failures.append(e)
+        barrier.abort()
     finally:
         if conn is not None:
             conn.close()
-    out.append((n, q, cl))
 
 
 def run_cell(path, config, mode, kind, threads, seconds, seed_):
@@ -134,10 +162,22 @@ def run_cell(path, config, mode, kind, threads, seconds, seed_):
 
     barrier = threading.Barrier(threads, action=go)
     out: list = []
+    failures: list[BaseException] = []
     ts = [
         threading.Thread(
             target=worker,
-            args=(path, config, mode, kind, clock, seed_ * 1000 + i, max_id, barrier, out),
+            args=(
+                path,
+                config,
+                mode,
+                kind,
+                clock,
+                seed_ * 1000 + i,
+                max_id,
+                barrier,
+                out,
+                failures,
+            ),
         )
         for i in range(threads)
     ]
@@ -145,17 +185,18 @@ def run_cell(path, config, mode, kind, threads, seconds, seed_):
         t.start()
     for t in ts:
         t.join()
+    cp.raise_worker_failures(failures)
     wall = time.perf_counter() - clock["start"]
     minflt = resource.getrusage(resource.RUSAGE_SELF).ru_minflt - clock["ru"]
     n = sum(o[0] for o in out)
+    nc = sum(o[3] for o in out)
     return {
         "ops": n,
         "wall_s": wall,
         "ops_per_s": n / wall,
         "query_mean_us": round(1e6 * sum(o[1] for o in out) / n, 2) if n else None,
-        "close_mean_us": round(1e6 * sum(o[2] for o in out) / n, 2)
-        if n and mode == "perconn"
-        else None,
+        # close 는 연결당 평균(쿼리 여러 개인 조건에서도 연결 하나에 한 번).
+        "close_mean_us": round(1e6 * sum(o[2] for o in out) / nc, 2) if nc else None,
         "minflt_per_op": round(minflt / n, 3) if n else None,
         "sqlite": status(reset=False),
         "rss_after": cp.rss_bytes(),

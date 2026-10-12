@@ -109,17 +109,17 @@ def verdict_table(meta: dict, cells: list[dict]) -> list[str]:
 
 def phase_table(meta: dict, cells: list[dict]) -> list[str]:
     out = [
-        "| 크기 | 스레드 | 변형 | open | PRAGMA | 요청 | close | 합(p50 합) |",
-        "|---|---:|---|---:|---:|---:|---:|---:|",
+        "| 크기 | 스레드 | 패턴 | 변형 | open | PRAGMA | 요청(연결당 합) | close | 합(p50 합) |",
+        "|---|---:|---|---|---:|---:|---:|---:|---:|",
     ]
     for cond in map(tuple, meta["conditions"]):
-        if cond[2] != "perconn":
+        if cond[2] not in ("perconn", "perconn10"):
             continue
         for variant in meta["variants"]:
             vals = [median_of(cells, cond, variant, f"phases_us.{p}.p50") for p in PHASES]
             total = sum(v for v in vals if v is not None)
             out.append(
-                f"| {cond[0]} | {cond[1]} | `{variant}` | "
+                f"| {cond[0]} | {cond[1]} | {cond[2]} | `{variant}` | "
                 + " | ".join(num(v, 1) for v in vals)
                 + f" | {num(total, 1)} |"
             )

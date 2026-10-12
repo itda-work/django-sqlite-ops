@@ -1186,3 +1186,136 @@ def test_cache_bench_kind_rows_reads_both_bench_formats():
     assert abs(row["d_sorted"] - 100 * 7 / 15) < 1e-12
     assert row["ratio"] == 2.0 and row["base_ratio"] == 1.5
     assert s.bench_kind_rows(v26, ["mmap_size"]) == []
+
+
+# --- 워커 실패 전파(#27 리뷰 1) ----------------------------------------------------------------
+
+
+def _call_with_deadline(fn, timeout=20.0):
+    """``fn()`` 을 다른 스레드에서 부르고 (끝났는가, 반환값, 예외)를 돌려준다."""
+    import threading
+
+    box = {}
+
+    def target():
+        try:
+            box["value"] = fn()
+        except BaseException as e:  # noqa: BLE001 — 테스트가 예외 자체를 본다
+            box["error"] = e
+
+    t = threading.Thread(target=target, daemon=True)
+    t.start()
+    t.join(timeout)
+    return not t.is_alive(), box.get("value"), box.get("error")
+
+
+@pytest.fixture
+def small_db(tmp_path):
+    p = _lab_module("cache_probe")
+    path = tmp_path / "db" / "db.sqlite3"
+    path.parent.mkdir()
+    p.seed(path, 500)
+    return path
+
+
+@pytest.mark.parametrize("threads", [1, 2])
+def test_cache_mech_worker_failure_fails_the_cell(small_db, monkeypatch, threads):
+    import sqlite3
+
+    m = _lab_module("cache_mech")
+    calls = {"n": 0}
+
+    def flaky(conn, kind, rng, max_id, lo=None):
+        calls["n"] += 1
+        if calls["n"] > 3:  # 몇 번은 성공하고 그 뒤 실패(일부 워커만 실패하는 경우 포함)
+            raise sqlite3.OperationalError("injected worker failure")
+
+    monkeypatch.setattr(m, "one", flaky)
+    done, value, error = _call_with_deadline(
+        lambda: m.run_cell(small_db, "baseline", "perconn", "read", threads, 0.3, 1)
+    )
+    assert done, "run_cell hung"
+    assert value is None, f"failed worker was reported as a normal cell: {value}"
+    assert isinstance(error, RuntimeError) and "injected worker failure" in str(error)
+
+
+def test_cache_mech_reuse_connect_failure_does_not_hang(small_db, monkeypatch):
+    m = _lab_module("cache_mech")
+
+    def broken(path, config):
+        raise OSError("injected connect failure")
+
+    monkeypatch.setattr(m, "open_conn", broken)
+    done, value, error = _call_with_deadline(
+        lambda: m.run_cell(small_db, "baseline", "reuse", "read", 2, 0.3, 1)
+    )
+    assert done, "run_cell hung on a worker that failed before the barrier"
+    assert value is None
+    assert isinstance(error, RuntimeError) and "injected connect failure" in str(error)
+
+
+@pytest.mark.parametrize("threads", [1, 2])
+def test_cache_probe_unexpected_worker_failure_fails_the_cell(small_db, monkeypatch, threads):
+    p = _lab_module("cache_probe")
+    calls = {"n": 0}
+    real = p.request
+
+    def flaky(conn, rng, max_id):
+        calls["n"] += 1
+        if calls["n"] > 3:
+            raise ValueError("injected worker failure")
+        return real(conn, rng, max_id)
+
+    monkeypatch.setattr(p, "request", flaky)
+    done, value, error = _call_with_deadline(
+        lambda: p.run_cell(small_db, "baseline", "perconn", threads, 0.3, 1)
+    )
+    assert done, "run_cell hung"
+    assert value is None, f"failed worker was reported as a normal cell: {value}"
+    assert isinstance(error, RuntimeError) and "injected worker failure" in str(error)
+
+
+def test_cache_probe_reuse_connect_failure_does_not_hang(small_db, monkeypatch):
+    p = _lab_module("cache_probe")
+
+    def broken(path, variant):
+        raise OSError("injected connect failure")
+
+    monkeypatch.setattr(p, "connect", broken)
+    done, value, error = _call_with_deadline(
+        lambda: p.run_cell(small_db, "baseline", "reuse", 2, 0.3, 1)
+    )
+    assert done, "run_cell hung on a worker that failed before the barrier"
+    assert value is None
+    assert isinstance(error, RuntimeError) and "injected connect failure" in str(error)
+
+
+def test_cache_probe_sqlite_errors_are_counted_not_lost(small_db, monkeypatch):
+    """SQLite 오류(예: busy)는 칸을 멈추지 않고 errors 에 센다. 보고서가 오류 수를 낸다."""
+    import sqlite3
+
+    p = _lab_module("cache_probe")
+
+    def busy(conn, rng, max_id):
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(p, "request", busy)
+    r = p.run_cell(small_db, "baseline", "perconn", 1, 0.2, 1)
+    assert r["ops"] == 0
+    assert sum(r["errors"].values()) > 0
+
+
+def test_cache_probe_perconn10_counts_queries_not_connections(small_db):
+    p = _lab_module("cache_probe")
+    r = p.run_cell(small_db, "baseline", "perconn10", 1, 0.2, 1)
+    assert r["ops"] > 0 and r["ops"] % 10 == 0
+    assert sum(r["kinds"].values()) == r["ops"]
+    assert set(r["phases_us"]) == {"open", "pragma", "query", "close"}
+
+
+def test_cache_mech_multi_query_conditions_count_queries(small_db):
+    m = _lab_module("cache_mech")
+    for kind in ("sort10same", "sort10diff"):
+        r = m.run_cell(small_db, "baseline", "perconn", kind, 1, 0.2, 1)
+        assert r["ops"] > 0 and r["ops"] % 10 == 0, (kind, r)
+        assert r["close_mean_us"] is not None
