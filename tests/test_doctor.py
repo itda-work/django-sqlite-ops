@@ -52,9 +52,13 @@ execute_from_command_line(["manage.py", "sqlite_doctor", *sys.argv[2:]])
 """
 
 
-def doctor(databases, *args, json_output=True, **extra):
+# 자식 프로세스에서 표준 라이브러리 resource 의 import 를 실패시킨다(Windows 모사).
+NO_RESOURCE = 'import sys\nsys.modules["resource"] = None\n'
+
+
+def doctor(databases, *args, json_output=True, prelude="", **extra):
     config = {"DATABASES": databases, **extra}
-    argv = [sys.executable, "-c", RUN_DOCTOR_SCRIPT, json.dumps(config), *args]
+    argv = [sys.executable, "-c", prelude + RUN_DOCTOR_SCRIPT, json.dumps(config), *args]
     if json_output:
         argv.append("--json")
     result = subprocess.run(argv, cwd=ROOT, capture_output=True, text=True, check=False)
@@ -389,13 +393,28 @@ def test_nofile_output_formats(monkeypatch):
     assert "nofile  -  — unavailable:" in format_text(nofile_items())
 
 
-def test_text_output_has_process_section(tmp_path):
+@pytest.mark.parametrize("prelude", ["", NO_RESOURCE], ids=["resource", "no-resource"])
+def test_text_output_has_process_section(tmp_path, prelude):
     db = make_db(tmp_path / "app.sqlite3")
-    rc, out = doctor({"default": sqlite_database(db)}, json_output=False)
+    rc, out = doctor({"default": sqlite_database(db)}, json_output=False, prelude=prelude)
     lines = out.splitlines()
     assert "[process]" in lines
     assert lines.index("[process]") > lines.index("[channels]")
-    assert any(line.split()[:3] == ["OK", "-", "nofile_soft"] for line in lines)
+    process = lines[lines.index("[process]") + 1 :]
+    try:
+        import resource  # noqa: F401
+    except ImportError:
+        available = False
+    else:
+        available = not prelude
+    if available:
+        keys = ["nofile_soft", "nofile_hard"]
+    else:
+        keys = ["nofile"]
+        assert "unavailable: the resource module is not available on this platform" in process[0]
+    assert [line.split()[:3] for line in process[: len(keys)]] == [["OK", "-", k] for k in keys]
+    assert process[len(keys)] == ""
+    assert rc == 0
 
 
 # --- 마운트 ----------------------------------------------------------------------------

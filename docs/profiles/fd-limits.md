@@ -11,9 +11,10 @@
 | `RLIMIT_NOFILE` soft | 프로세스 | 그 프로세스의 `open`·`pipe`·`dup` 등이 `EMFILE` | [getrlimit(2)](https://man7.org/linux/man-pages/man2/getrlimit.2.html) |
 | `RLIMIT_NOFILE` hard | 프로세스 | soft 의 천장. 권한 없는 프로세스는 soft 를 hard 까지만 올리고, hard 는 내리기만 한다(되돌릴 수 없음). 올리려면 `CAP_SYS_RESOURCE` | [getrlimit(2)](https://man7.org/linux/man-pages/man2/getrlimit.2.html) |
 | `fs.nr_open` (`/proc/sys/fs/nr_open`) | 커널 | `RLIMIT_NOFILE` 을 올릴 수 있는 최대값. 권한 있는 프로세스에도 적용된다. hard 를 이 값보다 크게 올리면 `EPERM`. 기본 1048576 | [proc_sys_fs(5)](https://man7.org/linux/man-pages/man5/proc_sys_fs.5.html), [getrlimit(2)](https://man7.org/linux/man-pages/man2/getrlimit.2.html) |
-| `fs.file-max` (`/proc/sys/fs/file-max`) | 시스템 전체 | 모든 프로세스의 열린 파일 합계 한도. 닿으면 `ENFILE`. `CAP_SYS_ADMIN` 프로세스는 넘을 수 있다. 사용량은 `/proc/sys/fs/file-nr` | [proc_sys_fs(5)](https://man7.org/linux/man-pages/man5/proc_sys_fs.5.html) |
+| `fs.file-max` (`/proc/sys/fs/file-max`) | 시스템 전체 | 커널이 할당할 **파일 핸들**(open file description) 수의 한도. fd 수가 아니다(아래). 닿으면 `ENFILE`. `CAP_SYS_ADMIN` 프로세스는 넘을 수 있다. 사용량은 `/proc/sys/fs/file-nr` 의 첫 값(할당된 파일 핸들 수) | [proc_sys_fs(5)](https://man7.org/linux/man-pages/man5/proc_sys_fs.5.html), [proc(5) 원문](https://raw.githubusercontent.com/mkerrisk/man-pages/master/man5/proc.5), [커널 문서](https://www.kernel.org/doc/html/latest/admin-guide/sysctl/fs.html#file-max-file-nr) |
 
-- **`nr_open` 과 `file-max` 는 다르다.** `nr_open` 은 프로세스 하나의 한도를 어디까지 **설정할 수 있는가**이고, `file-max` 는 시스템 전체에서 **동시에 열 수 있는 수**다. 컨테이너의 `nofile` 을 올려도 `file-max` 는 그대로다.
+- **`nr_open` 과 `file-max` 는 다르다.** `nr_open` 은 프로세스 하나의 fd 한도를 어디까지 **설정할 수 있는가**이고, `file-max` 는 시스템 전체에서 커널이 **할당할 수 있는 파일 핸들 수**다. 컨테이너의 `nofile` 을 올려도 `file-max` 는 그대로다.
+- **fd 와 파일 핸들은 일대일이 아니다.** `RLIMIT_NOFILE` 은 프로세스의 fd 를 세고, `file-max`·`file-nr` 은 커널의 파일 핸들(open file description)을 센다. `dup` 한 fd 와 `fork` 로 자식에게 넘어간 fd 는 같은 open file description 을 가리킨다([dup(2)](https://raw.githubusercontent.com/mkerrisk/man-pages/master/man2/dup.2), [fork(2)](https://raw.githubusercontent.com/mkerrisk/man-pages/master/man2/fork.2)). 그래서 프로세스마다 센 `/proc/<pid>/fd` 를 더한 값은 시스템 사용량이 아니다. 시스템 전체 사용량은 `/proc/sys/fs/file-nr` 의 첫 값으로 보고 `file-max` 와 비교한다([proc(5) 원문](https://raw.githubusercontent.com/mkerrisk/man-pages/master/man5/proc.5), [커널 문서](https://www.kernel.org/doc/html/latest/admin-guide/sysctl/fs.html#file-max-file-nr)).
 - **한도는 물려받는다.** `fork(2)` 의 자식은 부모의 한도를 받고, `execve(2)` 를 지나도 유지된다([getrlimit(2)](https://man7.org/linux/man-pages/man2/getrlimit.2.html)). 프로필의 프로세스 트리(boot → exec → `litestream replicate` → `sh` → `exec uvicorn`)는 그래서 컨테이너에 준 한도를 그대로 쓴다. 재현함: #33 에서 PID 1(`litestream replicate`)과 uvicorn 프로세스의 `/proc/<pid>/limits` 가 모두 compose 로 준 1048576 이었다([장시간 실행 환경](../research/fd-soak-2026-10-09.md#환경)).
 - 재현함(colima VM): `fs.nr_open` 1048576, `fs.file-max` 9223372036854775807. compose 에서 hard 를 2097152(> `nr_open`)로 주자 컨테이너가 뜨지 않았다: `error setting rlimits for ready process: error setting rlimit type 7: operation not permitted`(7 = `RLIMIT_NOFILE`).
 
@@ -95,7 +96,7 @@ hard ≥ soft  (그리고 hard ≤ fs.nr_open)
 가장 믿을 만한 방법은 **예상 피크 동시 접속으로 부하를 걸고 `ls /proc/<pid>/fd | wc -l` 의 최대값을 잰 뒤** 여유를 더하는 것이다. 열린 fd 는 `/proc/<pid>/fd` 의 링크 대상으로 DB 파일·소켓을 나눠 볼 수 있다(#33 이 쓴 방법, [방법](../research/fd-soak-2026-10-09.md#방법)).
 
 - 기본 soft 1024 로 충분한가: 권장 설정에서 동시 16 은 최대 90개였다(재현함). 웹소켓처럼 연결을 오래 쥐는 접속이 수백 개를 넘으면 위 계산으로 다시 본다.
-- 한 머신에 여러 서비스를 띄우면 합계가 `fs.file-max` 안이어야 한다(§1).
+- 한 머신에 여러 서비스를 띄우면 시스템 전체의 파일 핸들도 본다: `/proc/sys/fs/file-nr` 의 첫 값(할당된 파일 핸들 수)이 `fs.file-max` 에 가까워지지 않는지 확인한다. 프로세스별 `/proc/<pid>/fd` 수를 더한 값으로 대신하지 않는다(§1).
 
 ## 5. 한도를 올려도 해결되지 않는 것 — `CONN_MAX_AGE=None` + ASGI
 
