@@ -187,15 +187,21 @@ _META_HINT = (
 
 
 def _fold(name: str) -> str:
-    """이름 비교용: 조합형·완성형(NFD·NFC)과 대소문자 차이를 없앤다."""
-    return unicodedata.normalize("NFC", name).casefold()
+    """이름 비교용: 조합형·완성형(NFD·NFC)과 대소문자 차이를 없앤다.
+
+    유니코드 표준의 canonical caseless matching(§3.13 D145: ``NFD(casefold(NFD(s)))``)이다.
+    casefold 는 정규형을 바꿀 수 있어 앞뒤로 정규화해야 한다. ``NFC(s).casefold()`` 만 하면
+    ``ΐ``(U+0390) 와 ``Ϊ́`` 의 두 철자가 다르게 접혔다(#39 리뷰 2 재현).
+    """
+    nfd = unicodedata.normalize("NFD", name)
+    return unicodedata.normalize("NFD", nfd.casefold())
 
 
 def _boot_owned_name(db: Path, name: str) -> bool:
     """DB 디렉터리 안에서 boot 가 쓰는 이름이면 참: DB·사이드카·잠금·상태 파일, 임시 복원·격리
     디렉터리, 상태 임시 파일. 아직 없을 수 있으므로 동일성이 아니라 이름으로 보며, 대소문자·
     유니코드 정규형을 무시하는 파일시스템(macOS APFS)을 위해 모든 플랫폼에서 양쪽을
-    ``_fold()``(NFC 정규화 + ``casefold()``)로 비교한다(대소문자 구분 볼륨의
+    ``_fold()``(canonical caseless matching)로 비교한다(대소문자 구분 볼륨의
     ``APP.DB.BOOT.LOCK`` 같은 이름도 거부한다, #39).
     """
     folded = _fold(name)

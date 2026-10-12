@@ -1305,6 +1305,62 @@ def test_other_unicode_form_of_reserved_name_is_refused(lab, fake, no_exec, base
     assert exc.value.code == cli.EXIT_REFUSE
 
 
+# 리뷰 2 재현: casefold 는 정규형을 바꿀 수 있다. NFC 뒤 casefold 만 하면 'ΐ'(U+0390) 의 두 철자가
+# 다르게 접혀 아직 없는 예약 이름 검사를 지났다. 대소문자와 정규형을 함께 바꾼 철자다.
+GREEK_DB = "\u0390.db"
+GREEK_SUFFIXES = [
+    "",
+    "-wal",
+    "-shm",
+    "-journal",
+    ".boot.lock",
+    ".boot-state.json",
+    ".boot-state.json.tmp-x",
+    ".restore-x",
+    ".stale-x",
+]
+
+
+@pytest.mark.parametrize("db_form", ["NFC", "NFD"])
+@pytest.mark.parametrize("suffix", GREEK_SUFFIXES)
+def test_case_and_unicode_form_variant_of_reserved_name_is_refused(
+    lab, fake, no_exec, db_form, suffix
+):
+    meta_form = "NFD" if db_form == "NFC" else "NFC"
+    db_name = unicodedata.normalize(db_form, GREEK_DB)
+    meta_name = unicodedata.normalize(meta_form, (GREEK_DB + suffix).upper())
+    db, meta = lab / db_name, lab / meta_name
+    args = boot_args(lab, fake, "--meta-path", str(meta))
+    args[args.index(str(lab / "app.db"))] = str(db)
+    before = snapshot(lab)
+    with pytest.raises(SystemExit) as exc:
+        main_inproc(args, no_exec)
+    assert exc.value.code == cli.EXIT_USAGE
+    assert snapshot(lab) == before
+    assert fake.calls() == []
+    with pytest.raises(cli._Exit) as exc:
+        cli.check_no_overlap(db, meta)
+    assert exc.value.code == cli.EXIT_REFUSE
+
+
+def test_fold_is_canonical_caseless():
+    # Unicode §3.13 D145: NFD(casefold(NFD(s))). 리뷰 2 의 두 문자열이 같게 접혀야 한다.
+    a = "\u0390.db.boot-state.json"
+    b = "\u0399\u0308\u0301.DB.BOOT-STATE.JSON"
+    assert cli._fold(a) == cli._fold(b)
+    assert cli._fold("café.db") == cli._fold(unicodedata.normalize("NFD", "CAFÉ.DB"))
+    assert cli._fold("app.db") != cli._fold("app.db2")
+
+
+@pytest.mark.parametrize(
+    "name", ["meta", "litestream-meta", "app.db-litestream-x", ".app.db-litestream", "app.dbx"]
+)
+def test_ordinary_meta_names_are_not_reserved(lab, name):
+    db = lab / "app.db"
+    assert not cli._boot_owned_name(db, name)
+    assert cli.meta_conflict(db, lab / name) is None
+
+
 def test_case_variant_inside_case_variant_owned_dir_is_usage_error(lab):
     (lab / "APP.DB.STALE-x").mkdir()
     with pytest.raises(cli._Exit):
