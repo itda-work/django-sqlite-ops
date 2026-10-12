@@ -17,6 +17,7 @@ import stat
 import subprocess
 import sys
 import time
+import unicodedata
 from pathlib import Path
 
 import pytest
@@ -1276,6 +1277,31 @@ def test_case_variant_of_reserved_name_is_usage_error(lab, fake, no_exec, name):
     assert not cli.lock_path(lab / "app.db").exists()
     with pytest.raises(cli._Exit) as exc:
         cli.check_no_overlap(lab / "app.db", lab / name)
+    assert exc.value.code == cli.EXIT_REFUSE
+
+
+# 조합형(NFD)·완성형(NFC) 철자. APFS 는 정규형 차이를 무시하므로 같은 이름이다(fix-1 남은 의문 2).
+NFC_NAMES = ["café.db", "한글.db"]
+
+
+@pytest.mark.parametrize("db_form", ["NFD", "NFC"])
+@pytest.mark.parametrize("base", NFC_NAMES)
+@pytest.mark.parametrize("suffix", [".boot.lock", ".boot-state.json", "-wal", ".stale-meta"])
+def test_other_unicode_form_of_reserved_name_is_refused(lab, fake, no_exec, base, db_form, suffix):
+    meta_form = "NFC" if db_form == "NFD" else "NFD"
+    db_name = unicodedata.normalize(db_form, base)
+    meta_name = unicodedata.normalize(meta_form, base) + suffix
+    assert db_name + suffix != meta_name
+    db, meta = lab / db_name, lab / meta_name
+    args = boot_args(lab, fake, "--meta-path", str(meta))
+    args[args.index(str(lab / "app.db"))] = str(db)
+    before = snapshot(lab)
+    with pytest.raises(SystemExit) as exc:
+        main_inproc(args, no_exec)
+    assert exc.value.code == cli.EXIT_USAGE
+    assert snapshot(lab) == before
+    with pytest.raises(cli._Exit) as exc:
+        cli.check_no_overlap(db, meta)
     assert exc.value.code == cli.EXIT_REFUSE
 
 

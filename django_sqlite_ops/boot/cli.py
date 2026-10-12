@@ -25,6 +25,7 @@ import sqlite3
 import stat
 import sys
 import time
+import unicodedata
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import quote
@@ -185,17 +186,23 @@ _META_HINT = (
 )
 
 
+def _fold(name: str) -> str:
+    """이름 비교용: 조합형·완성형(NFD·NFC)과 대소문자 차이를 없앤다."""
+    return unicodedata.normalize("NFC", name).casefold()
+
+
 def _boot_owned_name(db: Path, name: str) -> bool:
     """DB 디렉터리 안에서 boot 가 쓰는 이름이면 참: DB·사이드카·잠금·상태 파일, 임시 복원·격리
-    디렉터리, 상태 임시 파일. 아직 없을 수 있으므로 동일성이 아니라 이름으로 보며, 대소문자 무시
-    파일시스템을 위해 모든 플랫폼에서 ``casefold()`` 로 비교한다(대소문자 구분 볼륨의
+    디렉터리, 상태 임시 파일. 아직 없을 수 있으므로 동일성이 아니라 이름으로 보며, 대소문자·
+    유니코드 정규형을 무시하는 파일시스템(macOS APFS)을 위해 모든 플랫폼에서 양쪽을
+    ``_fold()``(NFC 정규화 + ``casefold()``)로 비교한다(대소문자 구분 볼륨의
     ``APP.DB.BOOT.LOCK`` 같은 이름도 거부한다, #39).
     """
-    folded = name.casefold()
+    folded = _fold(name)
     exact = [p.name for p in (db, *sidecars(db), lock_path(db), state_path(db))]
     prefixes = (db.name + _RESTORE_INFIX, db.name + _STALE_INFIX, state_path(db).name + _TMP_INFIX)
-    return folded in {n.casefold() for n in exact} or folded.startswith(
-        tuple(p.casefold() for p in prefixes)
+    return folded in {_fold(n) for n in exact} or folded.startswith(
+        tuple(_fold(p) for p in prefixes)
     )
 
 
