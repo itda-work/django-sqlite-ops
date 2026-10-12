@@ -1312,6 +1312,27 @@ def test_empty_db_with_meta_remote_error_refuses_any_policy(lab, fake, no_exec, 
     assert "restore" not in fake.calls()
 
 
+@pytest.mark.parametrize("remote", [None, 0x19], ids=["remote-empty", "remote-txid"])
+def test_empty_db_with_meta_keep_local_refuses(lab, fake, no_exec, capsys, remote):
+    # D-17: 0바이트 DB 는 keep-local 로도 넘기지 않는다. 지킬 로컬 데이터가 없다.
+    db, _ = empty_volume(lab, "app.db-wal")
+    fake.remote_txid(remote)
+    before = snapshot(lab)
+    assert (
+        main_inproc(boot_args(lab, fake, "--on-unknown", "keep-local"), no_exec) == cli.EXIT_REFUSE
+    )
+    err = capsys.readouterr().err
+    assert "action=refuse" in err and "reason_code=empty_db" in err
+    assert "hint:" in err and "D-17" in err
+    assert "--on-unknown restore" in err and "--init-new" in err
+    assert "unknown_at_boot" not in err
+    assert snapshot(lab, skip=("app.db.boot.lock",)) == before
+    assert db.stat().st_size == 0
+    assert not cli.state_path(db).exists()
+    assert "restore" not in fake.calls()
+    assert not no_exec[0]
+
+
 def test_empty_db_without_meta_keeps_existing_rules(lab, fake, no_exec, capsys):
     # 메타 없는 0바이트는 D-16 범위 밖이다. no_local_meta / adopt_existing 그대로.
     (lab / "app.db").touch()
@@ -1741,6 +1762,26 @@ def test_l8_empty_db_with_meta_refuses_then_restores(real):
         "quarantine_and_restore",
         "empty_db",
     )
+
+
+def test_l8_empty_db_with_meta_keep_local_refuses(real):
+    # D-17: 실제 바이너리로 같은 볼륨에서 keep-local 도 거부되는지 본다.
+    data, db, config = real("vol")
+    _empty_db_volume(data, db)
+    replica = config.parent / "replica"
+    before_replica, before_data = snapshot(replica), snapshot(data)
+    result = run_boot(
+        real_args(db, config, "--on-unknown", "keep-local", cmd=marker_command(data, db))
+    )
+    assert result.returncode == 2, result.stderr
+    assert "reason_code=empty_db" in result.stderr
+    assert "D-17" in result.stderr
+    assert "unknown_at_boot" not in result.stderr
+    assert read_marker(data) is None
+    assert snapshot(replica) == before_replica
+    assert snapshot(data, skip=("app.db.boot.lock",)) == before_data
+    assert db.stat().st_size == 0
+    assert not cli.state_path(db).exists()
 
 
 def test_first_deploy_needs_init_new(litestream_binary, tmp_path):

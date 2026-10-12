@@ -117,7 +117,7 @@ python -m django_sqlite_ops.boot \
   - 이 검증은 사고·손상(중단, 운영자 실수, 디스크 손상) 대비다. 볼륨 쓰기 권한을 가진 공격자에 대한 인증 수단이 아니다.
   - 격리를 마친 뒤 설치 전에 죽으면 로컬 DB·메타가 없으므로 다음 부팅은 `fresh` 로 복원한다. 설치 뒤 exec 전에 죽으면 D-14 와 같은 상태(DB 있음, 메타 없음)가 되어 `--on-unknown restore` 면 한 번 더 격리·복원한다. 어느 kill 지점에서도 DB 와 메타가 다른 격리 디렉터리로 갈라지지 않는다(테스트로 고정).
   - rename 은 같은 파일시스템 안에서만 원자적이다. 메타 디렉터리가 DB 와 다른 파일시스템에 있으면 복원 전에 거부한다(exit 2).
-- `--on-unknown keep-local` : 로컬을 그대로 두고 진행하되, stderr 와 헬스 상태에 `unknown_at_boot` 를 남긴다. **원격 조회가 성공했을 때만** 통한다. 원격 조회 실패면 정책과 무관하게 거부한다(D-12, S3 장애 중 옛 볼륨 재부팅 방지).
+- `--on-unknown keep-local` : 로컬을 그대로 두고 진행하되, stderr 와 헬스 상태에 `unknown_at_boot` 를 남긴다. **원격 조회가 성공했을 때만** 통한다. 원격 조회 실패면 정책과 무관하게 거부한다(D-12, S3 장애 중 옛 볼륨 재부팅 방지). `empty_db` 도 거부한다(D-17). 0바이트 DB 에는 지킬 로컬 데이터가 없다.
 - `--adopt-existing` : 기존 DB 를 처음 Litestream 에 올릴 때 쓴다. 정확히 (로컬 DB 있음, 로컬 메타 없음, 원격 조회 성공·빈 목록) 일 때만 `adopt` 로 진행하고, 그 조합 밖에서는 효과가 없다. `keep-local` 을 최초 도입 절차로 쓰지 않는다(D-11). 그 조합 밖에서는 무효과지만 **첫 도입 배포 뒤에는 끈다.** 판정 함수는 '도입했음'을 기억하지 않으므로, 켜 둔 채로 두면 나중에 메타와 복제본이 함께 사라진(예: prefix 오타) 상황에서 같은 조합이 다시 성립해 그 DB 를 새 복제본으로 올린다(D-13 과 같은 이유).
 - `--init-new` : 생애 첫 배포에서 새 DB 로 시작할 때 쓴다. 정확히 (로컬 DB 없음, 로컬 메타 없음, 원격 조회 성공·빈 목록) 일 때만 `fresh/new_db` 로 진행하고, 없으면 같은 조합을 `unknown/no_replica_no_local` 로 거부한다. Litestream 은 복제본 경로·prefix 오타와 "복제본 없음"을 같은 빈 목록(rc 0, `[]`)으로 돌려주므로(#3 실측) 빈 목록만으로 새 DB 를 시작하면 오타 난 경로에 새 DB 를 복제해 기존 복제본을 버리게 된다. 그 조합 밖에서는 무효과지만, 판정 함수는 '첫 배포였음'을 기억하지 않으므로 나중에 DB·메타가 함께 사라지고 복제본 경로까지 틀리면 같은 조합이 다시 성립한다. 그래서 **첫 배포 뒤에는 끈다**(D-13 정정).
 - **원격 TXID 조회**는 `litestream ltx -config <설정> -level all -json <db 경로>` 로 설정 파일의 복제본을 모든 레벨에 걸쳐 보고, 항목들의 `max_txid`(16자리 16진수) 최대값을 쓴다. 기본(`-level` 생략)은 L0 만 나열해 L0 가 사라진 복제본을 빈 목록으로 오판한다(0.5.17 `ltx -h` 와 실측). 구현은 `boot/litestream.py` 의 `remote_max_txid()`.
@@ -155,12 +155,12 @@ python -m django_sqlite_ops.boot \
 | `fresh`, n | `RESTORE` | `RESTORE` | `RESTORE` |
 | `match` | `PROCEED` | `PROCEED` | `PROCEED` |
 | `adopt` | `PROCEED` | `PROCEED` | `PROCEED` |
-| `unknown`, 원격 n 있음 | `REFUSE` | `QUARANTINE_AND_RESTORE` | 로컬 DB 있으면 `KEEP_LOCAL`, 없으면 `REFUSE` |
-| `unknown`, 원격 빈 목록 | `REFUSE` | `REFUSE`(복원할 것이 없다) | 로컬 DB 있으면 `KEEP_LOCAL`, 없으면 `REFUSE` |
+| `unknown`, 원격 n 있음 | `REFUSE` | `QUARANTINE_AND_RESTORE` | 로컬 DB 있으면 `KEEP_LOCAL`, 없으면 `REFUSE`. `empty_db` 는 `REFUSE`(D-17) |
+| `unknown`, 원격 빈 목록 | `REFUSE` | `REFUSE`(복원할 것이 없다) | 로컬 DB 있으면 `KEEP_LOCAL`, 없으면 `REFUSE`. `empty_db` 는 `REFUSE`(D-17) |
 | `unknown`, 원격 실패 | `REFUSE` | `REFUSE` | `REFUSE`(D-12) |
 
 - `QUARANTINE_AND_RESTORE` 는 로컬(DB·메타)을 `<db>.stale-<ts>/` 로 옮긴 뒤 복원한다. `stale_meta` 도 남은 메타를 옮겨야 하므로 같은 조치다. `empty_db` 는 0바이트 DB·남은 사이드카·메타를 함께 옮긴다. `KEEP_LOCAL` 은 진행하되 `unknown_at_boot` 를 남긴다(§7). `REFUSE` 는 exit 2 다.
-- 안전 불변식(테스트로 고정): 로컬 DB 가 있으면 `RESTORE` 는 나오지 않는다(덮어쓰기는 반드시 격리를 거친다). 원격 조회 실패면 `REFUSE` 만 나온다(D-12). `refuse` 면 `unknown` 은 모두 `REFUSE` 다. `adopt_existing` 이 켜져 있어도 원격에 복제본이 있거나, 원격 조회 실패거나, 로컬 메타가 있으면 `adopt` 는 나오지 않으며, 위 한 행 밖에서는 결과가 꺼졌을 때와 같다(D-11). 로컬 DB 가 없을 때 `PROCEED` 는 `init_new` 가 켜져 있고 원격이 빈 목록일 때만 나오며, `init_new` 는 그 한 행 밖에서 결과를 바꾸지 않는다(D-13). 0바이트 DB 에 로컬 메타 TXID 가 있으면 원격 결과·정책·`adopt_existing`·`init_new` 와 무관하게 `match` 도 `PROCEED` 도 나오지 않는다. 메타 없는 0바이트의 결과는 `local_empty` 가 거짓일 때와 같다(D-16).
+- 안전 불변식(테스트로 고정): 로컬 DB 가 있으면 `RESTORE` 는 나오지 않는다(덮어쓰기는 반드시 격리를 거친다). 원격 조회 실패면 `REFUSE` 만 나온다(D-12). `refuse` 면 `unknown` 은 모두 `REFUSE` 다. `adopt_existing` 이 켜져 있어도 원격에 복제본이 있거나, 원격 조회 실패거나, 로컬 메타가 있으면 `adopt` 는 나오지 않으며, 위 한 행 밖에서는 결과가 꺼졌을 때와 같다(D-11). 로컬 DB 가 없을 때 `PROCEED` 는 `init_new` 가 켜져 있고 원격이 빈 목록일 때만 나오며, `init_new` 는 그 한 행 밖에서 결과를 바꾸지 않는다(D-13). 0바이트 DB 에 로컬 메타 TXID 가 있으면 원격 결과·정책·`adopt_existing`·`init_new` 와 무관하게 `match` 도 `PROCEED` 도 나오지 않고, `empty_db` 면 `KEEP_LOCAL` 도 나오지 않는다(D-17). 메타 없는 0바이트의 결과는 `local_empty` 가 거짓일 때와 같다(D-16).
 
 ### 4-4. 스파이크 guard.py 와의 차이 (고친 결함)
 `docs/reference/guard_spike.py` 는 랩에서 D4(옛 볼륨 재부팅)를 막는 데 성공했다. 그러나 그대로 옮기면 안 된다. 교차 리뷰에서 지적됐고, 코드로 직접 확인한 결함이다.
@@ -394,7 +394,7 @@ SQLITE_OPS = {
     "at": "2026-10-08T01:02:03Z"
   }
   ```
-  `unknown_at_boot` 는 `action` 이 `keep_local` 일 때만 참이다(`keep-local` 은 부팅 시 원격 조회가 성공했을 때만 통하므로 — D-12 — 이 표시는 원격이 비었거나 앞섰거나 로컬 메타가 없던 부팅을 뜻한다). `litestream_version` 은 읽지 못하면 `null`, `at` 은 UTC.
+  `unknown_at_boot` 는 `action` 이 `keep_local` 일 때만 참이다(`keep-local` 은 부팅 시 원격 조회가 성공했을 때만 통하므로 — D-12 — `empty_db` 도 거부하므로 — D-17 — 이 표시는 원격이 비었거나 앞섰거나 로컬 메타가 없던 부팅을 뜻한다). `litestream_version` 은 읽지 못하면 `null`, `at` 은 UTC.
 - **"마지막 업로드 시각"은 지연 지표로 쓰지 않는다.** 쓰기가 없는 정상 DB 도 업로드 시각은 오래되기 때문이다.
 
 **갱신 방식**

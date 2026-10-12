@@ -327,6 +327,9 @@ def decide(
     elif inp.remote.kind is _Kind.ERROR:
         # D-12: 원격 조회 실패면 정책과 무관하게 거부한다(S3 장애 중 옛 볼륨 재부팅 방지).
         action = Action.REFUSE
+    elif code is ReasonCode.EMPTY_DB and inp.policy is OnUnknown.KEEP_LOCAL:
+        # D-17: 0바이트 DB 는 keep-local 로도 넘기지 않는다. 지킬 로컬 데이터가 없다.
+        action = Action.REFUSE
     elif inp.policy is OnUnknown.RESTORE:
         # 복원할 복제본이 있을 때만 격리 후 복원한다. 빈 목록이면 거부한다.
         action = Action.QUARANTINE_AND_RESTORE if inp.remote.kind is _Kind.TXID else Action.REFUSE

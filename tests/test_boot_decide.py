@@ -234,12 +234,13 @@ def test_invalid_init_new(init_new):
 # (로컬 TXID, 원격) → (state, reason_code, refuse·restore·keep-local 각각의 action)
 # adopt_existing·init_new 는 이 표에 영향이 없다.
 # 원격 TXID 가 로컬보다 작거나 같아도 match 가 아니다.
+# keep-local 도 거부한다(D-17). 지킬 로컬 데이터가 없다.
 EMPTY_TABLE = {
     (5, "err"): (U, C.EMPTY_DB, NO, NO, NO),  # D-12
-    (5, "empty"): (U, C.EMPTY_DB, NO, NO, KEEP),
-    (5, "3"): (U, C.EMPTY_DB, NO, QR, KEEP),
-    (5, "5"): (U, C.EMPTY_DB, NO, QR, KEEP),
-    (5, "7"): (U, C.EMPTY_DB, NO, QR, KEEP),
+    (5, "empty"): (U, C.EMPTY_DB, NO, NO, NO),  # D-17
+    (5, "3"): (U, C.EMPTY_DB, NO, QR, NO),  # D-17
+    (5, "5"): (U, C.EMPTY_DB, NO, QR, NO),  # D-17
+    (5, "7"): (U, C.EMPTY_DB, NO, QR, NO),  # D-17
 }
 EMPTY_CASES = [
     pytest.param(
@@ -290,6 +291,38 @@ def test_invariant_empty_db_with_meta_never_matches(txid, remote, policy, adopt,
         assert got.action is Action.REFUSE  # D-12
     if policy == "refuse" and got.state is State.UNKNOWN:
         assert got.action is Action.REFUSE
+
+
+# local_empty 를 포함한 모든 유효 입력. 0바이트는 DB 파일이 있을 때만 성립한다.
+EVERY_INPUT = [
+    (local, empty, txid, remote, policy, adopt, init_new)
+    for local, txid, remote, policy in ALL_INPUTS
+    for empty in (False, True)
+    for adopt, init_new in FLAGS
+    if local or not empty
+]
+
+
+@pytest.mark.parametrize(
+    ("local", "empty", "txid", "remote", "policy", "adopt", "init_new"), EVERY_INPUT
+)
+def test_invariant_empty_db_never_keeps_local(local, empty, txid, remote, policy, adopt, init_new):
+    # D-17: 0바이트 DB 는 keep-local 로도 넘기지 않는다.
+    got = _decide(
+        local, txid, remote, policy, local_empty=empty, adopt_existing=adopt, init_new=init_new
+    )
+    if got.reason_code is C.EMPTY_DB:
+        assert got.action is not Action.KEEP_LOCAL
+
+
+def test_keep_local_still_applies_to_other_unknown_reasons():
+    # D-17 은 empty_db 만 바꾼다. 다른 unknown 사유의 keep-local 은 그대로다.
+    kept = {
+        _decide(local, txid, remote, "keep-local").reason_code
+        for local, txid, remote, _ in ALL_INPUTS
+        if _decide(local, txid, remote, "keep-local").action is Action.KEEP_LOCAL
+    }
+    assert kept == {C.NO_LOCAL_META, C.REMOTE_EMPTY, C.REMOTE_AHEAD}
 
 
 @pytest.mark.parametrize(("txid", "remote", "policy", "adopt", "init_new"), EMPTY_INPUTS)
