@@ -1163,6 +1163,158 @@ def test_quarantine_and_restore_leaves_the_lock_file_in_place(lab, fake, no_exec
     assert lock.stat().st_ino == inode
 
 
+# --- #39 리뷰 1: 대소문자 무시 파일시스템 ------------------------------------------------------
+# macOS APFS 기본 볼륨에서는 data 와 DATA, app.db.boot.lock 과 APP.DB.BOOT.LOCK 이 같은 파일이다.
+# 경로 문자열만 비교하면 이런 별칭이 검사를 지나 DB 를 옮기거나 잠금 파일을 격리했다(리뷰 재현).
+
+
+def case_insensitive(directory: Path) -> bool:
+    probe = directory / "case-probe"
+    probe.write_text("")
+    try:
+        return os.path.exists(directory / "CASE-PROBE")
+    finally:
+        probe.unlink()
+
+
+@pytest.fixture
+def ci_lab(lab):
+    if not case_insensitive(lab):
+        pytest.skip(
+            "tmp_path is on a case-sensitive filesystem (e.g. Linux CI); case aliases "
+            "of the same file cannot be made here"
+        )
+    return lab
+
+
+@pytest.fixture
+def cs_lab(lab):
+    if case_insensitive(lab):
+        pytest.skip(
+            "tmp_path is on a case-insensitive filesystem (e.g. macOS APFS); "
+            "DATA and data cannot be distinct directories here"
+        )
+    return lab
+
+
+def test_case_alias_of_db_dir_is_usage_error(ci_lab, fake, no_exec, capsys):
+    lab = ci_lab
+    db = lab / "app.db"
+    make_db(db, 3)
+    fake.remote_txid(5)
+    alias = lab.parent / lab.name.upper()
+    before = snapshot(lab)
+    args = boot_args(lab, fake, "--on-unknown", "restore", "--meta-path", str(alias))
+    with pytest.raises(SystemExit) as exc:
+        main_inproc(args, no_exec)
+    assert exc.value.code == cli.EXIT_USAGE
+    assert "--meta-path" in capsys.readouterr().err
+    assert snapshot(lab) == before
+    assert count_rows(db) == 3
+    assert fake.calls() == []
+    assert no_exec[0] == []
+
+
+def test_case_alias_of_db_dir_refuses_in_step_functions(ci_lab):
+    lab = ci_lab
+    db = lab / "app.db"
+    make_db(db, 3)
+    alias = lab.parent / lab.name.upper()
+    before = snapshot(lab)
+    for step in (cli.check_no_overlap, cli.check_quarantinable, cli.quarantine):
+        with pytest.raises(cli._Exit) as exc:
+            step(db, alias)
+        assert exc.value.code == cli.EXIT_REFUSE, step
+    assert snapshot(lab) == before
+
+
+def test_case_alias_of_lock_file_cannot_be_resumed_into_quarantine(lab):
+    # 리뷰 재현: 잠금을 쥔 채 메타 = APP.DB.BOOT.LOCK + 그 항목을 가진 manifest 로 재개를 직접
+    # 부르면 잠금 파일을 격리했고 두 번째 acquire_lock 이 성공했다. 대소문자 구분 볼륨에서도 이름
+    # 규칙으로 거부해야 하므로 어디서나 돈다. DB 는 두지 않는다(manifest 에 없는 DB 는 따로 거부).
+    db = lab / "app.db"
+    fd = cli.acquire_lock(db)
+    try:
+        inode = cli.lock_path(db).stat().st_ino
+        meta = lab / "APP.DB.BOOT.LOCK"
+        forged(lab, good_manifest(lab, entry("meta", meta)))
+        before = snapshot(lab)
+        with pytest.raises(cli._Exit) as exc:
+            cli.resume_quarantine(db, meta)
+        assert exc.value.code == cli.EXIT_REFUSE
+        assert snapshot(lab) == before
+        assert cli.lock_path(db).stat().st_ino == inode
+        with pytest.raises(cli._Exit) as exc:
+            cli.acquire_lock(db)
+        assert exc.value.code == cli.EXIT_LOCK
+    finally:
+        os.close(fd)
+
+
+CASE_VARIANT_META = [
+    "APP.DB.BOOT.LOCK",
+    "App.Db.Boot.Lock",
+    "APP.DB.BOOT-STATE.JSON",
+    "APP.DB.BOOT-STATE.JSON.TMP-x",
+    "APP.DB.STALE-meta",
+    "APP.DB.RESTORE-meta",
+    "APP.DB",
+    "APP.DB-WAL",
+    "App.Db-Shm",
+    "APP.DB-JOURNAL",
+]
+
+
+@pytest.mark.parametrize("name", CASE_VARIANT_META)
+def test_case_variant_of_reserved_name_is_usage_error(lab, fake, no_exec, name):
+    before = snapshot(lab)
+    args = boot_args(lab, fake, "--meta-path", str(lab / name))
+    with pytest.raises(SystemExit) as exc:
+        main_inproc(args, no_exec)
+    assert exc.value.code == cli.EXIT_USAGE
+    assert snapshot(lab) == before
+    assert not cli.lock_path(lab / "app.db").exists()
+    with pytest.raises(cli._Exit) as exc:
+        cli.check_no_overlap(lab / "app.db", lab / name)
+    assert exc.value.code == cli.EXIT_REFUSE
+
+
+def test_case_variant_inside_case_variant_owned_dir_is_usage_error(lab):
+    (lab / "APP.DB.STALE-x").mkdir()
+    with pytest.raises(cli._Exit):
+        cli.check_no_overlap(lab / "app.db", lab / "APP.DB.STALE-x" / "meta")
+
+
+def test_overlap_uses_file_identity(lab, monkeypatch):
+    # 하드링크·대소문자 별칭 없이 동일성 비교를 본다: alias 의 lstat 이 DB 디렉터리와 같다고 속인다.
+    db = lab / "app.db"
+    alias = lab.parent / "alias"
+    alias.mkdir()
+    assert cli.meta_conflict(db, alias) is None
+    real_lstat = os.lstat
+
+    def lstat(path, *a, **kw):
+        if os.fspath(path) == str(alias):
+            return real_lstat(lab, *a, **kw)
+        return real_lstat(path, *a, **kw)
+
+    monkeypatch.setattr(os, "lstat", lstat)
+    assert "overlaps" in cli.meta_conflict(db, alias)
+    with pytest.raises(cli._Exit) as exc:
+        cli.check_no_overlap(db, alias)
+    assert exc.value.code == cli.EXIT_REFUSE
+
+
+def test_distinct_case_directory_is_allowed_on_case_sensitive_fs(cs_lab, fake, no_exec):
+    # 경로 전체를 소문자화하지 않는다: 대소문자 구분 볼륨의 DATA 는 data 와 다른 디렉터리다.
+    lab = cs_lab
+    meta = lab.parent / lab.name.upper()
+    meta.mkdir()
+    args, _ = cli.parse_args(boot_args(lab, fake, "--meta-path", str(meta)))
+    assert args.meta_path == meta
+    cli.check_no_overlap(lab / "app.db", meta)
+
+
 # --- 임시 복원·설치 ---------------------------------------------------------------------------
 
 

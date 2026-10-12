@@ -519,7 +519,7 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 
 - 경로는 [경로 규칙](#경로-규칙)대로 준다.
 - `--meta-path` 를 DB 디렉터리 자체나 그 조상으로 두지 않는다. 메타가 DB 를 포함하면 인자 해석에서 거부된다(exit 64).
-- `--meta-path` 를 `<db>.boot.lock`·`<db>.boot-state.json`·DB·사이드카·Litestream 설정 파일이나 boot 가 만드는 `<db>.restore-*`·`<db>.stale-*` 로 주지 않는다. 메타는 복원 때 격리되므로, 예전에는 잠금 파일을 메타로 주면 boot 가 자기 잠금을 옮겨 두 번째 부팅이 같은 볼륨을 잠글 수 있었다(재현함, #39). 지금은 잠금 파일을 만들기 전에 exit 64 로 거부한다. 메타 경로에 정규 파일·FIFO·끊어진 링크가 있으면 판정 전에 exit 2 다. Litestream 설정의 `meta-path` 와 같은 디렉터리를 준다.
+- `--meta-path` 를 `<db>.boot.lock`·`<db>.boot-state.json`·DB·사이드카·Litestream 설정 파일이나 boot 가 만드는 `<db>.restore-*`·`<db>.stale-*` 로 주지 않는다. 메타는 복원 때 격리되므로, 예전에는 잠금 파일을 메타로 주면 boot 가 자기 잠금을 옮겨 두 번째 부팅이 같은 볼륨을 잠글 수 있었다(재현함, #39). 지금은 잠금 파일을 만들기 전에 exit 64 로 거부한다. 대소문자만 다른 이름(`APP.DB.BOOT.LOCK`, macOS 에서 `DATA` 처럼 같은 디렉터리의 다른 철자)도 같은 것으로 보고 거부한다. 메타 경로에 정규 파일·FIFO·끊어진 링크가 있으면 판정 전에 exit 2 다. Litestream 설정의 `meta-path` 와 같은 디렉터리를 준다.
 - 메타 디렉터리는 DB 와 같은 파일시스템에 둔다. 격리는 rename 으로 하므로 다른 볼륨에 있으면 거부한다.
 - **격리가 필요할 때(`restore` 조치) DB·`-wal`·`-shm`·`-journal`·메타 디렉터리 경로가 심볼릭 링크면 거부한다(exit 2).** 링크를 옮기면 실체가 밖에 남기 때문이다(v0.1 제약). 판정만 하고 진행하는 부팅(`match` 등)에서는 메타 디렉터리 링크를 따라가므로 평소에는 드러나지 않는다. 볼륨 안에 실제 파일·디렉터리로 둔다.
 - DB 나 `--meta-path` 의 이름을 `manifest.json` 으로 하지 않는다. 격리 디렉터리의 예약 이름이라 격리가 필요할 때 거부된다.

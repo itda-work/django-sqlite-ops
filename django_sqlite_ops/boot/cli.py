@@ -141,8 +141,42 @@ def _real_pair(db: Path, meta: Path) -> tuple[Path, Path]:
         raise _Exit(EXIT_USAGE, str(exc)) from None
 
 
+def _file_id(path: Path) -> tuple[int, int] | None:
+    """경로 항목 자체의 ``(st_dev, st_ino)``. 없으면 ``None``. 그 밖의 ``stat`` 실패는 올린다.
+
+    ``lstat`` 이다: 격리는 경로 항목을 rename 하므로 항목이 같은지가 중요하고, 부모 경로에는
+    링크가 없다(D-15). 대소문자 무시 파일시스템의 ``data``·``DATA`` 나 하드링크는 같은 값이다.
+    """
+    try:
+        st = os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return None
+    return st.st_dev, st.st_ino
+
+
+def _chain_ids(path: Path) -> set[tuple[int, int]]:
+    """``path`` 와 그 조상 중 있는 것의 파일 동일성."""
+    ids = (_file_id(p) for p in (path, *path.parents))
+    return {i for i in ids if i is not None}
+
+
+def _contains(a: Path, b: Path) -> bool:
+    """``a`` 가 ``b`` 와 같거나 ``b`` 의 조상이면 참. 문자열과 파일 동일성 중 하나라도 맞으면 참."""
+    if a == b or a in b.parents:
+        return True
+    ident = _file_id(a)
+    return ident is not None and ident in _chain_ids(b)
+
+
 def _overlaps(a: Path, b: Path) -> bool:
-    return a == b or a in b.parents or b in a.parents
+    return _contains(a, b) or _contains(b, a)
+
+
+def _same_dir(a: Path, b: Path) -> bool:
+    if a == b:
+        return True
+    ident = _file_id(a)
+    return ident is not None and ident == _file_id(b)
 
 
 _META_HINT = (
@@ -152,13 +186,16 @@ _META_HINT = (
 
 
 def _boot_owned_name(db: Path, name: str) -> bool:
-    """DB 디렉터리 안에서 boot 가 만드는 임시 복원·격리·상태 임시 파일의 이름이면 참."""
-    return name.startswith(
-        (
-            db.name + _RESTORE_INFIX,
-            db.name + _STALE_INFIX,
-            state_path(db).name + _TMP_INFIX,
-        )
+    """DB 디렉터리 안에서 boot 가 쓰는 이름이면 참: DB·사이드카·잠금·상태 파일, 임시 복원·격리
+    디렉터리, 상태 임시 파일. 아직 없을 수 있으므로 동일성이 아니라 이름으로 보며, 대소문자 무시
+    파일시스템을 위해 모든 플랫폼에서 ``casefold()`` 로 비교한다(대소문자 구분 볼륨의
+    ``APP.DB.BOOT.LOCK`` 같은 이름도 거부한다, #39).
+    """
+    folded = name.casefold()
+    exact = [p.name for p in (db, *sidecars(db), lock_path(db), state_path(db))]
+    prefixes = (db.name + _RESTORE_INFIX, db.name + _STALE_INFIX, state_path(db).name + _TMP_INFIX)
+    return folded in {n.casefold() for n in exact} or folded.startswith(
+        tuple(p.casefold() for p in prefixes)
     )
 
 
@@ -183,10 +220,11 @@ def meta_conflict(db: Path, meta: Path, config: Path | None = None) -> str | Non
         if _overlaps(meta, path):
             return f"--meta-path {meta} overlaps the {what} {path}; {_META_HINT}"
     for p in (meta, *meta.parents):
-        if p.parent == db.parent and _boot_owned_name(db, p.name):
+        if p != p.parent and _boot_owned_name(db, p.name) and _same_dir(p.parent, db.parent):
             return (
-                f"--meta-path {meta} is inside boot's restore/quarantine area {p} "
-                f"({db.name}{_RESTORE_INFIX}*, {db.name}{_STALE_INFIX}*); {_META_HINT}"
+                f"--meta-path {meta} uses a name boot owns next to the db: {p.name} "
+                f"(the db, its sidecars, boot lock/state files, {db.name}{_RESTORE_INFIX}*, "
+                f"{db.name}{_STALE_INFIX}*; compared case-insensitively); {_META_HINT}"
             )
     return None
 
@@ -197,6 +235,13 @@ def check_no_overlap(db: Path, meta: Path) -> None:
     조상이면 거부한다(exit 2). 예: 메타가 DB 의 부모면 DB 를 옮긴 뒤 메타를 자기 안으로 옮기려다
     실패하고, 재개도 같은 오류를 반복한다. 메타가 잠금 파일이면 boot 가 자기 잠금을 옮긴다(#39).
     """
+    try:
+        _check_no_overlap(db, meta)
+    except OSError as exc:
+        raise _Exit(EXIT_REFUSE, f"cannot quarantine: cannot compare paths: {exc}") from None
+
+
+def _check_no_overlap(db: Path, meta: Path) -> None:
     conflict = meta_conflict(db, meta)
     if conflict is not None:
         raise _Exit(EXIT_REFUSE, f"cannot quarantine: {conflict}")
@@ -205,7 +250,7 @@ def check_no_overlap(db: Path, meta: Path) -> None:
         for b in targets[i + 1 :]:
             if _overlaps(a, b):
                 raise _Exit(EXIT_REFUSE, f"cannot quarantine: {a} and {b} overlap")
-        if a == db.parent or a in db.parent.parents:
+        if _contains(a, db.parent):
             raise _Exit(
                 EXIT_REFUSE,
                 f"cannot quarantine: {a} contains the quarantine destination {db.parent}",
@@ -771,7 +816,10 @@ def parse_args(argv: list[str]) -> tuple[argparse.Namespace, list[str]]:
     except ValueError as exc:
         parser.error(str(exc))
     # 잠금 파일을 만들기 전에 거부한다. 메타가 잠금 파일이면 격리가 boot 의 잠금을 옮긴다(#39).
-    conflict = meta_conflict(args.db, args.meta_path, args.config)
+    try:
+        conflict = meta_conflict(args.db, args.meta_path, args.config)
+    except OSError as exc:
+        parser.error(f"cannot compare --meta-path with boot-owned paths: {exc}")
     if conflict is not None:
         parser.error(conflict)
     return args, command
