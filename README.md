@@ -395,7 +395,7 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 |---|---|---|
 | `--db PATH` | (필수) | SQLite DB 경로. Litestream 설정의 `path` 와 같아야 한다 |
 | `--config PATH` | (필수) | Litestream 설정 파일 |
-| `--on-unknown` | `refuse` | 판정할 수 없을 때: `refuse`(거부) · `restore`(로컬을 격리하고 복원) · `keep-local`(로컬 유지, 헬스에 `unknown_at_boot`) |
+| `--on-unknown` | `refuse` | 판정할 수 없을 때: `refuse`(거부) · `restore`(로컬을 격리하고 복원) · `keep-local`(로컬 유지, 헬스에 `unknown_at_boot`. 원격 조회 실패([D-12](docs/DECISIONS.md))와 [`empty_db`](#0바이트-db-복구-empty_db)([D-17](docs/DECISIONS.md))는 이 값이어도 거부) |
 | `--init-new` | 꺼짐 | 생애 첫 배포에서 새 DB 로 시작. [한 번 쓰고 끈다](#생애-첫-배포---init-new-를-한-번-쓰고-끈다) |
 | `--adopt-existing` | 꺼짐 | 기존 DB 를 처음 Litestream 에 올린다. [한 번 쓰고 끈다](#기존-db-도입---adopt-existing-을-한-번-쓰고-끈다) |
 | `--meta-path PATH` | `<db 디렉터리>/.<db 이름>-litestream` | Litestream 설정에 `meta-path` 를 바꿨다면 같은 값을 준다 |
