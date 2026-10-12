@@ -27,6 +27,11 @@ from .checks import _TRUE, _is_litestream_vfs, _options, _profile, _role, _uri
 from .compat import channels_lite
 from .database import DEFAULT_PROFILE, ENGINE, recommended
 
+try:
+    import resource
+except ImportError:  # Windows 등. 표준 라이브러리 resource 는 Unix 전용이다
+    resource = None
+
 __all__ = [
     "LEVELS",
     "SCHEMA_VERSION",
@@ -38,12 +43,13 @@ __all__ = [
     "format_text",
     "mountinfo_fstype",
     "mount_output_fstype",
+    "nofile_items",
     "to_json",
 ]
 
 SCHEMA_VERSION = 1
 LEVELS = ("ok", "warn", "error", "unknown")
-SECTIONS = ("settings", "database", "mount", "litestream", "channels")
+SECTIONS = ("settings", "database", "mount", "litestream", "channels", "process")
 
 # PRAGMA 값 매핑의 정본. SQLite 는 synchronous 를 정수로 돌려준다(https://www.sqlite.org/pragma.html).
 _SYNCHRONOUS = {0: "OFF", 1: "NORMAL", 2: "FULL", 3: "EXTRA"}
@@ -837,6 +843,55 @@ def _patch_items() -> list[Item]:
     return [Item(section, name, "patch", level, st.version, expected, message) for name in aio]
 
 
+# --- 프로세스 ----------------------------------------------------------------------------
+
+_FD_DOC = "docs/profiles/fd-limits.md"
+
+
+def _limit(value: int) -> int | str:
+    return "unlimited" if value == resource.RLIM_INFINITY else value
+
+
+def nofile_items() -> list[Item]:
+    """이 프로세스의 ``RLIMIT_NOFILE`` soft·hard. 보고만 하고 판정하지 않는다(DESIGN §6-2).
+
+    필요한 fd 수는 동시 연결 수에 달려 있어 근거 있는 경고 기준이 없다. 그래서 값을 읽지
+    못해도 ``unknown`` 이 아니라 ``ok`` 로 사유만 적는다(종료 코드를 바꾸지 않는다).
+    """
+    section = "process"
+    if resource is None:
+        return [
+            Item(
+                section,
+                None,
+                "nofile",
+                "ok",
+                None,
+                None,
+                "unavailable: the resource module is not available on this platform",
+            )
+        ]
+    try:
+        soft, hard = resource.getrlimit(resource.RLIMIT_NOFILE)
+    except (OSError, ValueError) as exc:  # resource.error 는 OSError 다
+        return [
+            Item(
+                section,
+                None,
+                "nofile",
+                "ok",
+                None,
+                None,
+                _one_line(f"unavailable: {type(exc).__name__}: {exc}"),
+            )
+        ]
+    note = f"RLIMIT_NOFILE of this process; reported, not judged ({_FD_DOC})"
+    return [
+        Item(section, None, "nofile_soft", "ok", _limit(soft), None, note),
+        Item(section, None, "nofile_hard", "ok", _limit(hard), None, note),
+    ]
+
+
 # --- 조립 ------------------------------------------------------------------------------
 
 
@@ -929,6 +984,7 @@ def diagnose(
 
     items.extend(_channel_items(files, replicated, profile))
     items.extend(_patch_items())
+    items.extend(nofile_items())
     return items
 
 

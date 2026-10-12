@@ -294,18 +294,19 @@ django_sqlite_ops/
   - 대조는 실제 경로(`realpath`)로 한다(D-15). 설정 경로가 실제 경로가 아니면 `warn` — boot 가 거부할 구성이다.
   - 쓰기 별칭인데 설정에 없음 → `warn`(복제되지 않음). channels-lite 전용 채널 DB(앱 DB 와 다른 실제 파일)는 §8 규칙상 복제에서 빼므로 이 검사에서 제외한다. 앱 DB 와 파일을 공유하면 제외하지 않는다. 설정에 있는데 `DATABASES` 에 없음 → `ok`(정보). 실행·파싱 실패(설정 파일 없음, 깨진 YAML, 바이너리 없음, 검증 안 된 버전) → `error`.
 - **채널 레이어**: `settings.CHANNEL_LAYERS` 를 읽기만 한다(`channels` 를 import 하지 않는다). 백엔드 경로로 종류를 알아보고 §8 표의 의미론을 한 줄로 요약한다. InMemory 는 프로필이 `single-server-multiproc` 이면 `warn`(프로필이 다중 프로세스를 명시하므로). channels_redis pub/sub 은 의미론 미측정이라 `unknown`, 모르는 백엔드도 `unknown`. channels-lite 는 §8 규칙대로 채널 DB 가 앱 DB(`default` 별칭이거나 다른 별칭과 같은 실제 파일)면 `warn`, Litestream 설정이 있고 채널 DB 가 복제 대상이면 `warn`. channels-lite aio 레이어를 쓰거나 `PATCH_CHANNELS_LITE_AIO` 가 켜져 있으면 §9 패치 상태를 `patch` 항목으로 낸다(적용됨 `ok`, 꺼짐·게이트 밖·미설치 `warn`). 이 경우에만 channels-lite 를 import 한다(DB 는 열지 않는다).
-- **수준**: `ok` · `warn` · `error` · `unknown`. 판정할 수 없으면 숨기지 않고 `unknown` 으로 적는다.
+- **프로세스**(#32): 명령을 실행한 프로세스의 `RLIMIT_NOFILE` 을 표준 라이브러리 `resource.getrlimit` 으로 읽어 `nofile_soft`·`nofile_hard` 두 항목으로 낸다. `RLIM_INFINITY` 는 `"unlimited"`. DB 와 무관하고 시스템 체크(§6-1)에는 넣지 않는다(체크는 실행 환경이 아니라 설정을 본다). **보고만 하고 판정하지 않는다 — 늘 `ok`.** 필요한 fd 수는 동시 접속 수에 달려 있고, 측정한 것은 권장 설정의 동시 16(fd 최대 90, [`fd-soak-2026-10-09.md`](research/fd-soak-2026-10-09.md#분포와-기울기-180구간-꼬리-제외))과 `CONN_MAX_AGE=None`+ASGI 의 고갈(W005 가 설정으로 잡는다)뿐이라 한도 값에 대한 경고 기준의 근거가 없다. 같은 이유로 `resource` 가 없거나(Windows) `getrlimit` 이 실패해도 `unknown` 이 아니라 `ok` 인 `nofile` 한 항목(값 `null`, 메시지 `unavailable: …`)으로 적는다. 판정하지 않는 항목이 종료 코드를 바꾸면 안 되기 때문이다. 기준을 두려면 근거를 이 절에 먼저 적는다. 가이드: [`profiles/fd-limits.md`](profiles/fd-limits.md).
+- **수준**: `ok` · `warn` · `error` · `unknown`. 판정할 수 없으면 숨기지 않고 `unknown` 으로 적는다(보고 전용 항목인 `process` 는 위 예외).
 - **종료 코드**: 0 문제 없음 · 1 경고 또는 `unknown` · 2 오류. 명령은 0 이 아니면 `SystemExit(code)` 로 끝난다.
-- **사람용 출력**: 섹션(`settings`·`database`·`mount`·`litestream`·`channels`)별 표, 줄 앞에 수준. 마지막 줄 `summary: N warning(s), N error(s), N unknown -> exit N`.
+- **사람용 출력**: 섹션(`settings`·`database`·`mount`·`litestream`·`channels`·`process`)별 표, 줄 앞에 수준. 마지막 줄 `summary: N warning(s), N error(s), N unknown -> exit N`.
 - **`--json` 스키마(`version: 1`)**:
   ```json
   {
     "version": 1,
     "items": [
       {
-        "section": "settings | database | mount | litestream | channels",
+        "section": "settings | database | mount | litestream | channels | process",
         "alias": "DB 별칭·채널 레이어 별칭, 또는 null",
-        "key": "profile | role | file | wal | connect | alias | transaction_mode | journal_mode | synchronous | busy_timeout | foreign_keys | sqlite_version | filesystem | config | config_path | replicated | extra | backend | database",
+        "key": "profile | role | file | wal | connect | alias | transaction_mode | journal_mode | synchronous | busy_timeout | foreign_keys | sqlite_version | filesystem | config | config_path | replicated | extra | backend | database | patch | nofile_soft | nofile_hard | nofile",
         "level": "ok | warn | error | unknown",
         "value": "실제 값(문자열·정수) 또는 null",
         "expected": "권장값·기대값 또는 null",
@@ -493,6 +494,7 @@ SQLITE_OPS = {
 ## 12. 미검증·확인 필요
 - ASGI 에서의 VFS 별칭 `CONN_MAX_AGE` 동작 (미검증). 일반 별칭은 확인함: 동기 뷰에서 `None` 은 재사용되지 않고 fd 를 쌓는다([`bench-2026-10-08.md`](research/bench-2026-10-08.md#결과-연결-재사용))
 - W003·W005 의 ASGI 판단은 설정만 본다. `PROFILE`·`ASGI_APPLICATION` 없이 ASGI 서버로 띄우는 경우는 정적으로 알 수 없어 미탐으로 남긴다(§6-1 'ASGI 판단'). W005 는 #26 원자료가 근거이고 랩에서 따로 재현하지 않았다. 양수 `CONN_MAX_AGE` 의 ASGI 동작은 재지 않았다. fd 한도를 올린 `None` 장시간 실행은 동시 16·30분만 쟀다([`fd-soak-2026-10-09.md`](research/fd-soak-2026-10-09.md#미검증)): 동시 수·요청 속도에 따른 정상 상태 수준, 닫히지 않은 연결을 무엇이 회수하는지는 미검증
+- fd 한도(#32): systemd `LimitNOFILE=` 구성과 `docker run --ulimit` 직접 실행은 재현하지 않았다(compose `ulimits` 만 재현). 다른 Docker·containerd 판과 클라우드 호스트의 기본 `nofile`(colima 에서 1024·524288), 동시 16 이외 부하에서 권장 설정의 fd 수는 미검증. `sqlite_doctor` 의 `nofile` 경고 기준은 근거가 없어 두지 않았다([`fd-limits.md`](profiles/fd-limits.md#7-미검증))
 - PRAGMA 후보의 5% 크기 효과: #26 실행은 반복 간 흔들림(약 7%)이 커서 검출하지 못했다. `cache_size` 단독 악화의 원인(#27)
 - 실제 클라우드 S3·R2·Tigris (미검증. 비용이 들어 마스터 승인 필요)
 - 회귀 랩은 SeaweedFS 4.48 + toxiproxy 2.12.0 으로만 돌았다(colima linux/arm64 와 GitHub Actions ubuntu-latest linux/amd64, 둘 다 11/11 통과 — [`lab-2026-10-08.md`](research/lab-2026-10-08.md#amd64-실행-github-actions-25)). 다른 S3 구현은 미검증
