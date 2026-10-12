@@ -307,16 +307,16 @@ EVERY_INPUT = [
     ("local", "empty", "txid", "remote", "policy", "adopt", "init_new"), EVERY_INPUT
 )
 def test_invariant_empty_db_never_keeps_local(local, empty, txid, remote, policy, adopt, init_new):
-    # D-17: 0바이트 DB 는 keep-local 로도 넘기지 않는다.
+    # D-17·D-18: 0바이트 DB 는 메타 유무와 무관하게 keep-local 로도 넘기지 않는다.
     got = _decide(
         local, txid, remote, policy, local_empty=empty, adopt_existing=adopt, init_new=init_new
     )
-    if got.reason_code is C.EMPTY_DB:
+    if empty:
         assert got.action is not Action.KEEP_LOCAL
 
 
 def test_keep_local_still_applies_to_other_unknown_reasons():
-    # D-17 은 empty_db 만 바꾼다. 다른 unknown 사유의 keep-local 은 그대로다.
+    # D-17·D-18 은 0바이트 DB 만 바꾼다. 0바이트가 아닌 DB 의 keep-local 은 그대로다.
     kept = {
         _decide(local, txid, remote, "keep-local").reason_code
         for local, txid, remote, _ in ALL_INPUTS
@@ -325,16 +325,96 @@ def test_keep_local_still_applies_to_other_unknown_reasons():
     assert kept == {C.NO_LOCAL_META, C.REMOTE_EMPTY, C.REMOTE_AHEAD}
 
 
+# local_empty=True 이고 로컬 메타가 없는 행(#44, D-18).
+# 원격 → (state, reason_code, refuse·restore·keep-local 각각의 action)
+# adopt_existing·init_new 는 이 표에 영향이 없다. --adopt-existing 은 0바이트를 도입하지 않고,
+# keep-local 도 거부한다(D-18). 지킬 로컬 데이터가 없다.
+EMPTY_NO_META_TABLE = {
+    "err": (U, C.REMOTE_ERROR, NO, NO, NO),  # D-12
+    "empty": (U, C.NO_LOCAL_META, NO, NO, NO),  # D-18: adopt·keep-local 아님
+    "3": (U, C.NO_LOCAL_META, NO, QR, NO),  # D-18
+    "5": (U, C.NO_LOCAL_META, NO, QR, NO),  # D-18
+    "7": (U, C.NO_LOCAL_META, NO, QR, NO),  # D-18
+}
+EMPTY_NO_META_CASES = [
+    pytest.param(
+        remote,
+        policy,
+        adopt,
+        init_new,
+        id=f"remote={remote}-{policy}-adopt={adopt}-init={init_new}",
+    )
+    for remote in EMPTY_NO_META_TABLE
+    for policy in POLICIES
+    for adopt, init_new in FLAGS
+]
+
+
+def test_empty_no_meta_table_covers_every_remote():
+    assert set(EMPTY_NO_META_TABLE) == set(REMOTES)
+    assert len(EMPTY_NO_META_CASES) == 5 * 3 * 4
+
+
+@pytest.mark.parametrize(("remote", "policy", "adopt", "init_new"), EMPTY_NO_META_CASES)
+def test_empty_db_without_meta_table(remote, policy, adopt, init_new):
+    state, code, *actions = EMPTY_NO_META_TABLE[remote]
+    got = _decide(
+        True, None, remote, policy, local_empty=True, adopt_existing=adopt, init_new=init_new
+    )
+    assert (got.state, got.reason_code, got.action) == (
+        state,
+        code,
+        actions[POLICIES.index(policy)],
+    )
+
+
+@pytest.mark.parametrize(
+    ("local", "empty", "txid", "remote", "policy", "adopt", "init_new"), EVERY_INPUT
+)
+def test_invariant_empty_db_is_never_adopted(local, empty, txid, remote, policy, adopt, init_new):
+    # D-18: --adopt-existing 은 0바이트 파일을 도입하지 않는다.
+    got = _decide(
+        local, txid, remote, policy, local_empty=empty, adopt_existing=adopt, init_new=init_new
+    )
+    if empty:
+        assert got.state is not State.ADOPT
+        assert got.reason_code is not C.ADOPT_EXISTING
+
+
 @pytest.mark.parametrize(("txid", "remote", "policy", "adopt", "init_new"), EMPTY_INPUTS)
-def test_empty_db_without_meta_is_unchanged(txid, remote, policy, adopt, init_new):
-    # 메타 없는 0바이트는 기존 규칙(no_local_meta·adopt_existing·remote_error) 그대로다.
-    # D-16 범위 밖.
+def test_empty_db_without_meta_differs_only_in_adopt_and_keep_local(
+    txid, remote, policy, adopt, init_new
+):
+    # 메타 없는 0바이트와 비어 있지 않은 DB 의 판정은 adopt 행(원격 빈 목록 + adopt_existing)과
+    # keep-local 의 KEEP_LOCAL 에서만 다르다(D-18). 둘 다 0바이트면 REFUSE 다.
+    # 사유 문구는 0바이트를 드러내므로 비교하지 않는다.
     if txid is not None:
         return
     kw = {"adopt_existing": adopt, "init_new": init_new}
     on = _decide(True, None, remote, policy, local_empty=True, **kw)
     off = _decide(True, None, remote, policy, local_empty=False, **kw)
-    assert on == off
+    if remote == "empty" and adopt:
+        assert (off.state, off.reason_code, off.action) == (
+            State.ADOPT,
+            C.ADOPT_EXISTING,
+            Action.PROCEED,
+        )
+        assert (on.state, on.reason_code, on.action) == (U, C.NO_LOCAL_META, NO)
+    elif off.action is Action.KEEP_LOCAL:
+        assert (on.state, on.reason_code, on.action) == (off.state, off.reason_code, NO)
+    else:
+        assert (on.state, on.reason_code, on.action) == (off.state, off.reason_code, off.action)
+
+
+@pytest.mark.parametrize(("remote", "text"), [("empty", "remote empty"), ("3", "remote txid 3")])
+def test_empty_db_without_meta_reason_names_size(remote, text):
+    got = decide(local_exists=True, local_empty=True, local_txid=None, remote=REMOTES[remote])
+    assert got.reason_code is C.NO_LOCAL_META
+    assert "0 bytes" in got.reason and "meta is missing" in got.reason and text in got.reason
+    assert "\n" not in got.reason
+    # 비어 있지 않은 DB 의 문구는 그대로다.
+    full = decide(local_exists=True, local_txid=None, remote=REMOTES[remote])
+    assert "0 bytes" not in full.reason
 
 
 def test_empty_db_reason_names_size_and_txids():
