@@ -58,3 +58,6 @@
 - compose 는 어느 서비스도 쓰지 않거나 비활성 프로필 서비스만 쓰는 볼륨을 모델에서 빼고, `down -v` 도 그 볼륨을 지우지 않는다(Compose 5.5.1, 재현함). 랩은 모든 볼륨을 붙인 `volume-holder` 서비스와 `--profile app down -v` 로 지운다. 정리 뒤 `docker volume ls --filter label=io.itda.dso-lab=1` 로 확인한다.
 - `uv build --out-dir D` 는 D 에 `.gitignore` 도 남긴다. `rmdir` 이 실패한다.
 - 이 호스트의 Docker(colima)에는 다른 프로젝트 컨테이너가 돈다. 랩 자원은 `lab/README.md` 의 규칙(프로젝트 이름 `dso-lab*`, 라벨 `io.itda.dso-lab=1`, `down -v` 만)으로만 다룬다.
+- `cache_size` 를 기본보다 올리면 연결마다 새로 열거나(`CONN_MAX_AGE=0`) 다른 연결이 쓰는 조건에서 많은 페이지를 읽는 요청이 느려진다. pcache 는 상한에 닿아야 버퍼를 재활용한다(#27 재현함). `mmap_size` 와 함께면 사라진다.
+- 표준 `sqlite3` 로 연결을 열고 닫는 측정에서 다른 연결이 없으면 close 가 매번 '마지막 연결 닫기'라 체크포인트·`-wal` 삭제가 끼어든다. 랩의 Litestream 대역으로 연결 하나를 열어 둔다(#27).
+- macOS 의 uv Python 은 SQLite 를 정적으로 넣는다. ctypes `CDLL(None)` 은 시스템 사본(3.51.0)을 잡아 `sqlite3_status` 가 0 이다. Linux 랩 이미지에서는 `libsqlite3.so.0` 이 같은 인스턴스다(#27).

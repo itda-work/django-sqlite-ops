@@ -5,6 +5,7 @@
 #   scripts/lab.sh run [L1..L8|P1|P2|all]   # 시나리오(끝나면 down -v)
 #   scripts/lab.sh bench [pytest 인자]   # PRAGMA 벤치(끝나면 down -v)
 #   scripts/lab.sh soak [pytest 인자]    # fd·RSS 장시간 실행(#33, 끝나면 down -v)
+#   scripts/lab.sh cache [mech] [인자]   # cache_size 최소 재현(mech: 원인 가설)을 Linux 컨테이너에서(#27, 끝나면 down -v)
 #   scripts/lab.sh down               # 이 랩의 컨테이너·볼륨·네트워크만 지운다
 #
 # 프로젝트 이름은 LAB_PROJECT(기본 dso-lab, 또는 dso-lab-<suffix>)다. 같은 호스트의 다른
@@ -103,11 +104,32 @@ case "$cmd" in
     stamp="$(date +%Y%m%d-%H%M%S)"
     pytest_lab -m soak "$@" 2>&1 | tee "$OUT/soak-$stamp.log"
     ;;
+  cache)
+    # lab/cache_probe.py 를 랩 이미지의 Python·SQLite 로 돌린다(#27). DB 는 labapp 의 볼륨
+    # (LAB_VOLUME, 기본 v01) 아래 새 디렉터리. 스크립트는 읽기 전용으로 붙이고 결과는 stdout 으로 받는다.
+    # 첫 인자가 mech 면 원인 가설 측정(lab/cache_mech.py)을 돈다.
+    script=cache_probe
+    if [[ "${1:-}" == mech ]]; then
+      script=cache_mech
+      shift
+    fi
+    trap down EXIT
+    build
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    result="$OUT/${script/_/-}-linux-$stamp.jsonl"
+    docker compose -p "$PROJECT" --project-directory "$BUILD" -f "$BUILD/lab-compose.yaml" \
+      run --rm --no-deps -T \
+      -v "$PWD/lab/cache_probe.py:/probe/cache_probe.py:ro" \
+      -v "$PWD/lab/cache_mech.py:/probe/cache_mech.py:ro" \
+      --entrypoint python labapp "/probe/$script.py" --env linux \
+      --db-dir "/data/$script-$stamp" --out - "$@" >"$result"
+    echo "결과: $result"
+    ;;
   down)
     down
     ;;
   *)
-    echo "사용법: $0 up | run [L1..L8|P1|P2|all] | bench | soak | down" >&2
+    echo "사용법: $0 up | run [L1..L8|P1|P2|all] | bench | soak | cache | down" >&2
     exit 64
     ;;
 esac

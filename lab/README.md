@@ -9,6 +9,7 @@ scripts/lab.sh run all        # L1–L8, P1·P2 (약 8분). 끝나면 성공·�
 scripts/lab.sh run L6         # pytest -k 로 좁힌다 (L1..L8, P1, P2)
 scripts/lab.sh bench          # PRAGMA 벤치 + 포화 측정 (약 50분). pytest 인자를 넘길 수 있다(-k saturation)
 scripts/lab.sh soak           # fd·RSS 장시간 실행, CONN_MAX_AGE None·0 각 30분 (약 70분, #33)
+scripts/lab.sh cache          # cache_size 최소 재현을 랩 이미지의 Python·SQLite 로 (약 13분, #27)
 scripts/lab.sh up             # 이미지 빌드 + SeaweedFS·toxiproxy 만 띄워 둔다(디버깅용)
 scripts/lab.sh down           # 이 랩의 자원만 지우고 남은 것을 보여 준다(비어 있어야 한다)
 ```
@@ -136,6 +137,25 @@ L6 의 훅은 `LAB_RENAME_DELAY` 가 있을 때만 `os.rename` 뒤에 한 줄(`[
 
 결과: `lab/.out/soak-<시각>.jsonl`(줄마다 `cma`·`kind` = `env`·`baseline`·`interval`·`final`·`summary`), `soak-<시각>-summary.json`(두 값 비교와 실행별 요약), 콘솔 `soak-<시각>.log`. 결과 문서의 표는 손으로 옮기지 않고 `uv run --no-project python lab/soak_report.py lab/.out/soak-<시각>.jsonl` 의 출력을 넣는다(중앙값은 `statistics.median`, p90 은 최근접 순위).
 
+## cache_size 최소 재현 (#27)
+
+`lab/cache_probe.py` 는 랩 스택(Django·uvicorn·Litestream·부하 발생기) 없이 표준 라이브러리 `sqlite3` 로 벤치 `mixed` 와 같은 쿼리(읽기 70%·인덱스 없는 정렬 10%·1행 쓰기 20%)를 돌리며 PRAGMA 변형(기준·`cache_size=-65536`·`mmap_size=256MiB`·둘 다·네 후보 다)을 비교한다. 결과는 [`cache-size-2026-10-12.md`](../docs/research/cache-size-2026-10-12.md).
+
+- 조건: DB 크기(행 100,000 / 400,000 ≈ 103 MiB, 64 MiB 캐시보다 큼) × 스레드(1, 16) × 연결 패턴(`perconn` 요청마다 open → PRAGMA → 요청 → close, `CONN_MAX_AGE=0` 과 같은 패턴 / `reuse` 스레드마다 한 연결). 조건마다 템플릿 DB 를 새 하위 디렉터리로 복사한다.
+- 순서 효과: 조건마다 버리는 워밍업 칸 하나, 그 뒤 블록 12개. 블록마다 변형 순서를 무작위로 섞고(블록 번호로 시드 고정) 칸 하나를 1.5초 돈다. 짝 차이는 같은 블록의 기준과 낸다.
+- 조건 내내 연결 하나(holder)를 열어 둔다(랩의 Litestream 대역). 없으면 단일 스레드에서 close 가 매번 마지막 연결 닫기가 되어 체크포인트·`-wal` 삭제가 끼어든다.
+- 기록: 처리량·p50·p99, `perconn` 의 open·PRAGMA·요청·close 시간, 칸 끝 RSS, Linux 에서는 `sqlite3_status(MEMORY_USED)` 최고치(macOS 의 uv Python 은 SQLite 를 정적으로 넣어 ctypes 로 닿지 않는다).
+- 판정(`_cachestat.py`, 측정 전에 정함): 블록 짝 차이의 평균과 t 분포 95% 신뢰구간. 구간이 0 을 벗어나고 |평균| ≥ 5% 면 '재현', 구간이 ±5% 안이면 '5% 이상 효과 없음', 그 밖은 '판정 불가'. 보조로 벤치 규칙(모든 블록 같은 방향 5% 이상)도 낸다.
+
+```bash
+uv run --no-project python lab/cache_probe.py --env macos --db-dir "$(mktemp -d)/db" \
+  --out lab/.out/cache-macos-<시각>.jsonl                      # macOS 호스트
+scripts/lab.sh cache                                           # Linux 컨테이너(labapp 볼륨, 끝나면 down -v)
+uv run --no-project python lab/cache_report.py lab/.out/cache-macos-<시각>.jsonl lab/.out/cache-linux-<시각>.jsonl
+```
+
+`--quick` 은 하네스 확인용(블록 2, 칸 0.3초, 행 1/10)이다. 기본 `pytest`·CI 에서는 돌지 않는다.
+
 ## 파일
 
 ```
@@ -154,6 +174,9 @@ lab/
 ├── test_bench.py           PRAGMA 벤치, 포화 측정
 ├── test_soak.py            fd·RSS 장시간 실행(#33)
 ├── soak_report.py          soak 원자료 → 결과 문서의 표(_soakstat 로 계산)
+├── cache_probe.py          cache_size 최소 재현(#27, 표준 라이브러리 sqlite3 만)
+├── _cachestat.py           그 집계·판정(순수 함수, 같은 테스트가 검사)
+├── cache_report.py         그 원자료 → 결과 문서의 표
 └── app/                    랩 Django 프로젝트(문서 조각 밖의 것)
     ├── manage.py, proj/asgi.py(벤치 계측 래퍼), proj/*_tail.py, notes/(뷰·계측)
     ├── lab_tools/          inspect_data.py, replica.py, s3_objects.py, loadgen.py

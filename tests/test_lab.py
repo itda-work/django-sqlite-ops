@@ -999,3 +999,190 @@ def test_soak_report_builds_tables_from_raw_jsonl(tmp_path):
         "| fd 합계 최소 / 중앙값 / p90 / 최대 | 836 / 836 / 836 / 836 | 68 / 68 / 68 / 68 |" in out
     )
     assert "RSS 비 5.71" in out
+
+
+# --- cache_size 최소 재현 집계(#27, lab/_cachestat.py·cache_probe.py·cache_report.py) ------------
+
+
+def _lab_module(name):
+    spec = importlib.util.spec_from_file_location(f"lab_{name}", ROOT / "lab" / f"{name}.py")
+    module = importlib.util.module_from_spec(spec)
+    sys.path.insert(0, str(ROOT / "lab"))
+    try:
+        spec.loader.exec_module(module)
+    finally:
+        sys.path.remove(str(ROOT / "lab"))
+    return module
+
+
+def _cell(variant, block, ops, p99=100.0, size="small", threads=1, mode="perconn", kind="cell"):
+    return {
+        "kind": kind,
+        "size": size,
+        "threads": threads,
+        "mode": mode,
+        "block": block,
+        "pos": 0,
+        "variant": variant,
+        "ops_per_s": ops,
+        "p99_us": p99,
+        "phases_us": {"open": {"p50": 10.0}},
+        "errors": {},
+    }
+
+
+def test_cache_pairs_within_block_and_condition_and_skips_warmup():
+    s = _lab_module("_cachestat")
+    cond = ("small", 1, "perconn")
+    cells = s.cells_of(
+        [
+            _cell("baseline", 0, 100.0, kind="warmup"),
+            _cell("baseline", 1, 200.0),
+            _cell("baseline", 0, 100.0),
+            _cell("cache_size", 1, 180.0),
+            _cell("cache_size", 0, 90.0),
+            _cell("baseline", 0, 50.0, mode="reuse"),
+            _cell("cache_size", 0, 60.0, mode="reuse"),
+            _cell("cache_size", 2, 70.0),  # 짝이 없는 블록
+        ]
+    )
+    assert s.paired_deltas(cells, cond, "cache_size", "ops_per_s") == [-10.0, -10.0]
+    assert s.paired_deltas(cells, ("small", 1, "reuse"), "cache_size", "ops_per_s") == [20.0]
+    assert s.value(cells[0], "phases_us.open.p50") == 10.0
+    assert s.value(cells[0], "phases_us.close.p50") is None
+
+
+def test_cache_mean_ci_uses_t_distribution():
+    s = _lab_module("_cachestat")
+    m, lo, hi = s.mean_ci([1.0, 2.0, 3.0])  # 평균 2, 표준편차 1, n=3, t(2)=4.303
+    assert m == 2.0
+    assert abs(hi - (2.0 + 4.303 / 3**0.5)) < 1e-9
+    assert abs(lo - (2.0 - 4.303 / 3**0.5)) < 1e-9
+    assert s.mean_ci([1.0]) is None
+    assert s.t975(11) == 2.201
+    assert s.t975(100) == 1.96
+
+
+def test_cache_verdict_needs_ci_away_from_zero_and_five_percent():
+    s = _lab_module("_cachestat")
+    assert s.verdict([-8.0, -9.0, -10.0, -9.0]) == s.REPRODUCED_WORSE
+    assert s.verdict([8.0, 9.0, 10.0, 9.0]) == s.REPRODUCED_BETTER
+    # 지연은 작을수록 좋다
+    assert s.verdict([8.0, 9.0, 10.0, 9.0], higher_is_better=False) == s.REPRODUCED_WORSE
+    # 구간이 0 을 벗어나도 평균이 5% 미만이면 재현이 아니다(구간이 ±5% 안이면 효과 없음)
+    assert s.verdict([-2.0, -2.1, -1.9, -2.0]) == s.NO_EFFECT
+    assert s.verdict([0.5, -0.5, 0.2, -0.2]) == s.NO_EFFECT
+    # 흔들림이 커서 구간이 넓으면 판정 불가
+    assert s.verdict([-15.0, 19.0, -10.0, -9.0]) == s.UNDECIDED
+    # 평균은 5% 이상이지만 구간이 0 을 포함
+    assert s.verdict([-30.0, 10.0, -12.0]) == s.UNDECIDED
+    assert s.verdict([-9.0]) == s.UNDECIDED
+
+
+def test_cache_same_direction_is_the_bench_rule():
+    s = _lab_module("_cachestat")
+    assert s.same_direction([-6.0, -5.0], 2)
+    assert not s.same_direction([-6.0, -4.9], 2)
+    assert not s.same_direction([-6.0, 6.0], 2)
+    assert not s.same_direction([-6.0], 2)
+
+
+def test_cache_probe_pragmas_match_recommended_table():
+    from django_sqlite_ops.database import recommended
+
+    p = _lab_module("cache_probe")
+    assert p.RECOMMENDED_PRAGMAS == recommended()["pragmas"]
+    stmts = p.pragma_statements("cache_size")
+    assert stmts[:2] == list(p.DJANGO_PRAGMAS)
+    assert stmts[-1] == "PRAGMA cache_size=-65536"
+    assert p.pragma_statements("baseline") == [
+        *p.DJANGO_PRAGMAS,
+        "PRAGMA journal_mode=WAL",
+        "PRAGMA synchronous=NORMAL",
+        "PRAGMA busy_timeout=5000",
+    ]
+    assert p.quantile([1.0, 2.0, 3.0, 4.0], 0.5) == 2.0
+    assert p.quantile([1.0, 2.0, 3.0, 4.0], 0.99) == 4.0
+    assert p.quantile([], 0.5) is None
+    # 블록 순서는 블록 번호로 고정되고 블록마다 다르다
+    order = [p.block_order(b, list(p.VARIANTS)) for b in range(6)]
+    assert order[0] == p.block_order(0, list(p.VARIANTS))
+    assert len({tuple(o) for o in order}) > 1
+
+
+def test_cache_report_renders_from_raw_records(tmp_path, capsys):
+    r = _lab_module("cache_report")
+    meta = {
+        "kind": "meta",
+        "env": "linux",
+        "python": "3.13",
+        "sqlite": "3.46.1",
+        "platform": "Linux",
+        "cpus": 4,
+        "cgroup_memory_max": "max",
+        "sizes": {"small": {"rows": 10, "bytes": 2**20, "page_size": 4096, "pages": 256}},
+        "blocks": 2,
+        "cell_s": 1.0,
+        "probe_sha256": "0" * 64,
+        "sqlite_status": False,
+        "variants": ["baseline", "cache_size"],
+        "conditions": [["small", 1, "perconn"]],
+    }
+    cells = [
+        _cell("baseline", 0, 100.0),
+        _cell("cache_size", 0, 90.0),
+        _cell("baseline", 1, 100.0),
+        _cell("cache_size", 1, 89.0),
+    ]
+    path = tmp_path / "cache.jsonl"
+    lines = [meta, *cells]
+    path.write_text("\n".join(json.dumps(x) for x in lines) + "\n")
+    with pytest.raises(SystemExit, match="end"):
+        r.load(path)
+    path.write_text("\n".join(json.dumps(x) for x in [*lines, {"kind": "end"}]) + "\n")
+    assert r.main([str(path)]) == 0
+    out = capsys.readouterr().out
+    assert "| small | 1 | perconn | `cache_size` | 100 | -10.5 [" in out
+    assert "| -11.0 … -10.0 |" in out
+    assert "SQLite 메모리" not in out  # sqlite3_status 가 없으면 RSS 만
+
+
+def test_cache_bench_kind_rows_reads_both_bench_formats():
+    s = _lab_module("_cachestat")
+
+    def kinds(read, sorted_, write, svc=False):
+        def k(ms):
+            d = {"mean_ms": ms + 100}  # 클라이언트 값은 svc 와 다르게 둔다
+            if svc:
+                d["svc"] = {"mean_ms": ms}
+            return d
+
+        return {"read": k(read), "sorted": k(sorted_), "write": k(write)}
+
+    # #10 형식: 실행에 cma 가 없고 kinds 가 바로 있다. 클라이언트 평균을 쓴다.
+    v10 = {
+        "runs": [
+            {"variant": "baseline", "rep": 1, "kinds": kinds(0.0, 25.0, 0.0)},
+            {"variant": "cache_size", "rep": 1, "kinds": kinds(10.0, 43.0, 0.0)},
+        ]
+    }
+    (row,) = s.bench_kind_rows(v10, ["cache_size"])
+    assert row["source"] == "client"
+    assert row["d_read"] == 10.0 and row["base_ratio"] == 1.25
+    assert abs(row["ratio"] - 143 / 110) < 1e-12
+    # #26 형식: phases.mixed.kinds 에 svc 가 있고 cma 로 거른다
+    v26 = {
+        "runs": [
+            {"cma": "0", "variant": "baseline", "rep": 1,
+             "phases": {"mixed": {"kinds": kinds(10.0, 15.0, 10.0, svc=True)}}},
+            {"cma": "0", "variant": "cache_size", "rep": 1,
+             "phases": {"mixed": {"kinds": kinds(11.0, 22.0, 10.0, svc=True)}}},
+            {"cma": "none", "variant": "cache_size", "rep": 1,
+             "phases": {"mixed": {"kinds": kinds(1.0, 1.0, 1.0, svc=True)}}},
+        ]
+    }  # fmt: skip
+    (row,) = s.bench_kind_rows(v26, ["cache_size"])
+    assert row["source"] == "svc"
+    assert abs(row["d_sorted"] - 100 * 7 / 15) < 1e-12
+    assert row["ratio"] == 2.0 and row["base_ratio"] == 1.5
+    assert s.bench_kind_rows(v26, ["mmap_size"]) == []
