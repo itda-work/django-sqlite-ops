@@ -228,6 +228,106 @@ def test_invalid_init_new(init_new):
         _decide(*INIT_NEW_ROW, "refuse", init_new=init_new)
 
 
+# --- 0바이트 DB (#38, D-16) ---
+
+# local_empty=True(DB 경로가 0바이트 정규 파일)이고 로컬 메타 TXID 가 있는 행.
+# (로컬 TXID, 원격) → (state, reason_code, refuse·restore·keep-local 각각의 action)
+# adopt_existing·init_new 는 이 표에 영향이 없다.
+# 원격 TXID 가 로컬보다 작거나 같아도 match 가 아니다.
+EMPTY_TABLE = {
+    (5, "err"): (U, C.EMPTY_DB, NO, NO, NO),  # D-12
+    (5, "empty"): (U, C.EMPTY_DB, NO, NO, KEEP),
+    (5, "3"): (U, C.EMPTY_DB, NO, QR, KEEP),
+    (5, "5"): (U, C.EMPTY_DB, NO, QR, KEEP),
+    (5, "7"): (U, C.EMPTY_DB, NO, QR, KEEP),
+}
+EMPTY_CASES = [
+    pytest.param(
+        txid,
+        remote,
+        policy,
+        adopt,
+        init_new,
+        id=f"txid={txid}-remote={remote}-{policy}-adopt={adopt}-init={init_new}",
+    )
+    for (txid, remote) in EMPTY_TABLE
+    for policy in POLICIES
+    for adopt, init_new in FLAGS
+]
+# local_empty 가 의미 있는 입력(DB 파일이 있을 때만). (txid, remote, policy, adopt, init_new)
+EMPTY_INPUTS = list(itertools.product((None, 5), REMOTES, POLICIES, (False, True), (False, True)))
+
+
+def test_empty_table_covers_every_meta_combination():
+    assert set(EMPTY_TABLE) == {(5, r) for r in REMOTES}
+    assert len(EMPTY_CASES) == 5 * 3 * 4
+
+
+@pytest.mark.parametrize(("txid", "remote", "policy", "adopt", "init_new"), EMPTY_CASES)
+def test_empty_db_with_meta_table(txid, remote, policy, adopt, init_new):
+    state, code, *actions = EMPTY_TABLE[(txid, remote)]
+    got = _decide(
+        True, txid, remote, policy, local_empty=True, adopt_existing=adopt, init_new=init_new
+    )
+    assert (got.state, got.reason_code, got.action) == (
+        state,
+        code,
+        actions[POLICIES.index(policy)],
+    )
+
+
+@pytest.mark.parametrize(("txid", "remote", "policy", "adopt", "init_new"), EMPTY_INPUTS)
+def test_invariant_empty_db_with_meta_never_matches(txid, remote, policy, adopt, init_new):
+    got = _decide(
+        True, txid, remote, policy, local_empty=True, adopt_existing=adopt, init_new=init_new
+    )
+    if txid is not None:
+        assert got.state is not State.MATCH
+        assert got.action is not Action.PROCEED
+        assert got.reason_code is C.EMPTY_DB
+    assert got.action is not Action.RESTORE  # 있는 파일은 격리 없이 덮지 않는다
+    if remote == "err":
+        assert got.action is Action.REFUSE  # D-12
+    if policy == "refuse" and got.state is State.UNKNOWN:
+        assert got.action is Action.REFUSE
+
+
+@pytest.mark.parametrize(("txid", "remote", "policy", "adopt", "init_new"), EMPTY_INPUTS)
+def test_empty_db_without_meta_is_unchanged(txid, remote, policy, adopt, init_new):
+    # 메타 없는 0바이트는 기존 규칙(no_local_meta·adopt_existing·remote_error) 그대로다.
+    # D-16 범위 밖.
+    if txid is not None:
+        return
+    kw = {"adopt_existing": adopt, "init_new": init_new}
+    on = _decide(True, None, remote, policy, local_empty=True, **kw)
+    off = _decide(True, None, remote, policy, local_empty=False, **kw)
+    assert on == off
+
+
+def test_empty_db_reason_names_size_and_txids():
+    got = decide(local_exists=True, local_empty=True, local_txid=41, remote=RemoteTxid(97))
+    assert "0 bytes" in got.reason and "41" in got.reason and "97" in got.reason
+    assert "\n" not in got.reason
+
+
+def test_local_empty_default_is_off():
+    got = decide(local_exists=True, local_txid=5, remote=RemoteTxid(5))
+    assert (got.state, got.reason_code) == (M, C.LOCAL_CURRENT)
+
+
+@pytest.mark.parametrize("txid", [None, 5])
+@pytest.mark.parametrize("remote", list(REMOTES))
+def test_empty_without_db_is_contradictory(txid, remote):
+    with pytest.raises(ValueError, match="local_empty"):
+        decide(local_exists=False, local_empty=True, local_txid=txid, remote=REMOTES[remote])
+
+
+@pytest.mark.parametrize("empty", [None, 0, 1, "yes"])
+def test_invalid_local_empty(empty):
+    with pytest.raises(ValueError, match="local_empty"):
+        decide(local_exists=True, local_empty=empty, local_txid=5, remote=EMPTY)
+
+
 # --- §4-4 스파이크 결함 회귀 ---
 
 
@@ -426,6 +526,7 @@ def _lookalike():
 # bool 과 OnUnknown 은 상속할 수 없어 가까운 타입(int, str)으로 대신한다.
 _DISGUISES = {
     "local_exists": {"subclass": lambda: _subclass(int, 1), "spoof": lambda: _spoof(bool)},
+    "local_empty": {"subclass": lambda: _subclass(int, 0), "spoof": lambda: _spoof(bool)},
     "local_txid": {"subclass": lambda: _subclass(int, 5), "spoof": lambda: _spoof(int)},
     "remote": {"subclass": lambda: _subclass(RemoteTxid, 7), "spoof": lambda: _spoof(RemoteTxid)},
     "remote.txid": {"subclass": lambda: _subclass(int, 7), "spoof": lambda: _spoof(int)},
@@ -447,6 +548,7 @@ def _call_with(field, value):
         return RemoteError(value)
     kw = {
         "local_exists": True,
+        "local_empty": False,
         "local_txid": 5,
         "remote": RemoteTxid(7),
         "on_unknown": "refuse",
@@ -524,6 +626,7 @@ def test_reason_codes_are_stable_strings():
         "no_local_meta",
         "remote_empty",
         "remote_ahead",
+        "empty_db",
     }
     assert {a.value for a in Action} == {
         "proceed",

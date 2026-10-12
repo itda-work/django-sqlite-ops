@@ -53,6 +53,9 @@ class ReasonCode(StrEnum):
     # unknown
     REMOTE_ERROR = "remote_error"
     STALE_META = "stale_meta"
+    # DB 경로가 0바이트 정규 파일인데 로컬 메타 TXID 가 있음(#38, D-16).
+    # 메타가 DB 내용을 대변하지 않는다.
+    EMPTY_DB = "empty_db"
     NO_LOCAL_META = "no_local_meta"
     REMOTE_EMPTY = "remote_empty"
     REMOTE_AHEAD = "remote_ahead"
@@ -190,6 +193,7 @@ class _Inputs:
     """정규화된 입력. 모든 필드가 내장 값이거나 이 모듈의 타입이다."""
 
     local_exists: bool
+    local_empty: bool
     local_txid: int | None
     remote: _Remote
     policy: OnUnknown
@@ -199,6 +203,7 @@ class _Inputs:
 
 def _normalize(
     local_exists: Any,
+    local_empty: Any,
     local_txid: Any,
     remote: Any,
     on_unknown: Any,
@@ -206,8 +211,13 @@ def _normalize(
     init_new: Any,
 ) -> _Inputs:
     """공개 입력을 검증하는 유일한 지점. 정확한 타입이 아니면 dunder 를 부르기 전에 거부한다."""
+    exists = _check_bool("local_exists", local_exists)
+    empty = _check_bool("local_empty", local_empty)
+    if empty and not exists:
+        raise ValueError("invalid local_empty True with local_exists False; an empty db must exist")
     return _Inputs(
-        local_exists=_check_bool("local_exists", local_exists),
+        local_exists=exists,
+        local_empty=empty,
         local_txid=None if local_txid is None else _check_txid("local txid", local_txid),
         remote=_normalize_remote(remote),
         policy=_check_policy(on_unknown),
@@ -225,6 +235,15 @@ def _classify(inp: _Inputs) -> tuple[State, ReasonCode, str]:
             State.UNKNOWN,
             ReasonCode.STALE_META,
             f"no local db but local meta has txid {local_txid}; remote {remote.text}",
+        )
+    # 0바이트 DB 에 메타 TXID 가 남았으면 TXID 비교는 의미가 없다(#38, D-16).
+    # 원격 실패보다 먼저 본다(조치 표가 원격 실패면 어차피 거부한다, D-12).
+    # 메타 없는 0바이트는 아래 규칙(no_local_meta·adopt_existing) 그대로다.
+    if inp.local_empty and local_txid is not None:
+        return (
+            State.UNKNOWN,
+            ReasonCode.EMPTY_DB,
+            f"local db is 0 bytes but local meta has txid {local_txid}; remote {remote.text}",
         )
     if remote.kind is _Kind.ERROR:
         where = "local db exists" if local_exists else "no local db"
@@ -287,12 +306,18 @@ def decide(
     local_exists: bool,
     local_txid: int | None,
     remote: Remote,
+    local_empty: bool = False,
     on_unknown: OnUnknown | str = OnUnknown.REFUSE,
     adopt_existing: bool = False,
     init_new: bool = False,
 ) -> Decision:
-    """부팅 상태(fresh/match/adopt/unknown)와 조치를 정한다. 규칙표는 DESIGN §4-3."""
-    inp = _normalize(local_exists, local_txid, remote, on_unknown, adopt_existing, init_new)
+    """부팅 상태(fresh/match/adopt/unknown)와 조치를 정한다. 규칙표는 DESIGN §4-3.
+
+    ``local_empty`` 는 DB 경로가 0바이트 정규 파일인지다. ``local_exists`` 가 거짓이면 참일 수 없다.
+    """
+    inp = _normalize(
+        local_exists, local_empty, local_txid, remote, on_unknown, adopt_existing, init_new
+    )
     state, code, reason = _classify(inp)
 
     if state is State.FRESH:

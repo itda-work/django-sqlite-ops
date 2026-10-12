@@ -75,8 +75,9 @@ python -m django_sqlite_ops.boot \
 
 1. **잠금 획득**: `<db>.boot.lock` 에 `flock(LOCK_EX | LOCK_NB)`. 이미 잡혀 있으면 exit 5. 잠금 fd 는 **exec 된 명령에 상속된다**. 그래서 `litestream replicate -exec ...` 와 그 자식이 살아 있는 동안 같은 볼륨에서 두 번째 boot 는 잠금에서 막힌다(exit 5). 거부·실패로 돌아올 때는 잠금을 풀고 끝난다. 잠금 파일이 심볼릭 링크거나 정규 파일이 아니면 exit 5, 잠근 뒤 경로의 inode 가 잠근 파일과 다르면(그 사이 바뀜) exit 5. **flock 의 한계**: 잠금은 파일(inode)에 걸리므로 운영자가 잠금 파일을 지우거나 바꾸면 다음 boot 는 새 파일을 잠가 보호가 사라진다. 획득 때의 검사는 그 순간만 보며 이후의 unlink 를 막지 못한다. 잠금 파일을 지우지 않는다. 다른 머신 사이의 이중 replicate 는 막지 못한다. 이는 문서와 `sqlite_doctor` 경고로 다룬다. `fcntl` 이 없는 플랫폼(Windows)은 판정할 수 없으므로 exit 64 다(§12).
 2. **중단된 격리 재개**: `<db>.stale-<ts>.partial/` 이 남아 있으면 앞선 부팅이 격리 도중 죽은 것이다. 판정 전에 그 격리를 끝낸다(멱등, §4-3 격리). 둘 이상이면 판정할 수 없으므로 exit 2.
-3. **판정 입력 수집**: 로컬 DB 존재(DB 경로가 정규 파일. 디렉터리·심볼릭 링크 등 그 밖의 것이면 exit 2), `local_max_txid()`, `remote_max_txid()`.
+3. **판정 입력 수집**: 로컬 DB 존재(DB 경로가 정규 파일. 디렉터리·심볼릭 링크 등 그 밖의 것이면 exit 2)와 그 파일이 0바이트인지(같은 `lstat` 한 번, `local_empty`), `local_max_txid()`, `remote_max_txid()`.
    - **DB 파일 없이 `-wal`/`-shm`/`-journal` 만 남은 경우**는 `decide()` 를 부르지 않고 `unknown/orphan_sidecars` 로 거부한다(exit 2). 남은 WAL 이 어느 DB 의 것인지 알 수 없고, 그 옆에 복원하면 옛 WAL 이 새 DB 에 섞인다. 단 `--on-unknown restore` 이고 원격에 복제본(TXID)이 있으면 이 파일들을 격리 대상에 넣고 복원한다(`quarantine_and_restore`).
+   - **0바이트 DB 파일이 있고 사이드카가 남은 경우**는 DB 파일이 있으므로 `orphan_sidecars` 가 아니다. 로컬 메타 TXID 가 있으면 `decide()` 가 `unknown/empty_db` 로 판정하고(§4-3), 남은 사이드카 이름을 사유에 넣으며(`local db is 0 bytes (-wal, -shm present) but ...`) 격리 대상에 포함한다(#38, D-16).
 4. **판정** (§4-3): `decide()` 한 번.
 5. **조치**: 판정 결과에 따라 복원하거나, 그대로 두거나, 거부한다(아래 '조치 실행').
 6. **무결성 확인**: DB 파일이 있으면 표준 `sqlite3` 로 읽기 전용 URI(`file:...?mode=ro`)를 열어 `PRAGMA quick_check` 가 `ok` 인지 본다. 아니면(열 수 없음 포함) exit 3. DB 파일이 없으면(새 DB) 건너뛴다. 확인하려고 빈 DB 를 만들지 않는다.
@@ -96,7 +97,7 @@ python -m django_sqlite_ops.boot \
 | `fresh` | 로컬 DB 파일과 로컬 메타가 모두 없고, 원격 조회 성공. 원격이 빈 목록이면 `--init-new` 도 있어야 한다(D-13) | 원격에 복제본이 있으면 복원, 빈 목록(+`--init-new`)이면 그대로 진행(새 DB) |
 | `match` | 로컬 메타의 최대 TXID ≥ 원격 최대 TXID, 그리고 원격 조회 성공 | 그대로 진행 |
 | `adopt` | `--adopt-existing` 이 있고, 로컬 DB 있음 + 로컬 메타 없음 + 원격 조회 성공·빈 목록 (D-11) | 그대로 진행(기존 DB 를 처음 Litestream 에 올림) |
-| `unknown` | 그 밖의 모든 경우: 원격 조회 실패·타임아웃·파싱 실패, 로컬 메타 없음, DB 없이 메타만 남음, 로컬 DB 는 있는데 원격이 빈 목록, 로컬 DB 도 원격도 없는데 `--init-new` 없음, 원격이 앞섬 | **기동 거부(exit 2)**. 사유를 한 줄로 출력 |
+| `unknown` | 그 밖의 모든 경우: 원격 조회 실패·타임아웃·파싱 실패, 로컬 메타 없음, DB 없이 메타만 남음, 0바이트 DB 에 메타만 남음, 로컬 DB 는 있는데 원격이 빈 목록, 로컬 DB 도 원격도 없는데 `--init-new` 없음, 원격이 앞섬 | **기동 거부(exit 2)**. 사유를 한 줄로 출력 |
 
 - `--on-unknown restore` : 복원을 임시 디렉터리에 먼저 끝낸 뒤, 로컬을 `<db>.stale-<ts>/` 디렉터리 하나로 옮기고 복원본을 설치한다. 여러 파일을 한 번에 옮기는 원자적 연산은 없으므로 **재개 가능하게** 옮긴다(L6).
   0. 복원 **전에** 격리할 수 있는지 본다(`check_quarantinable()`). 하나라도 어긋나면 아무것도 바꾸지 않고 exit 2: 대상 경로(DB·사이드카·메타) 자체가 심볼릭 링크, 대상 이름끼리 겹침, 대상 이름이 격리 디렉터리의 예약 이름(`manifest.json`, `manifest.json.tmp-*`)과 겹침, 다른 파일시스템.
@@ -128,13 +129,14 @@ python -m django_sqlite_ops.boot \
   - 제한: 체크섬·페이지 전체 검증은 하지 않는다. Litestream 의 `DB.Pos()` 는 같은 파일을 `Decoder.Verify()` 로 끝까지 검증하므로, 헤더는 멀쩡하고 본문만 깨진 파일은 우리가 TXID 로 받아들이지만 Litestream 은 오류를 낸다. v0.1 범위 밖이다.
   - `litestream ltx <db 경로>` 는 로컬이 아니라 복제본을 나열하므로 쓰지 않는다.
 - **복원 호출**은 `litestream restore -config <설정> -json -integrity-check quick -o <새 경로> <db 경로>` 다. 출력 경로는 아직 없어야 하고(`-force` 를 쓰지 않는다) `-if-db-not-exists` 는 쓰지 않는다. rc 0, `-json` 요약의 `txid`, 출력 파일이 비어 있지 않음을 모두 확인해야 성공이다. 기본 타임아웃 600초. 파일 교체·격리는 호출자(#4)가 한다. 구현은 `restore()`.
-- 판정에 쓰는 정보와 비교 규칙은 `boot/decide.py` 의 순수 함수 `decide()` 하나에 모은다. 입력은 (로컬 존재 여부, 로컬 메타 TXID|None, 원격 조회 결과, `on_unknown`, `adopt_existing`, `init_new`)이고, 원격 조회 결과는 실패(`RemoteError`)·빈 목록(`RemoteEmpty`)·최대 TXID(`RemoteTxid`) 세 타입으로 구분한다. 원격 결과는 정확한 타입으로 한 번 검증해 내부 태그로 정규화하고, TXID 는 내장 `int` 만 받는다(서브클래스는 비교를 바꿔 판정을 우회할 수 있다). 출력은 (상태, 조치, 사유 코드, 사람용 사유 한 줄)이다. 표 기반 단위 테스트(`tests/test_boot_decide.py`)로 모든 조합을 고정한다.
+- 판정에 쓰는 정보와 비교 규칙은 `boot/decide.py` 의 순수 함수 `decide()` 하나에 모은다. 입력은 (로컬 존재 여부, 로컬 DB 가 0바이트인지(`local_empty`, 기본 거짓), 로컬 메타 TXID|None, 원격 조회 결과, `on_unknown`, `adopt_existing`, `init_new`)이고, `local_empty` 가 참인데 로컬 존재가 거짓이면 모순 입력으로 거부한다. 원격 조회 결과는 실패(`RemoteError`)·빈 목록(`RemoteEmpty`)·최대 TXID(`RemoteTxid`) 세 타입으로 구분한다. 원격 결과는 정확한 타입으로 한 번 검증해 내부 태그로 정규화하고, TXID 는 내장 `int` 만 받는다(서브클래스는 비교를 바꿔 판정을 우회할 수 있다). 출력은 (상태, 조치, 사유 코드, 사람용 사유 한 줄)이다. 표 기반 단위 테스트(`tests/test_boot_decide.py`)로 모든 조합을 고정한다.
 
-상태 규칙 (위에서부터 처음 맞는 줄. `*` 는 무관):
+상태 규칙 (위에서부터 처음 맞는 줄. `*` 는 무관. '있음'은 0바이트 파일도 포함한다. 메타 없는 0바이트는 '있음' 행을 그대로 따른다(D-16)):
 
 | 로컬 DB | 로컬 TXID | 원격 | 상태 | 사유 코드 |
 |---|---|---|---|---|
 | 없음 | 값 있음 | * | `unknown` | `stale_meta` — DB 는 없는데 메타만 남음 |
+| 0바이트 | 값 있음 | * | `unknown` | `empty_db` — DB 파일은 비었는데 메타는 복제된 적이 있다고 말한다. TXID 비교는 의미가 없다(#38, D-16) |
 | * | * | 실패 | `unknown` | `remote_error` — DB 가 없어도 복제본 유무를 모르므로 새 DB 로 시작하면 원격을 덮을 수 있다 |
 | 없음 | 없음 | 빈 목록, `init_new` | `fresh` | `new_db` — 생애 첫 배포(D-13) |
 | 없음 | 없음 | 빈 목록 | `unknown` | `no_replica_no_local` — 복제본 경로 오타와 구분되지 않는다(D-13) |
@@ -157,8 +159,8 @@ python -m django_sqlite_ops.boot \
 | `unknown`, 원격 빈 목록 | `REFUSE` | `REFUSE`(복원할 것이 없다) | 로컬 DB 있으면 `KEEP_LOCAL`, 없으면 `REFUSE` |
 | `unknown`, 원격 실패 | `REFUSE` | `REFUSE` | `REFUSE`(D-12) |
 
-- `QUARANTINE_AND_RESTORE` 는 로컬(DB·메타)을 `<db>.stale-<ts>/` 로 옮긴 뒤 복원한다. `stale_meta` 도 남은 메타를 옮겨야 하므로 같은 조치다. `KEEP_LOCAL` 은 진행하되 `unknown_at_boot` 를 남긴다(§7). `REFUSE` 는 exit 2 다.
-- 안전 불변식(테스트로 고정): 로컬 DB 가 있으면 `RESTORE` 는 나오지 않는다(덮어쓰기는 반드시 격리를 거친다). 원격 조회 실패면 `REFUSE` 만 나온다(D-12). `refuse` 면 `unknown` 은 모두 `REFUSE` 다. `adopt_existing` 이 켜져 있어도 원격에 복제본이 있거나, 원격 조회 실패거나, 로컬 메타가 있으면 `adopt` 는 나오지 않으며, 위 한 행 밖에서는 결과가 꺼졌을 때와 같다(D-11). 로컬 DB 가 없을 때 `PROCEED` 는 `init_new` 가 켜져 있고 원격이 빈 목록일 때만 나오며, `init_new` 는 그 한 행 밖에서 결과를 바꾸지 않는다(D-13).
+- `QUARANTINE_AND_RESTORE` 는 로컬(DB·메타)을 `<db>.stale-<ts>/` 로 옮긴 뒤 복원한다. `stale_meta` 도 남은 메타를 옮겨야 하므로 같은 조치다. `empty_db` 는 0바이트 DB·남은 사이드카·메타를 함께 옮긴다. `KEEP_LOCAL` 은 진행하되 `unknown_at_boot` 를 남긴다(§7). `REFUSE` 는 exit 2 다.
+- 안전 불변식(테스트로 고정): 로컬 DB 가 있으면 `RESTORE` 는 나오지 않는다(덮어쓰기는 반드시 격리를 거친다). 원격 조회 실패면 `REFUSE` 만 나온다(D-12). `refuse` 면 `unknown` 은 모두 `REFUSE` 다. `adopt_existing` 이 켜져 있어도 원격에 복제본이 있거나, 원격 조회 실패거나, 로컬 메타가 있으면 `adopt` 는 나오지 않으며, 위 한 행 밖에서는 결과가 꺼졌을 때와 같다(D-11). 로컬 DB 가 없을 때 `PROCEED` 는 `init_new` 가 켜져 있고 원격이 빈 목록일 때만 나오며, `init_new` 는 그 한 행 밖에서 결과를 바꾸지 않는다(D-13). 0바이트 DB 에 로컬 메타 TXID 가 있으면 원격 결과·정책·`adopt_existing`·`init_new` 와 무관하게 `match` 도 `PROCEED` 도 나오지 않는다. 메타 없는 0바이트의 결과는 `local_empty` 가 거짓일 때와 같다(D-16).
 
 ### 4-4. 스파이크 guard.py 와의 차이 (고친 결함)
 `docs/reference/guard_spike.py` 는 랩에서 D4(옛 볼륨 재부팅)를 막는 데 성공했다. 그러나 그대로 옮기면 안 된다. 교차 리뷰에서 지적됐고, 코드로 직접 확인한 결함이다.
@@ -385,7 +387,7 @@ SQLITE_OPS = {
     "version": 1,
     "state": "fresh | match | adopt | unknown",
     "action": "proceed | restore | quarantine_and_restore | keep_local",
-    "reason_code": "decide() 의 사유 코드 또는 orphan_sidecars",
+    "reason_code": "decide() 의 사유 코드(empty_db 포함) 또는 orphan_sidecars",
     "reason": "사람용 한 줄",
     "unknown_at_boot": true,
     "litestream_version": "0.5.17",

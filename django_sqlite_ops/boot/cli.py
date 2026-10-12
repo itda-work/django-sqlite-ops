@@ -496,17 +496,26 @@ def resume_quarantine(db: Path, meta: Path) -> None:
 # --- 3. 판정 입력 -------------------------------------------------------------------------
 
 
-def local_db_exists(db: Path) -> bool:
-    """DB 경로가 정규 파일이면 참, 없으면 거짓. 그 밖의 것(디렉터리·링크 등)이면 거부."""
+def local_db_state(db: Path) -> tuple[bool, bool]:
+    """(DB 가 정규 파일로 있음, 그 파일이 0바이트). lstat 한 번으로 둘 다 본다.
+
+    없으면 ``(False, False)``. 그 밖의 것(디렉터리·링크 등)이면 거부. 잠금을 쥔 뒤에 부르므로
+    다른 boot 와 경쟁하지 않는다. 잠금 밖의 프로세스가 그 사이에 쓰는 경우는 막지 않는다.
+    """
     try:
-        mode = os.lstat(db).st_mode
+        st = os.lstat(db)
     except FileNotFoundError:
-        return False
+        return False, False
     except OSError as exc:
         raise _Exit(EXIT_REFUSE, f"cannot stat {db}: {exc}") from None
-    if not stat.S_ISREG(mode):
+    if not stat.S_ISREG(st.st_mode):
         raise _Exit(EXIT_REFUSE, f"{db} exists but is not a regular file")
-    return True
+    return True, st.st_size == 0
+
+
+def local_db_exists(db: Path) -> bool:
+    """DB 경로가 정규 파일이면 참, 없으면 거짓. 그 밖의 것(디렉터리·링크 등)이면 거부."""
+    return local_db_state(db)[0]
 
 
 # --- 5. 임시 복원·설치 -----------------------------------------------------------------------
@@ -711,6 +720,12 @@ _HINTS = {
         "the replica is newer than this volume (another host wrote after it); rerun with "
         "--on-unknown restore to quarantine local files and restore"
     ),
+    ReasonCode.EMPTY_DB: (
+        "the db file is 0 bytes but litestream meta says it was replicated, so its txid is "
+        "meaningless; check that the existing file is really empty, then rerun with "
+        "--on-unknown restore to quarantine the empty file, sidecars and meta and restore from "
+        "the replica; if the remote lookup failed, fix replica access first (D-12)"
+    ),
     ORPHAN_SIDECARS: (
         "-wal/-shm/-journal exist without the db file; inspect them, or rerun with "
         "--on-unknown restore to quarantine them and restore from the replica"
@@ -720,7 +735,7 @@ _HINTS = {
 
 def _plan(args: argparse.Namespace) -> _Plan:
     db, meta = args.db, args.meta_path
-    local_exists = local_db_exists(db)
+    local_exists, local_empty = local_db_state(db)
     local_txid = ls.local_max_txid(db, meta_path=meta)
     remote = ls.remote_max_txid(
         db, config=args.config, binary=args.litestream, timeout=args.ltx_timeout
@@ -731,7 +746,10 @@ def _plan(args: argparse.Namespace) -> _Plan:
         remote_text = f"error: {remote.message}"
     else:
         remote_text = "empty"
-    log(f"inputs: local_exists={local_exists} local_txid={local_txid} remote={remote_text}")
+    log(
+        f"inputs: local_exists={local_exists} local_empty={local_empty} "
+        f"local_txid={local_txid} remote={remote_text}"
+    )
 
     orphans = [p.name for p in sidecars(db) if os.path.lexists(p)]
     if not local_exists and orphans:
@@ -742,13 +760,19 @@ def _plan(args: argparse.Namespace) -> _Plan:
 
     d = decide(
         local_exists=local_exists,
+        local_empty=local_empty,
         local_txid=local_txid,
         remote=remote,
         on_unknown=args.on_unknown,
         adopt_existing=args.adopt_existing,
         init_new=args.init_new,
     )
-    return _Plan(d.state, d.action, d.reason_code, d.reason)
+    reason = d.reason
+    if d.reason_code is ReasonCode.EMPTY_DB and orphans:
+        # 0바이트 DB 옆에 남은 사이드카는 격리 대상이다. 무엇이 있는지 사유에 남긴다.
+        present = ", ".join(name.removeprefix(db.name) for name in orphans)
+        reason = reason.replace("0 bytes", f"0 bytes ({present} present)", 1)
+    return _Plan(d.state, d.action, d.reason_code, reason)
 
 
 def _act(args: argparse.Namespace, plan: _Plan) -> None:
