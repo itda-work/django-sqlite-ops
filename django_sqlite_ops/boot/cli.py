@@ -722,9 +722,11 @@ _HINTS = {
     ),
     ReasonCode.EMPTY_DB: (
         "the db file is 0 bytes but litestream meta says it was replicated, so its txid is "
-        "meaningless; check that the existing file is really empty, then rerun with "
-        "--on-unknown restore to quarantine the empty file, sidecars and meta and restore from "
-        "the replica; if the remote lookup failed, fix replica access first (D-12)"
+        "meaningless and --on-unknown keep-local is refused too (D-17); check that the file is "
+        "really empty, then if the replica has data rerun with --on-unknown restore to "
+        "quarantine the empty file, sidecars and meta and restore from it; if the replica is "
+        "empty, inspect and remove the empty file, sidecars and meta yourself and boot once "
+        "with --init-new (D-13); if the remote lookup failed, fix replica access first (D-12)"
     ),
     ORPHAN_SIDECARS: (
         "-wal/-shm/-journal exist without the db file; inspect them, or rerun with "

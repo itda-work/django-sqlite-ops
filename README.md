@@ -473,7 +473,7 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 | `remote_ahead` | 복제본이 이 볼륨보다 새롭다(옛 볼륨으로 재부팅) | 복제본이 정본이면 `--on-unknown restore` 로 한 번 부팅한다. 로컬은 `<db>.stale-<ts>/` 에 남는다 |
 | `no_local_meta` | DB 는 있는데 Litestream 메타가 없다 | 아래 '복원 직후 크래시 복구'. 기존 DB 를 처음 올리는 중이고 복제본이 비었으면 `--adopt-existing` |
 | `stale_meta` | DB 없이 메타만 남았다 | `--on-unknown restore` 로 메타를 격리하고 복원한다 |
-| `empty_db` | DB 파일이 0바이트인데 메타는 복제된 적이 있다고 말한다 | 아래 '0바이트 DB 복구'. 기존 파일이 정말 비었는지 확인하고 `--on-unknown restore` 로 한 번 부팅한다 |
+| `empty_db` | DB 파일이 0바이트인데 메타는 복제된 적이 있다고 말한다 | 아래 '0바이트 DB 복구'. 기존 파일이 정말 비었는지 확인하고 `--on-unknown restore` 로 한 번 부팅한다. `keep-local` 도 거부된다([D-17](docs/DECISIONS.md)) |
 | `remote_empty` | 복제한 적 있는 DB 인데 복제본이 비었다 | 복제본 경로·prefix·버킷을 확인한다. 로컬을 그대로 쓰려면 `--on-unknown keep-local` |
 | `orphan_sidecars` | DB 파일 없이 `-wal`/`-shm`/`-journal` 만 있다 | 파일을 조사한다. 복제본이 정본이면 `--on-unknown restore` 로 격리하고 복원한다 |
 
@@ -499,8 +499,9 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 
 1. DB 파일이 정말 비어야 하는 것이 아닌지(다른 곳에 옮겨 둔 원본이 있는지) 확인한다.
 2. 복제본이 정본이면 `--on-unknown restore` 로 한 번 부팅한다. 빈 파일·사이드카·메타는 `<db>.stale-<ts>/` 로 옮겨지고 복제본이 복원된다. 복제본 조회가 실패하면 이 경우에도 거부한다([D-12](docs/DECISIONS.md)).
-3. `--on-unknown keep-local` 은 쓰지 않는다. 원격 조회가 성공하면 이 거부를 우회해 빈 DB 로 앱을 띄우고, 그 상태에서 앱이 쓰면 복제본 최신본에서 기존 데이터가 사라진다. `empty_db` 에서는 `restore` 를 쓴다.
-4. 이미 빈 DB 로 앱이 돌아 복제까지 됐다면 최신 복제본에는 원래 데이터가 없다. `litestream restore -txid <이전 TXID>` 로 사고 이전 시점을 따로 복원해 확인한다.
+3. 복제본이 비었으면(`remote=empty`) 복원할 것이 없어 `restore` 도 거부된다. 빈 파일·사이드카·메타를 확인해 직접 치운 뒤 `--init-new` 로 한 번 부팅한다(첫 배포 절차, [D-13](docs/DECISIONS.md)).
+4. `--on-unknown keep-local` 도 거부된다([D-17](docs/DECISIONS.md)). 빈 DB 로 앱을 띄우면 그 상태의 쓰기가 복제돼 복제본 최신본에서 기존 데이터가 사라지기 때문이다. 빈 DB 로 다시 시작하는 별도 옵션은 없다.
+5. 이미 빈 DB 로 앱이 돌아 복제까지 됐다면 최신 복제본에는 원래 데이터가 없다. `litestream restore -txid <이전 TXID>` 로 사고 이전 시점을 따로 복원해 확인한다.
 
 메타가 없는 0바이트 파일은 이 규칙 밖이다. 지금처럼 `no_local_meta`(복제본이 비었고 `--adopt-existing` 이면 `adopt`)로 판정된다([D-16](docs/DECISIONS.md)).
 
