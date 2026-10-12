@@ -462,7 +462,7 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 
 이미 운영 중인 DB 를 처음 Litestream 에 올리면 로컬 메타가 없고 복제본은 비어 있다. 이때만 `--adopt-existing` 을 붙인다. 정확히 (로컬 DB 있음, 로컬 메타 없음, 원격 빈 목록) 일 때만 통과시키고 다른 조합에는 효과가 없다. 첫 복제가 끝나면 지운다([D-11](docs/DECISIONS.md)). `--on-unknown keep-local` 을 도입 절차로 쓰지 않는다.
 
-DB 파일이 0바이트면 도입할 데이터가 없으므로 `--adopt-existing` 이 있어도 `no_local_meta` 로 거부한다([D-18](docs/DECISIONS.md)). 원격 조회가 실패하면 그 전에 `remote_error` 로 거부된다([D-12](docs/DECISIONS.md)). 도입하면 빈 DB 가 복제본의 첫 세대가 되고, 복제본 경로가 틀려 진짜 복제본이 다른 곳에 있을 때도 구분할 수 없다. 대처는 아래 '0바이트 DB 복구'의 '메타가 없을 때'를 따른다.
+DB 파일이 0바이트면 도입할 데이터가 없으므로 `--adopt-existing` 이 있어도 `no_local_meta` 로 거부한다([D-18](docs/DECISIONS.md)). 메타 없는 0바이트에서 원격 조회가 실패하면 그 전에 `remote_error` 로 거부된다([D-12](docs/DECISIONS.md)). 도입하면 빈 DB 가 복제본의 첫 세대가 되고, 복제본 경로가 틀려 진짜 복제본이 다른 곳에 있을 때도 구분할 수 없다. 대처는 아래 '0바이트 DB 복구'의 '메타가 없을 때'를 따른다.
 
 #### 거부됐을 때 (exit 2): 사유 코드별 대처
 
