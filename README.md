@@ -425,7 +425,7 @@ stderr 의 `[boot] ...` 줄만 보면 무슨 일이 있었는지 알 수 있다.
 
 ```text
 [boot] lock: /data/app.sqlite3.boot.lock
-[boot] inputs: local_exists=False local_txid=None remote=txid 25
+[boot] inputs: local_exists=False local_empty=False local_txid=None remote=txid 25
 [boot] decision: state=fresh action=restore reason_code=restore_from_remote reason=no local db; restore remote txid 25
 [boot] restore: /data/app.sqlite3 -> /data/app.sqlite3.restore-20261008T010203.000001Z-1a2b3c4d/app.sqlite3
 [boot] restore: ok, txid 25
@@ -473,6 +473,7 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 | `remote_ahead` | 복제본이 이 볼륨보다 새롭다(옛 볼륨으로 재부팅) | 복제본이 정본이면 `--on-unknown restore` 로 한 번 부팅한다. 로컬은 `<db>.stale-<ts>/` 에 남는다 |
 | `no_local_meta` | DB 는 있는데 Litestream 메타가 없다 | 아래 '복원 직후 크래시 복구'. 기존 DB 를 처음 올리는 중이고 복제본이 비었으면 `--adopt-existing` |
 | `stale_meta` | DB 없이 메타만 남았다 | `--on-unknown restore` 로 메타를 격리하고 복원한다 |
+| `empty_db` | DB 파일이 0바이트인데 메타는 복제된 적이 있다고 말한다 | 아래 '0바이트 DB 복구'. 기존 파일이 정말 비었는지 확인하고 `--on-unknown restore` 로 한 번 부팅한다 |
 | `remote_empty` | 복제한 적 있는 DB 인데 복제본이 비었다 | 복제본 경로·prefix·버킷을 확인한다. 로컬을 그대로 쓰려면 `--on-unknown keep-local` |
 | `orphan_sidecars` | DB 파일 없이 `-wal`/`-shm`/`-journal` 만 있다 | 파일을 조사한다. 복제본이 정본이면 `--on-unknown restore` 로 격리하고 복원한다 |
 
@@ -486,6 +487,22 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream.yml \
     --on-unknown restore -- litestream replicate -config /etc/litestream.yml -exec "..."
 ```
+
+#### 0바이트 DB 복구 (`empty_db`)
+
+잘못된 복사나 DB 를 지운 뒤 열린 연결 때문에 DB 파일만 0바이트가 되고 Litestream 메타(`.<db>-litestream/`)가 남을 수 있다. SQLite 는 빈 파일을 빈 DB 로 열고 `quick_check` 도 `ok` 라서, 메타의 TXID 만 믿고 진행하면 앱이 빈 DB 에 테이블을 새로 만들고 그것을 복제해 **복제본 최신본에서 기존 데이터가 사라진다**(#38 재현). 그래서 boot 는 이 조합을 `empty_db` 로 거부한다. `-wal`·`-shm` 이 남아 있어도 DB 파일이 있으므로 `orphan_sidecars` 가 아니라 `empty_db` 이고, 남은 파일 이름이 사유에 나온다.
+
+```text
+[boot] inputs: local_exists=True local_empty=True local_txid=25 remote=txid 25
+[boot] decision: state=unknown action=refuse reason_code=empty_db reason=local db is 0 bytes (-wal, -shm present) but local meta has txid 25; remote txid 25
+```
+
+1. DB 파일이 정말 비어야 하는 것이 아닌지(다른 곳에 옮겨 둔 원본이 있는지) 확인한다.
+2. 복제본이 정본이면 `--on-unknown restore` 로 한 번 부팅한다. 빈 파일·사이드카·메타는 `<db>.stale-<ts>/` 로 옮겨지고 복제본이 복원된다. 복제본 조회가 실패하면 이 경우에도 거부한다([D-12](docs/DECISIONS.md)).
+3. `--on-unknown keep-local` 은 쓰지 않는다. 원격 조회가 성공하면 이 거부를 우회해 빈 DB 로 앱을 띄우고, 그 상태에서 앱이 쓰면 복제본 최신본에서 기존 데이터가 사라진다. `empty_db` 에서는 `restore` 를 쓴다.
+4. 이미 빈 DB 로 앱이 돌아 복제까지 됐다면 최신 복제본에는 원래 데이터가 없다. `litestream restore -txid <이전 TXID>` 로 사고 이전 시점을 따로 복원해 확인한다.
+
+메타가 없는 0바이트 파일은 이 규칙 밖이다. 지금처럼 `no_local_meta`(복제본이 비었고 `--adopt-existing` 이면 `adopt`)로 판정된다([D-16](docs/DECISIONS.md)).
 
 #### 함정
 

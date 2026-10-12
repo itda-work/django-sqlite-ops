@@ -1226,6 +1226,112 @@ def test_restore_also_quarantines_unusable_meta(lab, fake, no_exec):
     assert not meta.exists()
 
 
+# --- 0바이트 DB + 로컬 메타 (#38, D-16) ---
+
+
+def empty_volume(lab: Path, *sidecar_names: str) -> tuple[Path, Path]:
+    """DB 본 파일만 0바이트이고 로컬 메타(최대 TXID 0x19)가 남은 볼륨."""
+    db = lab / "app.db"
+    db.touch()
+    for name in sidecar_names:
+        (lab / name).write_bytes(name.encode())
+    return db, write_meta(db)
+
+
+def test_empty_db_with_meta_refuses_by_default(lab, fake, no_exec, capsys):
+    empty_volume(lab)
+    fake.remote_txid(0x19)
+    before = snapshot(lab)
+    assert main_inproc(boot_args(lab, fake), no_exec) == cli.EXIT_REFUSE
+    err = capsys.readouterr().err
+    assert "local_empty=True" in err
+    assert "reason_code=empty_db" in err
+    assert "0 bytes" in err
+    assert "hint:" in err and "--on-unknown restore" in err
+    assert snapshot(lab, skip=("app.db.boot.lock",)) == before
+    assert "restore" not in fake.calls()
+    assert not no_exec[0]
+
+
+@pytest.mark.parametrize("remote", [None, 0x10, 0x19, 0x20])
+def test_empty_db_with_meta_never_matches(lab, fake, no_exec, capsys, remote):
+    empty_volume(lab)
+    fake.remote_txid(remote)
+    assert main_inproc(boot_args(lab, fake), no_exec) == cli.EXIT_REFUSE
+    assert "reason_code=empty_db" in capsys.readouterr().err
+
+
+def test_empty_db_with_meta_restore_policy_quarantines_and_restores(lab, fake, no_exec):
+    db, meta = empty_volume(lab)
+    fake.remote_txid(0x19)
+    old = snapshot(lab)
+    assert main_inproc(boot_args(lab, fake, "--on-unknown", "restore"), no_exec) == "exec"
+    assert count_rows(db) == 7
+    (final,) = stale_dirs(lab)
+    assert (final / "app.db").stat().st_size == 0
+    assert (final / ".app.db-litestream").is_dir()
+    assert snapshot(final, skip=("manifest.json",)) == old
+    assert not meta.exists()
+    s = state(lab)
+    assert (s["state"], s["action"], s["reason_code"]) == (
+        "unknown",
+        "quarantine_and_restore",
+        "empty_db",
+    )
+
+
+def test_empty_db_with_wal_is_empty_db_not_orphan_sidecars(lab, fake, no_exec, capsys):
+    # DB 파일이 있으므로 orphan_sidecars 가 아니다. 남은 사이드카 이름은 사유에 들어간다.
+    empty_volume(lab, "app.db-wal", "app.db-shm")
+    fake.remote_txid(0x19)
+    assert main_inproc(boot_args(lab, fake), no_exec) == cli.EXIT_REFUSE
+    err = capsys.readouterr().err
+    assert "reason_code=empty_db" in err
+    assert "orphan_sidecars" not in err
+    assert "(-wal, -shm present)" in err
+    assert main_inproc(boot_args(lab, fake, "--on-unknown", "restore"), no_exec) == "exec"
+    (final,) = stale_dirs(lab)
+    assert (final / "app.db-wal").read_bytes() == b"app.db-wal"
+    assert (final / "app.db-shm").read_bytes() == b"app.db-shm"
+    assert (final / "app.db").stat().st_size == 0
+    assert count_rows(lab / "app.db") == 7
+    assert state(lab)["reason_code"] == "empty_db"
+    assert "(-wal, -shm present)" in state(lab)["reason"]
+
+
+def test_empty_db_with_meta_remote_error_refuses_any_policy(lab, fake, no_exec, capsys):
+    empty_volume(lab, "app.db-wal")
+    fake.remote_error()
+    before = snapshot(lab)
+    for policy in ("refuse", "restore", "keep-local"):
+        assert main_inproc(boot_args(lab, fake, "--on-unknown", policy), no_exec) == 2
+    err = capsys.readouterr().err
+    assert "reason_code=empty_db" in err
+    assert "remote error" in err and "D-12" in err
+    assert snapshot(lab, skip=("app.db.boot.lock",)) == before
+    assert "restore" not in fake.calls()
+
+
+def test_empty_db_without_meta_keeps_existing_rules(lab, fake, no_exec, capsys):
+    # 메타 없는 0바이트는 D-16 범위 밖이다. no_local_meta / adopt_existing 그대로.
+    (lab / "app.db").touch()
+    fake.remote_txid(0x19)
+    assert main_inproc(boot_args(lab, fake), no_exec) == cli.EXIT_REFUSE
+    assert "reason_code=no_local_meta" in capsys.readouterr().err
+    fake.remote_txid(None)
+    assert main_inproc(boot_args(lab, fake, "--adopt-existing"), no_exec) == "exec"
+    assert state(lab)["state"] == "adopt"
+
+
+def test_local_db_size_input(lab):
+    db = lab / "app.db"
+    assert cli.local_db_state(db) == (False, False)
+    db.touch()
+    assert cli.local_db_state(db) == (True, True)
+    make_db(db, 1)
+    assert cli.local_db_state(db) == (True, False)
+
+
 def test_db_path_that_is_not_a_regular_file_refuses(lab, fake, no_exec):
     (lab / "app.db").mkdir()
     assert main_inproc(boot_args(lab, fake), no_exec) == cli.EXIT_REFUSE
@@ -1284,7 +1390,7 @@ def test_stderr_tells_the_story(lab, fake):
     text = result.stderr
     for needle in (
         "lock:",
-        "inputs: local_exists=False local_txid=None remote=txid 5",
+        "inputs: local_exists=False local_empty=False local_txid=None remote=txid 5",
         "decision: state=fresh action=restore reason_code=restore_from_remote",
         "restore: ok, txid 5",
         "install:",
@@ -1590,6 +1696,51 @@ def test_l7_corrupt_replica_restore_fails_local_unchanged(real):
     assert {k: v for k, v in after.items() if ".restore-" not in k} == before
     assert not stale_dirs(data)
     assert read_marker(data) is None
+
+
+def _empty_db_volume(data: Path, db: Path) -> Path:
+    """#38 재현 절차 3: DB·사이드카를 치우고 메타·복제본은 두고 0바이트 정규 파일을 만든다."""
+    aside = data.parent / "aside"
+    aside.mkdir()
+    for p in [db, *cli.sidecars(db)]:
+        if p.exists():
+            p.rename(aside / p.name)
+    db.touch()
+    assert (data / ".app.db-litestream").is_dir()
+    return aside
+
+
+def test_l8_empty_db_with_meta_refuses_then_restores(real):
+    # #38: 0바이트 DB + 로컬 메타 TXID == 원격 TXID 를 match 로 통과시키지 않는다.
+    data, db, config = real("vol")
+    _empty_db_volume(data, db)
+    replica = config.parent / "replica"
+    before_replica, before_data = snapshot(replica), snapshot(data)
+    result = run_boot(real_args(db, config, cmd=marker_command(data, db)))
+    assert result.returncode == 2, result.stderr
+    assert "reason_code=empty_db" in result.stderr
+    assert "--on-unknown restore" in result.stderr
+    assert read_marker(data) is None
+    assert snapshot(replica) == before_replica
+    assert snapshot(data, skip=("app.db.boot.lock",)) == before_data
+    assert db.stat().st_size == 0
+
+    result = run_boot(
+        real_args(db, config, "--on-unknown", "restore", cmd=marker_command(data, db))
+    )
+    assert result.returncode == 0, result.stderr
+    assert read_marker(data)["lock_held"] is True
+    assert count_rows(db) == 20
+    (final,) = stale_dirs(data)
+    assert (final / "app.db").stat().st_size == 0
+    assert (final / ".app.db-litestream" / "ltx").is_dir()
+    assert snapshot(replica) == before_replica
+    s = state(data)
+    assert (s["state"], s["action"], s["reason_code"]) == (
+        "unknown",
+        "quarantine_and_restore",
+        "empty_db",
+    )
 
 
 def test_first_deploy_needs_init_new(litestream_binary, tmp_path):
