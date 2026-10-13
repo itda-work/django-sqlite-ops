@@ -398,7 +398,7 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 | `--on-unknown` | `refuse` | 판정할 수 없을 때: `refuse`(거부) · `restore`(로컬을 격리하고 복원) · `keep-local`(로컬 유지, 헬스에 `unknown_at_boot`. 원격 조회 실패([D-12](docs/DECISIONS.md))와 [0바이트 DB](#0바이트-db-복구-empty_db)(메타가 있으면 `empty_db` [D-17](docs/DECISIONS.md), 없고 원격 조회가 성공했으면 `no_local_meta` [D-18](docs/DECISIONS.md))는 이 값이어도 거부) |
 | `--init-new` | 꺼짐 | 생애 첫 배포에서 새 DB 로 시작. [한 번 쓰고 끈다](#생애-첫-배포---init-new-를-한-번-쓰고-끈다) |
 | `--adopt-existing` | 꺼짐 | 기존 DB 를 처음 Litestream 에 올린다. 0바이트 파일은 도입하지 않는다([D-18](docs/DECISIONS.md)). [한 번 쓰고 끈다](#기존-db-도입---adopt-existing-을-한-번-쓰고-끈다) |
-| `--meta-path PATH` | `<db 디렉터리>/.<db 이름>-litestream` | Litestream 설정에 `meta-path` 를 바꿨다면 같은 값을 준다 |
+| `--meta-path PATH` | `<db 디렉터리>/.<db 이름>-litestream` | Litestream 설정에 `meta-path` 를 바꿨다면 같은 값을 준다. 자기만의 **디렉터리**여야 한다: DB·사이드카·`<db>.boot.lock`·`<db>.boot-state.json`·`--config`·`<db>.restore-*`·`<db>.stale-*` 와 같거나 그 조상·자손이면 exit 64, 있는데 디렉터리가 아니면(파일·FIFO·끊어진 링크) exit 2([D-19](docs/DECISIONS.md)) |
 | `--litestream BIN` | `litestream` | 실행 파일 |
 | `--ltx-timeout S` | `30` | 원격 TXID 조회 제한 시간(초). 넘으면 거부한다 |
 | `--restore-timeout S` | `600` | 복원 제한 시간(초). DB 크기에 맞춰 늘린다 |
@@ -444,7 +444,7 @@ stderr 의 `[boot] ...` 줄만 보면 무슨 일이 있었는지 알 수 있다.
 | `3` | 무결성 실패(`quick_check` 가 `ok` 아님) | DB 파일을 조사한다. 판정은 `match` 라 `--on-unknown restore` 만으로는 복원되지 않는다. 복제본이 정본이면 DB 파일(과 `-wal`·`-shm`)을 다른 곳으로 옮기고 `--on-unknown restore` 로 다시 부팅한다. 남은 메타가 `stale_meta` 로 격리되고 복원된다 |
 | `4` | 복원 실패 | 로그의 `restore failed:` 사유를 본다. 임시 복원이 실패했으면 로컬은 그대로이고, 남은 `<db>.restore-…/` 는 조사 뒤 지운다. 격리·설치 중 I/O 실패도 4 다. 격리 도중이면 `<db>.stale-…partial/` 이 남고 다음 부팅이 이어서 끝낸다. 격리를 마친 뒤(설치 중) 실패했으면 다음 부팅이 남은 상태에 따라 다시 복원하거나(로컬이 비었을 때) `no_local_meta` 로 거부한다(아래 '복원 직후 크래시 복구') |
 | `5` | 잠금 실패 | 같은 볼륨에서 이미 돌고 있는 컨테이너·프로세스를 멈춘다 |
-| `64` | 사용법 오류 | 인자를 고친다. `--` 뒤 명령이 꼭 있어야 한다. 경로가 실제 경로가 아니면 메시지의 실제 경로로 바꾸고 Litestream 설정도 같은 경로로 맞춘다 |
+| `64` | 사용법 오류 | 인자를 고친다. `--` 뒤 명령이 꼭 있어야 한다. 경로가 실제 경로가 아니면 메시지의 실제 경로로 바꾸고 Litestream 설정도 같은 경로로 맞춘다. `--meta-path ... overlaps` 면 메타를 Litestream 설정의 `meta-path` 와 같은 자기만의 디렉터리로 준다 |
 | `127` | `--` 뒤 명령을 실행할 수 없음 | 명령 이름·PATH·실행 권한을 확인한다 |
 
 #### 생애 첫 배포: `--init-new` 를 한 번 쓰고 끈다
@@ -518,7 +518,8 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 #### 함정
 
 - 경로는 [경로 규칙](#경로-규칙)대로 준다.
-- `--meta-path` 를 DB 디렉터리 자체나 그 조상으로 두지 않는다. 메타가 DB 를 포함하면 격리가 필요할 때 거부된다(exit 2).
+- `--meta-path` 를 DB 디렉터리 자체나 그 조상으로 두지 않는다. 메타가 DB 를 포함하면 인자 해석에서 거부된다(exit 64).
+- `--meta-path` 를 `<db>.boot.lock`·`<db>.boot-state.json`·DB·사이드카·Litestream 설정 파일이나 boot 가 만드는 `<db>.restore-*`·`<db>.stale-*` 로 주지 않는다. 메타는 복원 때 격리되므로, 예전에는 잠금 파일을 메타로 주면 boot 가 자기 잠금을 옮겨 두 번째 부팅이 같은 볼륨을 잠글 수 있었다(재현함, #39). 지금은 잠금 파일을 만들기 전에 exit 64 로 거부한다. 대소문자만 다른 이름(`APP.DB.BOOT.LOCK`, macOS 에서 `DATA` 처럼 같은 디렉터리의 다른 철자)도 같은 것으로 보고 거부한다. 메타 경로에 정규 파일·FIFO·끊어진 링크가 있으면 판정 전에 exit 2 다. Litestream 설정의 `meta-path` 와 같은 디렉터리를 준다.
 - 메타 디렉터리는 DB 와 같은 파일시스템에 둔다. 격리는 rename 으로 하므로 다른 볼륨에 있으면 거부한다.
 - **격리가 필요할 때(`restore` 조치) DB·`-wal`·`-shm`·`-journal`·메타 디렉터리 경로가 심볼릭 링크면 거부한다(exit 2).** 링크를 옮기면 실체가 밖에 남기 때문이다(v0.1 제약). 판정만 하고 진행하는 부팅(`match` 등)에서는 메타 디렉터리 링크를 따라가므로 평소에는 드러나지 않는다. 볼륨 안에 실제 파일·디렉터리로 둔다.
 - DB 나 `--meta-path` 의 이름을 `manifest.json` 으로 하지 않는다. 격리 디렉터리의 예약 이름이라 격리가 필요할 때 거부된다.
@@ -790,6 +791,8 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 | S3 가 내려가 연결을 거부하는데 boot 가 30초 걸려 exit 2, `remote_error`(사유 `timed out`) | Litestream 0.5.17 의 `ltx` 는 연결 거부에도 곧바로 실패하지 않고 재시도하며 기다린다 | S3 를 복구한 뒤 다시 띄운다. 더 빨리 거부하려면 `--ltx-timeout` 을 줄인다 | 재현함(회귀 랩 L4: toxiproxy 로 끊음 → 30.5초) |
 | exit 2, `remote_error` 이고 사유에 `database not found in config` | `--db` 가 `litestream.yml` 의 `path` 와 다르다 | 세 곳을 같은 실제 경로로([경로 규칙](#경로-규칙)) | 재현함(fixture `ltx_db_not_in_config`) |
 | exit 64, 실제 경로 안내 | `--db`·`--meta-path` 의 부모에 심볼릭 링크·`..`·없는 디렉터리 | 안내된 실제 경로를 쓰고, 이미지에서 부모 디렉터리를 만든다([경로 규칙](#경로-규칙)) | 코드상 확인([D-15](docs/DECISIONS.md)) |
+| exit 64, `--meta-path ... overlaps the boot lock`(또는 db·state file·`--config`·restore/quarantine area) | `--meta-path` 가 boot 소유 경로와 같거나 조상·자손이다. 그대로 두면 복원 때 boot 가 잠금·상태 파일을 격리해 잠금 보호가 사라진다 | Litestream 설정의 `meta-path` 와 같은 자기만의 디렉터리를 준다([함정](#함정)) | 재현함(#39, 실제 litestream 으로 두 번째 잠금 획득) |
+| exit 2, `--meta-path ... is not a directory`·`broken symbolic link` | 메타 경로에 정규 파일·FIFO·끊어진 링크가 있다 | 메타 경로를 확인해 디렉터리로 두거나 경로를 고친다. boot 는 그 파일을 격리하지 않는다 | 코드상 확인(#39 테스트) |
 | exit 5 | 같은 볼륨에서 boot 나 그것이 exec 한 앱이 이미 돈다(잠금은 exec 된 명령에 상속) | 앞선 컨테이너를 멈춘다. `<db>.boot.lock` 은 지우지 않는다([함정](#boot-cli)) | 코드상 확인 |
 | 옛 볼륨으로 다시 띄우자 exit 2, `remote_ahead` | 복제본이 이 볼륨보다 새롭다. 보호가 없으면 최신본이 옛 볼륨으로 덮인다 | 복제본이 정본이면 `--on-unknown restore` 로 한 번([사유 코드별 대처](#거부됐을-때-exit-2-사유-코드별-대처)) | 실측(docker D4: 150건이 55건으로 덮임), 재현함(회귀 랩 L2: boot 가 exit 2 로 막고 복제본 무변경) |
 | 복원 직후 컨테이너가 죽은 뒤 exit 2, `no_local_meta` | 복원한 DB 옆에는 Litestream 메타가 없고 `replicate` 가 첫 변경을 기록해야 생긴다 | `--on-unknown restore` 로 한 번([복원 직후 크래시 복구](#복원-직후-크래시-복구)) | 실측(restore 결과에 메타 없음), [D-14](docs/DECISIONS.md) |
