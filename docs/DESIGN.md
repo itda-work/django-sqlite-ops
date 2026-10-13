@@ -1,6 +1,6 @@
 # django-sqlite-ops 설계서 v1
 
-- 상태: 설계 확정 전 단계(v1). 구현은 아직 없다.
+- 상태: v0.1 범위(§3-1)는 구현·병합됐다(#1~#10, 이후 결함 수정 #38~#44). 남은 것은 2단계(§3-2)와 §12 의 미검증 항목이다. PyPI 배포·외부 홍보는 보류한다(D-4·D-9).
 - 작성: Django전문가-아이스버그(itda-django), 2026-10-07
 - 근거: `docs/research/` 의 보고서 6편과 교차 리뷰 원문. 수치는 모두 그 보고서의 실측이다.
 - 이름 `django-sqlite-ops` 는 가칭이다. PyPI 배포 전에 바꿀 수 있다(→ `docs/DECISIONS.md` D-6).
@@ -195,21 +195,24 @@ python -m django_sqlite_ops.boot \
 ```
 django_sqlite_ops/
 ├── boot/            Django import 금지. 표준 라이브러리 + subprocess(litestream)만
-│   ├── __main__.py
+│   ├── __main__.py  진입점
+│   ├── cli.py       잠금·격리·재개·조치·상태 파일·exec (§4-2)
 │   ├── decide.py    판정 순수 함수
-│   ├── litestream.py  ltx/restore 호출과 출력 파싱(버전 고정 테스트)
-│   └── lock.py
+│   └── litestream.py  ltx/restore 호출과 출력 파싱(버전 고정 테스트)
 ├── database.py      권장 설정 표 + sqlite_database() (§6-0). 표준 라이브러리만 import
 ├── apps.py          체크 등록만. ready()에서 DB 를 열지 않는다
 ├── checks.py        정적 체크 (§6)
-├── management/commands/sqlite_doctor.py
+├── doctor.py        sqlite_doctor 진단 로직 (§6-2)
+├── management/commands/sqlite_doctor.py  옵션·출력·종료 코드만
 ├── health.py        헬스 상태 계산 + 뷰 (§7)
+├── wal.py           WAL 커밋 위치 계산(DB 를 열지 않음, §7)
 ├── compat/
-│   └── channels_lite.py  선택적 몽키패치 (§9)
+│   ├── channels_lite.py  선택적 몽키패치 (§9)
+│   └── _channels_lite_aio.py  교체 메서드 (§9)
 └── vfs.py           (2단계) 확장 로드 우회 — 옵션
 ```
 - 의존성: Django ≥ 5.2(LTS)만 필수다. extra 로 `[nats]` → channels-nats, `[channels-lite]` → channels-lite 를 둔다.
-- 지원 범위(초안): Python 3.13+, Django 5.2 / 6.1, SQLite 3.37+ (Django 하한). Litestream 0.5.17 에 맞추고, CLI 출력 파싱은 버전 범위를 명시한다.
+- 지원 범위(CI `.github/workflows/ci.yml` 이 정본): Python 3.13+, Django 5.2 / 6.1, SQLite 3.37+ (Django 하한). Litestream 0.5.17 에 맞추고, CLI 출력 파싱은 버전 범위를 명시한다.
 
 ## 6. 권장 설정, 진단과 체크
 
@@ -524,4 +527,4 @@ SQLITE_OPS = {
 - Windows 에서 boot CLI 의 파일 잠금과 디렉터리 rename 원자성 [확인 필요]. 그때까지 boot 는 `fcntl` 이 없으면 exit 64 로 거부한다
 - channels-nats D2 의 196/200 이 하네스 문제인지 [확인 필요]
 - "같은 이력" 증명 방법(자동 판정의 전제) [확인 필요]
-- Litestream 상류 #1506(VFS 확장 로드), #1271·#1363(writable VFS) 머지 여부
+- Litestream 상류(2026-10-13 확인): #1506(VFS 확장 로드)은 2026-10-08 머지됐으나 v0.5.17 이후라 미릴리스 — 다음 릴리스에서 Linux 확장 로드 뒤 일반 connect 실패가 사라지는지 재검증한다. #1271(writable VFS 손상)은 열림, 수정 PR #1363 도 열림(§3-3 유지)

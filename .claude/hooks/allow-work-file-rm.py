@@ -1,5 +1,6 @@
 #!/usr/bin/env python3
-"""PermissionRequest(Bash) 훅: `.work/issue-<N>/` 아래 파일을 지우는 단독 `rm` 만 확인 없이 허용한다.
+"""PermissionRequest(Bash) 훅: `.work/issue-<N>/` 아래 파일을 지우는 단독 `rm` 만
+확인 없이 허용한다.
 
 전역 설정의 `ask: Bash(rm:*)` 때문에 구현 에이전트가 자기가 만든 작업 파일을 지울 때마다
 멈춘다. 허용 규칙(allow)과 PreToolUse 훅의 allow 는 ask 규칙을 넘지 못한다(공식 문서, 실측 확인).
