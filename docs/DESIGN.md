@@ -335,7 +335,7 @@ django_sqlite_ops/
   `key` 목록은 늘어날 수 있다. 소비자는 모르는 `key` 를 무시한다. 필드를 빼거나 뜻을 바꾸면 `version` 을 올린다.
 
 #### `--restore-test` — 주기적 복원 검증 (#52)
-> **설계 단계(구현 전, 2026-10-14).** 아래 '결정' 표는 확정(2026-10-14, 마스터 확인, D-20~D-24)이고, 나머지는 #52 의 설계 초안을 옮긴 것이다. 구현은 별도 이슈에서 하며 그때 실측으로 바뀔 수 있다. 아직 명령에 이 옵션은 없다.
+> **설계 단계(구현 전, 2026-10-14).** 아래 '결정' 표는 확정(2026-10-14, 마스터 확인, D-20~D-25)이고, 나머지는 #52 의 설계 초안을 옮긴 것이다. 구현은 별도 이슈에서 하며 그때 실측으로 바뀔 수 있다. 아직 명령에 이 옵션은 없다.
 
 헬스(§7)는 "지금 복제가 따라오는가"만 말한다. 이 모드는 "복제본으로 실제 복구할 수 있는가"를 본다: 복제본을 별도 디렉터리에 실제로 복원하고, 무결성과 TXID 를 확인한다.
 
@@ -348,16 +348,21 @@ django_sqlite_ops/
 | TXID 비교 | 복원 TXID 가 **복원 직전 조회한 원격 최대 TXID 이상**이면 ok, 미만이면 warn | 복원 중 새 업로드로 원격이 앞서는 것은 정상이므로 '이상'만 본다 | D-22 |
 | 실행 방식 | **단독 모드**: `--restore-test` 를 주면 `restore` 섹션만 낸다 | 무겁고 주기가 다른 작업이라 다른 진단과 섞지 않는다 | D-23 |
 | 무결성 실행 | `restore(..., integrity_check="none")` 으로 받은 뒤 **우리가** 복원본에 `PRAGMA integrity_check`/`quick_check` 를 실행한다 | `restore()` 는 실패를 사유 한 줄로만 돌려줘 Litestream 의 무결성 실패와 내려받기 실패가 구분되지 않는다(코드상 확인). `restore`·`integrity` 를 따로 판정한다 | D-24 |
+| 운영 경로 보호 | 메타 경로는 헬스 설정의 `meta_path`, 없으면 기본 `.<db>-litestream/`. 그와 별도로 `DIR` 이 **운영 DB 의 부모 디렉터리와 같거나 그 안이거나 그것을 포함하면 무조건 거부**한다. 보호 대상은 실행 대상 모든 별칭의 운영 경로 합집합 | Litestream YAML 의 `meta-path` 는 `databases -json` 이 내주지 않아(0.5.17 재현함) 사용자 지정 메타를 다 알 수 없으므로 보수적으로 막는다 | D-25 |
 
 **입력**
-- `sqlite_doctor --restore-test --restore-dir DIR --litestream-config C [--database ALIAS ...] [--litestream BIN] [--integrity full|quick] [--restore-timeout SEC] [--keep] [--json]`
+- `sqlite_doctor --restore-test --restore-dir DIR --litestream-config C [--database ALIAS ...] [--litestream BIN] [--integrity full|quick] [--restore-timeout SEC] [--integrity-timeout SEC] [--keep] [--json]`
 - 대상 별칭은 **쓰기 파일 DB 만**이다. 역할은 기존 `checks._role()`, 경로는 `get_connection_params()["database"]` 로 정한다(위 '실제 연결 대상'과 같다). 메모리·읽기 전용·VFS·판정 불가 별칭은 `unknown`. **이 모드는 Django DB 연결을 열지 않는다** — 일반 doctor 와 달리 `init_command` 부작용이 없다.
 - 경로 규칙은 boot 의 `real_path()`(D-15)로 검사한다. 규칙 위반, `litestream databases -config C -json` 목록에 없는 DB 는 `error`.
-- `--restore-timeout` 기본값은 boot 와 같은 `DEFAULT_RESTORE_TIMEOUT`(600초, `boot/litestream.py`)이다.
+- `--restore-timeout` 기본값은 boot 와 같은 `DEFAULT_RESTORE_TIMEOUT`(600초, `boot/litestream.py`)이다. 복원 subprocess 에만 걸린다.
+- `--integrity-timeout` 은 무결성 검사(흐름 3)의 **별도** 예산이다. 기본 1800초. 복원 시간과 합치지 않는다.
+- **메타 경로**(D-25): 별칭마다 `SQLITE_OPS["HEALTH"]["DATABASES"][alias]["meta_path"]` 가 있으면 그것, 없으면 기본 `.<db>-litestream/`(DB 옆). Litestream YAML 의 `meta-path` 는 읽지 않는다 — YAML 파서를 넣지 않고(위 Litestream 설정 검사와 같은 원칙), `litestream databases -config C -json` 은 DB 경로와 복제본 종류만 내준다(0.5.17, `meta-path` 를 넣은 설정으로 재현함: `[{"path": ".../app.db", "replica": "file"}]`). 그래서 **YAML 의 `meta-path` 를 헬스 설정과 다르게 두면 이 모드는 그 메타를 판별하지 못한다.** 그 한계를 DB 부모 디렉터리 규칙(아래)으로 줄인다. 메타가 DB 디렉터리 밖이고 헬스 설정에도 없으면 보호되지 않는다 — README·도움말에 적는다.
 
 **운영 자원을 건드리지 않는 계약**
 - 복원은 `DIR` 아래 `tempfile.mkdtemp(prefix="dso-restore-")`(권한 0700)로 만든 새 디렉터리 안의 새 경로로만 한다. 겹치는 cron 실행끼리도 충돌하지 않는다. `restore()` 는 `-force` 없이 아직 없는 출력 경로만 받는다(이미 있으면 실패).
-- `DIR` 이 운영 DB·사이드카·메타·boot 소유 경로와 같거나 그 조상·자손이면 거부(`restore_dir` `error`). 비교는 §4-2 경로 계약의 방식(경로 문자열 + 이미 있는 경로의 `(st_dev, st_ino)` + 예약 이름의 `_fold()` 비교)을 그대로 쓴다.
+- **`DIR` 은 마지막 구성요소까지 링크가 아닌 실제 디렉터리여야 한다.** 부모는 `real_path()`(D-15)로, 마지막 구성요소는 `os.lstat` 으로 디렉터리인지 본다(`real_path()` 는 부모의 링크만 거부하고 마지막 구성요소는 호출자 몫이다, `boot/cli.py`). 없음·링크·디렉터리 아님이면 **아무것도 만들기 전에** `restore_dir` `error`, exit 2. 리뷰 1 재현: `DIR` 이 운영 메타 디렉터리를 가리키는 링크면 `real_path()`·§4-2 비교(`lstat` 동일성)·`meta_conflict()` 가 모두 통과하고 `mkdtemp(dir=DIR)` 가 실제 메타 안에 만들었다.
+- **보호 대상**은 실행 대상인 **모든 별칭**의 운영 경로 합집합이다: 운영 DB, `-wal`·`-shm`·`-journal`, 메타(위 '메타 경로'), boot 소유 경로(§4-2 예약 경로: `<db>.boot.lock`·`<db>.boot-state.json`·`<db 이름>.restore-*`·`.stale-*`·상태 임시 파일), **그리고 운영 DB 의 부모 디렉터리**. 메타가 링크면(D-15 조회 규약상 허용) 링크 경로와 그 실체(`os.path.realpath`) 둘 다 보호 대상으로 넣는다.
+- `DIR` 이 보호 대상과 같거나 그 조상·자손이면 거부(`restore_dir` `error`, exit 2). DB 부모 디렉터리에 대해서는 같음·안·포함을 모두 거부한다(D-25 — 사용자 지정 메타가 그 디렉터리 안 어디에 있을지 모르므로 보수적으로). 비교는 §4-2 경로 계약의 방식(경로 문자열 + 이미 있는 경로의 `(st_dev, st_ino)` + 예약 이름의 `_fold()` 비교)을 그대로 쓴다.
 - 운영 DB·`-wal`·`-shm`·메타 디렉터리를 바꾸지 않음을 **테스트로 확인**한다(전후 해시·mtime·디렉터리 목록).
 - **미검증**: `litestream restore -config C DB_PATH -o OUT` 이 `DB_PATH` 쪽(로컬 메타 `.<db>-litestream/`·사이드카)에 아무것도 쓰지 않는지. 0.5.17 `restore -h` 는 `-o` 를 "Output path of the restored database"(기본은 원래 DB 경로)로만 설명한다. 구현 이슈의 첫 실측 항목이다(§12).
 - 용량: 별칭마다 **그 별칭을 시작하기 직전에** 그 시점의 `shutil.disk_usage(DIR).free` 로 검사한다. 여러 별칭은 차례로 하고 필요량을 합산하지 않는다(앞 별칭의 실패 산출물이 남아 있으면 그만큼 여유에 자연히 반영된다). 여유가 (로컬 DB + `-wal` 크기) × 1.2 미만이면 `space` `error`. 로컬 크기로 복원본 크기를 추정한 값이라는 것을 메시지에 적는다.
@@ -367,29 +372,36 @@ django_sqlite_ops/
 2. `boot/litestream.py` 의 `restore(db_path, output, config=C, binary=BIN, timeout=--restore-timeout, integrity_check="none")` 를 재사용한다(D-24). 이 함수는 `litestream restore -config C -json -integrity-check none -o OUT DB_PATH` 를 부르고, `-json` 요약의 `txid` 와 출력 파일(있고 0바이트 아님)을 확인한다. 실패·타임아웃 → `restore` `error`, 3 단계로 가지 않는다(`integrity` 는 내지 않는다).
 3. 복원본을 `file:<OUT>?mode=ro&immutable=1` URI 로 연다(Django 연결이 아니라 표준 `sqlite3`). 열기 실패 → `integrity` `error`.
    - 무결성: `--integrity full`(기본, D-21)이면 `PRAGMA integrity_check`, `quick` 이면 `PRAGMA quick_check`. 결과가 `ok` 한 줄이 아니면 `integrity` `error` 이고, 오류 줄 앞 N줄(N 은 구현 때 정한다)을 `message` 에 담는다. 실행 중 예외도 `error`. 복원 실패와 무결성 실패가 서로 다른 키로 갈린다.
+   - 시간 예산: `--integrity-timeout`(기본 1800초, 복원과 별도). 검사를 시작할 때 타이머 스레드(`threading.Timer`)를 걸고, 시간이 넘으면 그 스레드에서 `sqlite3.Connection.interrupt()` 로 검사를 중단한다(검사 스레드에서 `OperationalError: interrupted`). 초과면 `integrity` `error`(사유 `timeout`, 걸린 시간 포함), exit 2, 산출물은 보존한다. 큰 DB 의 full 검사에서 `interrupt()` 가 실제로 제때 멈추는지는 미검증이다(§12, 구현 테스트로 확인).
    - 구조 요약: `sqlite_master` 의 테이블 수·`page_count`·`page_size` 를 읽는다(보고 전용, 읽기 실패면 `error`).
-4. 판정·보고 뒤 정리: 모두 성공이면 작업 디렉터리를 지운다. 하나라도 실패면 **남기고 경로를 `output` 으로 보고**한다. `--keep` 이면 늘 남긴다. `DIR` 의 오래된 산출물을 자동으로 정리하지 않는다(운영자가 치운다 — README 에 적는다).
+4. 판정·보고 뒤 정리:
+   - `restore`·`integrity` 가 **둘 다 `ok`** 면 작업 디렉터리를 지운다. `restored_txid` 가 `warn`(원격 미달)이거나 `remote_txid`·`restored_txid` 가 `unknown`(원격 조회 실패)이어도 지운다 — 산출물은 그 원인(원격 쪽 상태)을 설명하지 않는다.
+   - 둘 중 하나라도 `error`(무결성 시간 초과 포함)면 **남기고 경로를 `output` 으로 보고**한다. 3 단계 전에 실패한 경우(`restore_dir`·`space`·`remote_txid` 빈 목록)에 이미 만든 작업 디렉터리가 있으면 같이 남긴다.
+   - `--keep` 이면 늘 남긴다.
+   - 정리 자체가 실패하면(`shutil.rmtree` 예외) `output` `warn` 이고 남은 경로를 보고한다.
+   - `DIR` 의 오래된 산출물을 자동으로 정리하지 않는다(운영자가 치운다 — README 에 적는다).
 
 **보고 항목** (`section: "restore"`)
 
 | key | value | level |
 |---|---|---|
-| `restore_dir` | 작업 디렉터리 | 없음·겹침 거부 시 `error` |
+| `restore_dir` | 작업 디렉터리 | 없음·링크·디렉터리 아님·보호 대상과 겹침 거부 시 `error` |
 | `space` | 여유 바이트(`expected` = 추정 필요량) | 부족 `error` |
 | `remote_txid` | 직전 원격 최대 TXID | 빈 목록 `error`, 조회 실패 `unknown` |
 | `restore` | 성공 여부·사유 | 실패·타임아웃 `error` |
 | `restored_txid` | 복원 TXID(`expected` = `remote_txid`) | 미만 `warn`, 원격 조회 실패면 `unknown` |
-| `integrity` | `full`/`quick` 결과(우리가 실행, D-24) | 열기·검사 실패 `error`(오류 줄 앞 N줄을 `message` 에). 복원 실패면 내지 않는다 |
+| `integrity` | `full`/`quick` 결과(우리가 실행, D-24) | 열기·검사 실패·`--integrity-timeout` 초과 `error`(오류 줄 앞 N줄 또는 `timeout` 을 `message` 에). 복원 실패면 내지 않는다 |
 | `duration_ms` | 복원 소요 시간 | `ok`(보고) |
 | `size` | 복원본 바이트 | `ok`(보고) |
 | `tables`·`page_count` | 복원본 구조 요약 | `ok`(보고) |
-| `output` | 남긴 산출물 경로(있을 때) | `ok`(보고) |
+| `output` | 남긴 산출물 경로(있을 때) | `ok`(보고), 정리 실패면 `warn`(남은 경로) |
 
 - **JSON 스키마**: 위 `version: 1` 에 `section` 값 `restore` 와 이 `key` 들을 **'예정'으로 덧붙인다. `version` 은 올리지 않는다.** 근거: 위 스키마 규약상 `key` 목록은 늘어날 수 있고 소비자는 모르는 `key` 를 무시한다. 필드를 빼거나 뜻을 바꾸는 변경이 아니다. 단독 모드라 기존 소비자가 받는 일반 진단 출력은 그대로다.
 - **수준·종료 코드**: 기존 규약 그대로 — 0 문제 없음, 1 `warn`·`unknown`, 2 `error`. `--restore-dir` 누락 등 이 모드의 인자 오류도 exit 2 다(D-20). Django `CommandError` 의 기본 종료 코드는 1 이라 그대로 쓰면 규약과 어긋나므로, 구현 때 `SystemExit(2)` 로 맞춘다.
 - **비용 경고**: 복원은 스냅샷 전체와 그 뒤 LTX 를 내려받는다. 시간과 S3 egress 가 DB 크기에 비례한다. 첫 실행의 `duration_ms` 를 보고 주기(cron·systemd timer)를 정하라고 README 에 적는다.
+- **겹치는 실행**: 고유 작업 디렉터리 덕에 이름은 충돌하지 않지만 복원·검사 부하는 쌓인다. 명령이 막지 않고 운영 안내로 다룬다: 주기는 1회 소요 시간(복원 + 무결성)보다 길게, 필요하면 cron 에서 `flock -n` 으로 감싼다(예: `flock -n /var/lock/dso-restore-test.lock python manage.py sqlite_doctor --restore-test ...`). README 에 같은 예를 둔다.
 - **헬스에 넣지 않는다**(§7): 헬스는 가볍고 자주 도는 판정이고, 복원 검증은 무겁고 드물다. 결과를 헬스 응답에 섞지 않는다.
-- 테스트 계획(구현 이슈): 실제 Litestream(`litestream` CI 잡)으로 정상 복제본, 빈 복제본, 손상(LTX 파일 변조), 원격 조회 불가 endpoint(타임아웃), 용량 부족(가짜 `disk_usage`), `--restore-dir` 겹침 거부, 운영 파일 불변, 실패 산출물 보존·성공 시 정리.
+- 테스트 계획(구현 이슈): 실제 Litestream(`litestream` CI 잡)으로 정상 복제본, 빈 복제본, 손상(LTX 파일 변조), 원격 조회 불가 endpoint(타임아웃), 용량 부족(가짜 `disk_usage`), `--restore-dir` 겹침 거부(DB 부모 디렉터리와 같음·안·포함, 헬스 `meta_path`·기본 메타, 링크인 메타의 실체, 여러 별칭 중 다른 별칭의 경로), **`DIR` 자체가 운영 메타를 가리키는 링크면 아무것도 만들기 전에 거부**(리뷰 1 재현 사례), 운영 파일 불변, 무결성 시간 초과(제한을 넘긴 검사가 `interrupt()` 로 실제로 끝나고 `integrity/error`·exit 2·산출물 보존), 정리 규칙(둘 다 ok 면 TXID `warn`·`unknown` 이어도 삭제, `error` 면 보존, `--keep`, 정리 실패 `output/warn`).
 
 ## 7. 헬스
 
@@ -585,4 +597,5 @@ SQLITE_OPS = {
 - channels-nats D2 의 196/200 이 하네스 문제인지 [확인 필요]
 - "같은 이력" 증명 방법(자동 판정의 전제) [확인 필요]
 - `litestream restore -config C DB_PATH -o OUT` 이 `DB_PATH` 쪽(로컬 메타 `.<db>-litestream/`·`-wal`·`-shm`)에 쓰는지 (미검증, 0.5.17). `--restore-test`(§6-2, #52)의 운영 자원 불변 계약의 전제라 구현 이슈의 첫 실측 항목이다
+- `--restore-test` 무결성 시간 제한: 큰 DB 의 `PRAGMA integrity_check` 가 `sqlite3.Connection.interrupt()` 로 제때 중단되는지 (미검증, #52 설계). 구현 이슈에서 테스트로 확인한다
 - Litestream 상류(2026-10-13 확인): #1506(VFS 확장 로드)은 2026-10-08 머지됐으나 v0.5.17 이후라 미릴리스 — 다음 릴리스에서 Linux 확장 로드 뒤 일반 connect 실패가 사라지는지 재검증한다. #1271(writable VFS 손상)은 열림, 수정 PR #1363 도 열림(§3-3 유지)
