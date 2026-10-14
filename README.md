@@ -16,7 +16,7 @@ PyPI 배포 전이다([D-4·D-9](docs/DECISIONS.md)). 패키지 이름 `django-s
 | [channels-lite 패치](#channels-lite-패치) | 구현됨 | [#8](https://github.com/itda-work/django-sqlite-ops/issues/8) |
 | [배포 프로필 문서](#배포-프로필) | 구현됨 | [#9](https://github.com/itda-work/django-sqlite-ops/issues/9) |
 | 회귀 랩(Docker 로 실패 경계 L1–L8 재현, 프로필 Dockerfile·compose 종단 검증, PRAGMA 벤치). 수동 실행(`scripts/lab.sh`, GitHub Actions `lab.yml`), 기본 CI 밖. arm64·amd64 모두 통과 | 구현됨 | [#10](https://github.com/itda-work/django-sqlite-ops/issues/10) · [lab/README.md](lab/README.md) · [결과](docs/research/lab-2026-10-08.md) |
-| 복원 검증 `sqlite_doctor --restore-test` | 예정(2단계) | [DESIGN §7](docs/DESIGN.md#7-헬스) |
+| 복원 검증 `sqlite_doctor --restore-test` | 설계 확정([#52](https://github.com/itda-work/django-sqlite-ops/issues/52)), 구현 예정 | [DESIGN §6-2](docs/DESIGN.md#6-2-sqlite_doctor-명시-실행-실제-연결) |
 | VFS 읽기 복제본용 DB 라우터 | 예정(2단계) | [DESIGN §3-2](docs/DESIGN.md#3-2-2단계-이후) |
 
 ## 설치
@@ -667,7 +667,7 @@ LOGGING = {
 }
 ```
 
-헬스는 "지금 복제가 따라오는가"만 말한다. 복제본으로 실제 복구할 수 있는지는 주기적인 복원 검증(`sqlite_doctor --restore-test`)으로 따로 본다. 이 검증은 **예정(2단계)**이고 아직 없다([DESIGN §7](docs/DESIGN.md#7-헬스)).
+헬스는 "지금 복제가 따라오는가"만 말한다. 복제본으로 실제 복구할 수 있는지는 주기적인 복원 검증(`sqlite_doctor --restore-test`)으로 따로 본다. 이 검증은 **설계만 확정됐고(#52) 구현 예정**이라 아직 명령에 없다. 설계(별도 `--restore-dir` 에 실제 복원, 기본 `full` 무결성, 복원 TXID 와 원격 TXID 비교, 헬스와 분리)는 [DESIGN §6-2](docs/DESIGN.md#6-2-sqlite_doctor-명시-실행-실제-연결) 의 `--restore-test` 소절에 있다.
 
 ### channels-lite 패치
 
