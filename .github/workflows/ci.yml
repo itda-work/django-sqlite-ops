@@ -33,6 +33,25 @@ jobs:
       - name: Test
         run: uv run --no-sync pytest -v
 
+  # macOS(APFS 기본: 대소문자·유니코드 정규형 무시)에서 전체 테스트를 돈다. 대소문자 무시 볼륨
+  # 전용 테스트(ci_lab)는 Linux 에서 skip 되므로, REQUIRE_CASE_INSENSITIVE_FS=1 로 tmp_path 가 대소문자
+  # 구분 볼륨이라 skip 되는 경우를 실패로 바꾼다(#50). act 는 Linux 컨테이너만 돌리므로 ci-local.sh
+  # 로는 재현되지 않는다.
+  macos:
+    name: test (macos, py3.14, django 6.1)
+    runs-on: macos-latest
+    env:
+      REQUIRE_CASE_INSENSITIVE_FS: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      - name: Install
+        run: |
+          uv venv --python 3.14
+          uv pip install -e . "django~=6.1.0" --group dev
+      - name: Test
+        run: uv run --no-sync pytest -v -rs
+
   # 지원 하한(DESIGN §5: SQLite 3.37)을 실제로 돈다. uv 가 받는 Python 은 최신 SQLite 를
   # 정적으로 품고 있어서 위 매트릭스로는 하한이 검사되지 않는다. Ubuntu 22.04 의 시스템
   # libsqlite3(3.37.2)에 연결된 deadsnakes Python 을 쓴다.
