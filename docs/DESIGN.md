@@ -75,7 +75,7 @@ python -m django_sqlite_ops.boot \
 
 **메타 경로는 boot 소유 경로와 겹칠 수 없고 디렉터리여야 한다**(D-19, #39, `meta_conflict()`·`check_meta_kind()`). 메타는 격리 대상이므로 boot 소유 경로와 겹치면 복원 때 boot 가 자기 파일을 옮긴다. 재현: `--meta-path <db>.boot.lock` 이면 기본 정책의 `fresh/restore` 에서도 격리가 boot 가 쥔 잠금 파일을 `<db>.stale-<ts>/` 로 옮겼고, 다음 프로세스가 원래 경로에 새 파일을 만들어 두 번째 잠금을 얻었다(상호 배제 상실).
 - 예약 경로: DB, `-wal`·`-shm`·`-journal`, `<db>.boot.lock`, `<db>.boot-state.json`, `--config`(원문의 절대 경로와 링크를 따라간 실제 경로), DB 디렉터리 안의 boot 소유 이름 `<db 이름>.restore-*`(임시 복원)·`<db 이름>.stale-*`(격리, `.partial` 포함)·`<db 이름>.boot-state.json.tmp-*`(상태 파일 임시). 메타가 이것과 **같거나 조상·자손**이면 겹친다. 메타가 DB 디렉터리 자체나 그 조상이면 DB 의 조상이므로 여기서 걸린다.
-- 비교 방식(대소문자 무시 파일시스템 대비, macOS APFS 기본): 경로 문자열 비교에 더해, **이미 있는 경로는 파일 동일성**(`lstat` 의 `(st_dev, st_ino)`, 경로 항목 자체. 부모 경로에는 링크가 없으므로(D-15) 조상 비교에서는 `stat` 과 같다)으로 같음·조상 관계를 본다. 그래서 `data`·`DATA` 같은 별칭과 하드링크도 겹침이다. **아직 없을 수 있는 예약 이름**(DB·사이드카·잠금·상태 파일·상태 임시 이름·`restore-*`·`stale-*`)은 메타나 그 조상 중 부모가 DB 디렉터리(같은 동일성 기준)인 항목의 이름을 모든 플랫폼에서 양쪽 모두 유니코드 표준의 canonical caseless matching(Unicode §3.13 D145: `NFD(casefold(NFD(이름)))`, `_fold()`)으로 비교한다. APFS 는 대소문자와 함께 유니코드 정규형 차이도 무시하므로 `café.db` 의 조합형·완성형 철자를 같은 이름으로 본다. casefold 는 정규형을 바꿀 수 있어 앞뒤로 정규화한다(`NFC` 뒤 `casefold()` 만 하면 `ΐ.db` 와 `Ϊ́.DB` 가 다르게 접혀 예약 이름 검사를 지났다, 리뷰 재현). 대소문자 구분 볼륨의 `APP.DB.BOOT.LOCK` 같은 메타 이름도 거부한다(판정할 수 없으면 거부). 디렉터리 경로 전체를 소문자화하지는 않으므로 대소문자 구분 볼륨의 서로 다른 `data`·`DATA` 디렉터리는 다르게 본다. 비교 중 `lstat` 이 없음 외의 이유로 실패하면 거부한다(인자 해석 exit 64, 단계 함수 exit 2). 격리 대상 간 겹침과 '격리 목적지 포함' 검사도 같은 비교를 쓴다. 이름 규칙은 `boot/cli.py` 의 `_RESTORE_INFIX`·`_STALE_INFIX` 한 곳에 있고 임시 복원·격리·재개가 같은 상수를 쓴다.
+- 비교 방식(대소문자 무시 파일시스템 대비, macOS APFS 기본): 경로 문자열 비교에 더해, **이미 있는 경로는 파일 동일성**(`lstat` 의 `(st_dev, st_ino)`, 경로 항목 자체. 부모 경로에는 링크가 없으므로(D-15) 조상 비교에서는 `stat` 과 같다)으로 같음·조상 관계를 본다. 그래서 `data`·`DATA` 같은 별칭과 하드링크도 겹침이다. **아직 없을 수 있는 예약 이름**(DB·사이드카·잠금·상태 파일·상태 임시 이름·`restore-*`·`stale-*`)은 메타나 그 조상 중 부모가 DB 디렉터리(같은 동일성 기준)인 항목의 이름을 모든 플랫폼에서 양쪽 모두 유니코드 표준의 canonical caseless matching(Unicode §3.13 D145: `NFD(casefold(NFD(이름)))`, `_fold()`)으로 비교한다. APFS 는 대소문자와 함께 유니코드 정규형 차이도 무시하므로 `café.db` 의 조합형·완성형 철자를 같은 이름으로 본다. casefold 는 정규형을 바꿀 수 있어 앞뒤로 정규화한다(`NFC` 뒤 `casefold()` 만 하면 `ΐ.db` 와 `Ϊ́.DB` 가 다르게 접혀 예약 이름 검사를 지났다, 리뷰 재현). 대소문자 구분 볼륨의 `APP.DB.BOOT.LOCK` 같은 메타 이름도 거부한다(판정할 수 없으면 거부). 디렉터리 경로 전체를 소문자화하지는 않으므로 대소문자 구분 볼륨의 서로 다른 `data`·`DATA` 디렉터리는 다르게 본다. 비교 중 `lstat` 이 없음 외의 이유로 실패하면 거부한다(인자 해석 exit 64, 단계 함수 exit 2). 격리 대상 간 겹침과 '격리 목적지 포함' 검사도 같은 비교를 쓴다. 격리 디렉터리 안의 이름(격리 대상 이름끼리, 그리고 예약 이름 `manifest.json`·`manifest.json.tmp-*` 와의 충돌)도 모든 플랫폼에서 `_fold()` 로 비교한다(§4-3, #50). 이름 규칙은 `boot/cli.py` 의 `_RESTORE_INFIX`·`_STALE_INFIX` 한 곳에 있고 임시 복원·격리·재개가 같은 상수를 쓴다.
 - 거부 시점 세 곳:
   - **인자 해석**(`parse_args`, 잠금 파일을 만들기 전): 겹치면 exit 64. 무엇과 겹치는지와 고칠 방법(`--meta-path` 를 Litestream 설정의 `meta-path` 와 같은 자기만의 디렉터리로)을 출력한다.
   - **잠금 직후**(재개·판정 전): 메타 경로가 있는데 `os.stat`(링크를 따라감) 기준 디렉터리가 아니면(정규 파일·FIFO·파일을 가리키는 링크) exit 2. 끊어진 링크·`stat` 실패는 무엇인지 판정할 수 없으므로 exit 2. 디렉터리를 가리키는 링크는 통과한다(조회 규약). 정규 파일 메타를 판정 입력이나 격리 대상으로 쓰지 않는다.
@@ -110,7 +110,7 @@ python -m django_sqlite_ops.boot \
 | `unknown` | 그 밖의 모든 경우: 원격 조회 실패·타임아웃·파싱 실패, 로컬 메타 없음, DB 없이 메타만 남음, 0바이트 DB 에 메타만 남음, 로컬 DB 는 있는데 원격이 빈 목록, 로컬 DB 도 원격도 없는데 `--init-new` 없음, 원격이 앞섬 | **기동 거부(exit 2)**. 사유를 한 줄로 출력 |
 
 - `--on-unknown restore` : 복원을 임시 디렉터리에 먼저 끝낸 뒤, 로컬을 `<db>.stale-<ts>/` 디렉터리 하나로 옮기고 복원본을 설치한다. 여러 파일을 한 번에 옮기는 원자적 연산은 없으므로 **재개 가능하게** 옮긴다(L6).
-  0. 복원 **전에** 격리할 수 있는지 본다(`check_quarantinable()`). 하나라도 어긋나면 아무것도 바꾸지 않고 exit 2: 대상 경로(DB·사이드카·메타) 자체가 심볼릭 링크, 대상 이름끼리 겹침, 대상 이름이 격리 디렉터리의 예약 이름(`manifest.json`, `manifest.json.tmp-*`)과 겹침, 다른 파일시스템.
+  0. 복원 **전에** 격리할 수 있는지 본다(`check_quarantinable()`). 하나라도 어긋나면 아무것도 바꾸지 않고 exit 2: 대상 경로(DB·사이드카·메타) 자체가 심볼릭 링크, 대상 이름끼리 겹침, 대상 이름이 격리 디렉터리의 예약 이름(`manifest.json`, `manifest.json.tmp-*`)과 겹침, 다른 파일시스템. 이름은 모두 같은 `.partial` 안으로 들어가므로 대소문자·유니코드 정규형만 달라도 겹친 것으로 본다(`_fold()`, §4-2 비교 방식). 대소문자 무시 볼륨에서 DB 이름 `MANIFEST.JSON` 은 `.partial/manifest.json` 과 같은 파일이라, 정확 비교였던 예전에는 DB 를 옮기는 rename 이 manifest 를 덮고 그 뒤 중단되면 재개가 manifest 해석 실패로 거부됐다(재현함, #50). 다른 디렉터리의 메타 `APP.DB-WAL` 도 `.partial` 안에서 WAL 과 겹친다.
      - **상하위 관계**: 격리 대상끼리 같은 경로이거나 한쪽이 다른 쪽의 조상이면, 또는 대상이 격리 목적지(DB 디렉터리 안의 `.partial`·final·임시 복원 디렉터리)를 포함하면 거부한다. 메타가 잠금·상태 파일·boot 소유 이름과 겹치는 경우도 거부한다(D-19, §4-2 경로 계약). 메타가 있는데 디렉터리가 아니면 거부한다. 예: 메타가 DB 의 부모면 DB 를 옮긴 뒤 메타를 자기 안으로 옮기려다 실패하고 재개도 같은 오류를 반복한다(리뷰 재현). 재개 검증도 같은 검사를 한다.
      - **링크 제약(v0.1)**: 링크를 rename 하면 실체는 밖에 남고 격리본에는 끊어진 링크만 남는다(리뷰 재현). 링크 실체 보존은 지원하지 않으므로 격리가 필요한 조치(`RESTORE`·`QUARANTINE_AND_RESTORE`)에서는 거부한다. 판정·`PROCEED`·`KEEP_LOCAL` 에서는 아래 로컬 TXID 조회 규약대로 메타 디렉터리 링크를 따라간다(이 차이는 의도다).
   1. `<db>.stale-<ts>.partial/` 을 만들고, 그 안에 `manifest.json` 을 임시 파일 + rename 으로 쓴다. 스키마: `version`(1), `db`(대상 DB 절대 경로), `entries`(항목마다 `role`(`db`/`wal`/`shm`/`journal`/`meta`)·`src`(원래 절대 경로)·`name`(격리 안 이름, 단일 basename)). 디렉터리를 fsync 한다.
@@ -118,12 +118,12 @@ python -m django_sqlite_ops.boot \
   3. fsync(디렉터리) 뒤 `.partial` 을 `<db>.stale-<ts>/` 로 rename 한다. 이 rename 이 격리의 완료 표시다.
   - 도중에 죽으면 `.partial` 이 남는다. 다음 부팅은 판정 전에 이를 마저 끝낸다(멱등). **manifest 는 '무엇을 옮기려 했는지'의 기록일 뿐 이동 명령이 아니다.** 재개는 현재 `--db`·`--meta-path` 에서 다시 유도한 대상과 manifest 를 대조하고, **전체를 먼저 검증한 뒤** 원래 자리에 남은 대상만 옮기고 3 을 한다. 하나라도 어긋나면 아무것도 옮기지 않고 exit 2:
     - `.partial`·manifest 자체가 심볼릭 링크이거나 디렉터리·정규 파일이 아님, JSON·스키마·`version` 불일치, `db` 가 이번 DB 가 아님
-    - 항목의 역할이 모르는 값·중복·순서 어긋남, `src` 가 그 역할의 유도 경로가 아님, `name` 이 그 경로의 basename 이 아님(`/`·`..`·빈 문자열·예약 이름 포함)
+    - 항목의 역할이 모르는 값·중복·순서 어긋남, `src` 가 그 역할의 유도 경로가 아님, `name` 이 그 경로의 basename 이 아님(`/`·`..`·빈 문자열·예약 이름 포함. 예약 이름은 0 단계와 같이 `_fold()` 로 비교한다 — 수정 전 판이 남긴 `MANIFEST.JSON` 항목은 옮기면 manifest 를 덮으므로 거부한다)
     - 메타 항목의 `src` 가 이번 `--meta-path` 와 다름 → 원래 `--meta-path` 로 다시 실행하라고 안내한다
     - 각 항목이 원래 자리·격리 안 중 **정확히 한 곳**에 있지 않음(둘 다 없음 = 손실, 둘 다 있음 = 그 사이 누가 새 파일을 만듦), 그 파일이 링크임
     - manifest 에 **없는** 역할의 파일이 원래 자리나 격리 안에 있음. 재개는 manifest 항목만이 아니라 `quarantine_roles()` 의 모든 역할을 양쪽에서 본다. 자동으로 보충해 옮기지 않는다(WAL 항목이 빠진 manifest 로 DB 만 격리하면 DB 와 WAL 이 갈라진다, 리뷰 재현). 처음부터 없던 역할은 문제없다
     - `.partial` 안에 manifest 에 없는 파일이 있음, 완료 이름 `<db>.stale-<ts>/` 가 이미 있음
-  - manifest 를 쓰기 전에 죽었으면(manifest 없음, 임시 파일만 있음) 옮긴 파일이 없으므로 `.partial` 만 지운다. 그 밖의 내용이 있으면 exit 2.
+  - manifest 를 쓰기 전에 죽었으면(manifest 없음, 임시 파일만 있음) 옮긴 파일이 없으므로 `.partial` 만 지운다. 그 밖의 내용이 있으면 exit 2. 지우는 경로이므로 boot 가 쓴 철자(`manifest.json.tmp-*`)와 **정확히** 같은 이름만 임시 파일로 본다. `os.listdir` 는 만들 때의 철자를 돌려주므로 boot 가 쓴 파일은 이 꼴이고, 접으면 같아지는 다른 이름(`MANIFEST.JSON.TMP-x`)은 지우지 않고 거부한다(#50). manifest 유무와 '`.partial` 안의 모르는 파일' 판정도 정확 비교다(boot 가 쓴 이름 그대로인지를 묻는 자리라서).
   - 이 검증은 사고·손상(중단, 운영자 실수, 디스크 손상) 대비다. 볼륨 쓰기 권한을 가진 공격자에 대한 인증 수단이 아니다.
   - 격리를 마친 뒤 설치 전에 죽으면 로컬 DB·메타가 없으므로 다음 부팅은 `fresh` 로 복원한다. 설치 뒤 exec 전에 죽으면 D-14 와 같은 상태(DB 있음, 메타 없음)가 되어 `--on-unknown restore` 면 한 번 더 격리·복원한다. 어느 kill 지점에서도 DB 와 메타가 다른 격리 디렉터리로 갈라지지 않는다(테스트로 고정).
   - rename 은 같은 파일시스템 안에서만 원자적이다. 메타 디렉터리가 DB 와 다른 파일시스템에 있으면 복원 전에 거부한다(exit 2).
@@ -212,7 +212,7 @@ django_sqlite_ops/
 └── vfs.py           (2단계) 확장 로드 우회 — 옵션
 ```
 - 의존성: Django ≥ 5.2(LTS)만 필수다. extra 로 `[nats]` → channels-nats, `[channels-lite]` → channels-lite 를 둔다.
-- 지원 범위(CI `.github/workflows/ci.yml` 이 정본): Python 3.13+, Django 5.2 / 6.1, SQLite 3.37+ (Django 하한). Litestream 0.5.17 에 맞추고, CLI 출력 파싱은 버전 범위를 명시한다.
+- 지원 범위(CI `.github/workflows/ci.yml` 이 정본): Python 3.13+, Django 5.2 / 6.1, SQLite 3.37+ (Django 하한). Litestream 0.5.17 에 맞추고, CLI 출력 파싱은 버전 범위를 명시한다. 플랫폼은 POSIX(Linux·macOS)다. 매트릭스는 Linux 이고, macOS 는 `macos` 잡(`macos-latest`, Python 3.14, Django 6.1) 하나가 전체 테스트를 돈다. 이 잡은 `REQUIRE_CASE_INSENSITIVE_FS=1` 이라 대소문자 무시 볼륨 전용 테스트가 skip 되면 실패한다(#50, 2026-10-14 추가). act(`scripts/ci-local.sh`)로는 돌지 않는다.
 
 ## 6. 권장 설정, 진단과 체크
 

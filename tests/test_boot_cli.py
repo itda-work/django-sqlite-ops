@@ -5,6 +5,8 @@
 - 서브프로세스: ``python -m django_sqlite_ops.boot`` 를 실제로 실행해 exec·잠금 상속을 본다.
 - L 시나리오: 실제 ``litestream`` 과 ``file://`` 복제본. 바이너리가 없으면 skip,
   ``REQUIRE_LITESTREAM=1`` 이면 실패(``_litestream.py``).
+- 대소문자 무시 볼륨 전용 테스트(``ci_lab``)는 대소문자 구분 볼륨에서 skip,
+  ``REQUIRE_CASE_INSENSITIVE_FS=1`` 이면 실패(CI 의 macOS 잡).
 """
 
 import fcntl
@@ -1178,13 +1180,21 @@ def case_insensitive(directory: Path) -> bool:
         probe.unlink()
 
 
+# CI 의 macOS 잡은 REQUIRE_CASE_INSENSITIVE_FS=1 로 아래 skip 을 실패로 바꾼다. 대소문자 무시
+# 볼륨 전용 테스트가 실제로 돌았음을 잡이 강제한다(#50).
+REQUIRE_CASE_INSENSITIVE_FS = os.environ.get("REQUIRE_CASE_INSENSITIVE_FS") == "1"
+
+
 @pytest.fixture
 def ci_lab(lab):
     if not case_insensitive(lab):
-        pytest.skip(
+        reason = (
             "tmp_path is on a case-sensitive filesystem (e.g. Linux CI); case aliases "
             "of the same file cannot be made here"
         )
+        if REQUIRE_CASE_INSENSITIVE_FS:
+            pytest.fail(f"{reason} (REQUIRE_CASE_INSENSITIVE_FS=1)")
+        pytest.skip(reason)
     return lab
 
 
@@ -1395,6 +1405,156 @@ def test_distinct_case_directory_is_allowed_on_case_sensitive_fs(cs_lab, fake, n
     args, _ = cli.parse_args(boot_args(lab, fake, "--meta-path", str(meta)))
     assert args.meta_path == meta
     cli.check_no_overlap(lab / "app.db", meta)
+
+
+# --- #50: 격리 디렉터리 안의 이름도 접어서 비교한다 -------------------------------------------
+# 대소문자 무시 볼륨에서 DB 이름 MANIFEST.JSON 은 partial 안의 manifest.json 과 같은 파일이다.
+# 예약 이름 검사가 정확 비교라 통과했고, DB 를 옮기는 rename 이 manifest 를 덮었다(이슈 #50).
+# 격리 대상 이름끼리의 중복 검사도 같다: 다른 디렉터리의 메타 APP.DB-WAL 은 partial 안에서 WAL 과
+# 같은 이름이 된다. #39 처럼 모든 플랫폼에서 _fold() 로 비교한다.
+
+MANIFEST_VARIANTS = ["MANIFEST.JSON", "Manifest.json", "MANIFEST.JSON.TMP-abcd1234"]
+
+
+@pytest.mark.parametrize("db_name", MANIFEST_VARIANTS)
+def test_db_named_like_manifest_case_variant_refuses_before_restore(lab, fake, no_exec, db_name):
+    db = lab / db_name
+    make_db(db, 1)
+    meta = write_meta(db)
+    fake.remote_txid(0x20)
+    before = snapshot(lab)
+    args = boot_args(lab, fake, "--on-unknown", "restore")
+    args[args.index(str(lab / "app.db"))] = str(db)
+    assert main_inproc(args, no_exec) == 2
+    assert snapshot(lab, skip=(db_name + ".boot.lock",)) == before
+    assert "restore" not in fake.calls()
+    with pytest.raises(cli._Exit) as exc:
+        cli.check_quarantinable(db, meta)
+    assert exc.value.code == cli.EXIT_REFUSE
+    assert "reserved name" in exc.value.message
+
+
+@pytest.mark.parametrize("meta_name", MANIFEST_VARIANTS)
+def test_meta_named_like_manifest_case_variant_refuses_before_restore(
+    lab, fake, no_exec, meta_name
+):
+    db = lab / "app.db"
+    make_db(db, 1)
+    meta = lab / meta_name
+    meta.mkdir()
+    (meta / "data").write_text("meta")
+    fake.remote_txid(0x20)
+    before = snapshot(lab)
+    args = boot_args(lab, fake, "--on-unknown", "restore", "--meta-path", str(meta))
+    assert main_inproc(args, no_exec) == 2
+    assert snapshot(lab, skip=("app.db.boot.lock",)) == before
+    assert "restore" not in fake.calls()
+
+
+def test_db_named_like_manifest_does_not_overwrite_it_on_case_insensitive_fs(ci_lab):
+    # 이슈 #50 재현: 수정 전에는 DB 를 옮기는 rename 이 partial/manifest.json 을 덮었고, 그 뒤
+    # 중단되면 재개가 manifest 해석 실패로 거부됐다. 이제 옮기기 전에 거부한다.
+    lab = ci_lab
+    db = lab / "MANIFEST.JSON"
+    make_db(db, 3)
+    meta = write_meta(db)
+    before = snapshot(lab)
+    with pytest.raises(cli._Exit) as exc:
+        cli.quarantine(db, meta)
+    assert exc.value.code == cli.EXIT_REFUSE
+    assert snapshot(lab) == before
+    assert count_rows(db) == 3
+
+
+def _sub_meta(lab: Path, name: str) -> Path:
+    meta = lab / "sub" / name
+    meta.mkdir(parents=True)
+    (meta / "data").write_text("meta")
+    return meta
+
+
+# (DB 이름, 다른 디렉터리에 둔 메타 이름): partial 안에서 대소문자·정규형만 다르게 겹친다.
+FOLDED_DUPLICATES = [
+    ("app.db", "APP.DB-WAL"),
+    ("app.db", "App.Db"),
+    ("app.db", "APP.DB-JOURNAL"),
+    (unicodedata.normalize("NFC", "café.db"), unicodedata.normalize("NFD", "café.db-shm")),
+    (unicodedata.normalize("NFD", "한글.db"), unicodedata.normalize("NFC", "한글.db")),
+    (unicodedata.normalize("NFC", "café.db"), unicodedata.normalize("NFD", "CAFÉ.DB-WAL")),
+]
+
+
+@pytest.mark.parametrize(("db_name", "meta_name"), FOLDED_DUPLICATES)
+def test_folded_duplicate_target_names_refuse_before_restore(
+    lab, fake, no_exec, db_name, meta_name
+):
+    db = lab / db_name
+    make_db(db, 1)
+    meta = _sub_meta(lab, meta_name)
+    assert meta.name != db.name and meta.name not in [p.name for p in cli.sidecars(db)]
+    fake.remote_txid(0x20)
+    before = snapshot(lab)
+    args = boot_args(lab, fake, "--on-unknown", "restore", "--meta-path", str(meta))
+    args[args.index(str(lab / "app.db"))] = str(db)
+    assert main_inproc(args, no_exec) == 2
+    assert snapshot(lab, skip=(db_name + ".boot.lock",)) == before
+    assert "restore" not in fake.calls()
+    with pytest.raises(cli._Exit) as exc:
+        cli.check_quarantinable(db, meta)
+    assert exc.value.code == cli.EXIT_REFUSE
+    assert "duplicate target names" in exc.value.message
+
+
+def test_distinct_folded_target_names_still_quarantine(lab):
+    # 접어도 겹치지 않는 다른 디렉터리의 메타는 그대로 격리된다.
+    db = lab / "app.db"
+    make_db(db, 3)
+    meta = _sub_meta(lab, "app.db-meta")
+    final = cli.quarantine(db, meta)
+    assert final is not None
+    assert sorted(os.listdir(final)) == ["app.db", "app.db-meta", "manifest.json"]
+
+
+def test_resume_refuses_manifest_entry_named_like_manifest_case_variant(lab):
+    # 수정 전 판이 남긴(또는 위조한) partial: DB 항목 이름이 MANIFEST.JSON 이면 재개가 DB 를
+    # partial/MANIFEST.JSON 으로 옮긴다. 대소문자 무시 볼륨에서는 manifest 를 덮으므로 거부한다.
+    db = lab / "MANIFEST.JSON"
+    make_db(db, 1)
+    partial = lab / "MANIFEST.JSON.stale-20261008T000000.000001Z.partial"
+    partial.mkdir()
+    manifest = {"version": 1, "db": str(db), "entries": [entry("db", db)]}
+    (partial / "manifest.json").write_text(json.dumps(manifest))
+    before = snapshot(lab)
+    with pytest.raises(cli._Exit) as exc:
+        cli.resume_quarantine(db, ls.default_meta_path(db))
+    assert exc.value.code == cli.EXIT_REFUSE
+    assert "invalid name" in exc.value.message
+    assert snapshot(lab) == before
+
+
+def test_partial_without_manifest_keeps_case_variant_of_manifest_temp(cs_lab):
+    # 남은 것 판정은 정확 비교다: boot 가 쓴 임시 파일(manifest.json.tmp-*)만 지운다. 이름만
+    # 비슷한 MANIFEST.JSON.TMP-x 는 boot 가 쓴 것이 아니므로 지우지 않고 거부한다(대소문자 구분
+    # 볼륨에서만 따로 만들 수 있다).
+    lab = cs_lab
+    db = lab / "app.db"
+    partial = lab / PARTIAL
+    partial.mkdir()
+    (partial / "MANIFEST.JSON.TMP-abcd1234").write_text("x")
+    before = snapshot(lab)
+    with pytest.raises(cli._Exit) as exc:
+        cli.resume_quarantine(db, ls.default_meta_path(db))
+    assert exc.value.code == cli.EXIT_REFUSE
+    assert snapshot(lab) == before
+
+
+def test_partial_without_manifest_removes_own_manifest_temp(lab):
+    db = lab / "app.db"
+    partial = lab / PARTIAL
+    partial.mkdir()
+    (partial / "manifest.json.tmp-abcd1234").write_text("{")
+    cli.resume_quarantine(db, ls.default_meta_path(db))
+    assert list(lab.iterdir()) == []
 
 
 # --- 임시 복원·설치 ---------------------------------------------------------------------------

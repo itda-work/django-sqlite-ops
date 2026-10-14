@@ -522,7 +522,7 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 - `--meta-path` 를 `<db>.boot.lock`·`<db>.boot-state.json`·DB·사이드카·Litestream 설정 파일이나 boot 가 만드는 `<db>.restore-*`·`<db>.stale-*` 로 주지 않는다. 메타는 복원 때 격리되므로, 예전에는 잠금 파일을 메타로 주면 boot 가 자기 잠금을 옮겨 두 번째 부팅이 같은 볼륨을 잠글 수 있었다(재현함, #39). 지금은 잠금 파일을 만들기 전에 exit 64 로 거부한다. 대소문자만 다른 이름(`APP.DB.BOOT.LOCK`, macOS 에서 `DATA` 처럼 같은 디렉터리의 다른 철자)도 같은 것으로 보고 거부한다. 메타 경로에 정규 파일·FIFO·끊어진 링크가 있으면 판정 전에 exit 2 다. Litestream 설정의 `meta-path` 와 같은 디렉터리를 준다.
 - 메타 디렉터리는 DB 와 같은 파일시스템에 둔다. 격리는 rename 으로 하므로 다른 볼륨에 있으면 거부한다.
 - **격리가 필요할 때(`restore` 조치) DB·`-wal`·`-shm`·`-journal`·메타 디렉터리 경로가 심볼릭 링크면 거부한다(exit 2).** 링크를 옮기면 실체가 밖에 남기 때문이다(v0.1 제약). 판정만 하고 진행하는 부팅(`match` 등)에서는 메타 디렉터리 링크를 따라가므로 평소에는 드러나지 않는다. 볼륨 안에 실제 파일·디렉터리로 둔다.
-- DB 나 `--meta-path` 의 이름을 `manifest.json` 으로 하지 않는다. 격리 디렉터리의 예약 이름이라 격리가 필요할 때 거부된다.
+- DB 나 `--meta-path` 의 이름을 `manifest.json`(대소문자만 다른 `MANIFEST.JSON` 포함)으로 하지 않는다. 격리 디렉터리의 예약 이름이라 격리가 필요할 때 복원 전에 exit 2 로 거부된다. macOS 에서는 `MANIFEST.JSON` 이 격리 디렉터리의 manifest 와 같은 파일이라, 예전에는 격리가 manifest 를 덮어 중단 뒤 재개가 막혔다(재현함, #50). 다른 디렉터리에 둔 메타라도 이름이 DB·사이드카 이름과 대소문자·유니코드 정규형만 다르면(`APP.DB-WAL`) 격리 안에서 겹치므로 거부된다.
 - 격리 도중 죽어 `<db>.stale-…partial/` 이 남았다면 **같은 `--db`·`--meta-path`** 로 다시 부팅한다. 다르면 판정할 수 없어 거부한다. 그 안의 파일을 손으로 바꾸지 않는다.
 - `<db>.boot.lock` 을 지우지 않는다. flock 잠금은 파일에 걸리므로, 앱이 도는 중에 잠금 파일을 지우거나 바꾸면 다음 boot 가 새 파일을 잠가 이중 실행을 막지 못한다. 잠금 파일이 링크거나 정규 파일이 아니면 exit 5 다.
 - boot 는 Windows 에서 검증하지 않았다. `fcntl` 이 없으면 exit 64 다.

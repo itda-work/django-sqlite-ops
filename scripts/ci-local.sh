@@ -8,6 +8,10 @@
 #   CI_ARCH=amd64 scripts/ci-local.sh        # GitHub 러너와 같은 amd64 (에뮬레이션이라 느리다)
 #
 # 기본 이미지와 아키텍처는 저장소 루트의 .actrc 에 있다.
+# act 는 Linux 컨테이너만 돌린다. macOS 잡(macos, 대소문자 무시 볼륨 테스트)은 여기서 돌지 않고
+# act 가 'Skipping unsupported platform' 으로 건너뛴다. 로컬 macOS 에서는
+#   REQUIRE_CASE_INSENSITIVE_FS=1 uv run pytest -rs
+# 로 같은 검사를 한다.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."

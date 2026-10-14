@@ -408,8 +408,25 @@ def _write_json_atomic(path: Path, data: dict) -> None:
 
 
 def _reserved(name: str) -> bool:
-    """격리 디렉터리 안에서 우리가 쓰는 이름(manifest 와 그 임시 파일)."""
-    return name == _MANIFEST or name.startswith(_MANIFEST + _TMP_INFIX)
+    """격리 디렉터리 안에서 우리가 쓰는 이름(manifest 와 그 임시 파일)과 겹치면 참.
+
+    격리 대상 이름을 거르는 자리(격리 전 사전 검사, manifest 항목 검증)에서 쓴다. 대소문자·
+    정규형을 무시하는 볼륨에서는 ``MANIFEST.JSON`` 이 partial 안의 manifest 와 같은 파일이므로
+    모든 플랫폼에서 ``_fold()`` 로 비교한다(#50). partial 안에 남은 파일이 boot 가 쓴 것인지
+    가리는 자리는 정확 비교인 ``_own_manifest_file()`` 을 쓴다.
+    """
+    folded = _fold(name)
+    return folded == _fold(_MANIFEST) or folded.startswith(_fold(_MANIFEST + _TMP_INFIX))
+
+
+def _own_manifest_file(name: str) -> bool:
+    """boot 가 partial 안에 쓴 manifest 임시 파일 이름 그대로면 참(정확 비교).
+
+    manifest 없는 partial 을 치울지 가릴 때 쓴다. 지워도 되는 것은 boot 가 쓴 이름뿐이다.
+    ``os.listdir`` 는 만들 때의 철자를 돌려주므로 boot 가 쓴 파일은 정확히 이 꼴이고, 이름만
+    비슷한 다른 파일은 지우지 않고 거부한다(#50).
+    """
+    return name.startswith(_MANIFEST + _TMP_INFIX)
 
 
 def check_meta_kind(meta: Path) -> None:
@@ -444,6 +461,7 @@ def check_quarantinable(db: Path, meta: Path) -> None:
       밖에 남고 격리본에는 끊어진 링크만 남는다. 링크 실체 보존은 v0.1 에서 지원하지 않는다.
       (판정·PROCEED·KEEP_LOCAL 에서 메타 디렉터리 링크를 따라가는 조회 규약과는 별개다.)
     - 대상 이름이 서로 겹치거나 격리 디렉터리의 예약 이름(manifest)과 겹치면 거부한다.
+      대소문자·정규형만 달라도 겹친 것으로 본다(``_fold()``, #50).
     - rename 은 같은 파일시스템 안에서만 원자적이다. 다른 파일시스템이면 거부한다.
     - 메타가 있는데 디렉터리가 아니면 거부한다. 정규 파일·FIFO 를 메타로 격리하지 않는다(#39).
     """
@@ -451,7 +469,8 @@ def check_quarantinable(db: Path, meta: Path) -> None:
     check_no_overlap(db, meta)
     check_meta_kind(meta)
     names = [p.name for _, p in quarantine_roles(db, meta)]
-    if len(set(names)) != len(names):
+    # 모두 같은 partial 안으로 옮기므로 대소문자·정규형만 다른 이름도 겹친다(#50).
+    if len({_fold(n) for n in names}) != len(names):
         raise _Exit(EXIT_REFUSE, f"cannot quarantine: duplicate target names {names}")
     clash = [n for n in names if _reserved(n)]
     if clash:
@@ -608,7 +627,7 @@ def resume_quarantine(db: Path, meta: Path) -> None:
     contents = set(os.listdir(partial))
     if _MANIFEST not in contents:
         # manifest 를 쓰기 전에 죽었다. manifest 는 무엇보다 먼저 쓰므로 옮긴 파일이 없다.
-        leftovers = sorted(n for n in contents if not _reserved(n))
+        leftovers = sorted(n for n in contents if not _own_manifest_file(n))
         if leftovers:
             raise _refuse_resume(partial, f"no manifest but contains {leftovers}")
         shutil.rmtree(partial)
