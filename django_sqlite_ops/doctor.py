@@ -49,7 +49,7 @@ __all__ = [
 
 SCHEMA_VERSION = 1
 LEVELS = ("ok", "warn", "error", "unknown")
-SECTIONS = ("settings", "database", "mount", "litestream", "channels", "process")
+SECTIONS = ("settings", "database", "mount", "litestream", "channels", "process", "restore")
 
 # PRAGMA 값 매핑의 정본. SQLite 는 synchronous 를 정수로 돌려준다(https://www.sqlite.org/pragma.html).
 _SYNCHRONOUS = {0: "OFF", 1: "NORMAL", 2: "FULL", 3: "EXTRA"}
@@ -895,6 +895,40 @@ def nofile_items() -> list[Item]:
 # --- 조립 ------------------------------------------------------------------------------
 
 
+def select_aliases(
+    aliases: Iterable[str] | None, section: str
+) -> tuple[dict[str, Mapping[str, Any]], list[str], list[Item]]:
+    """``(sqlite3 별칭 설정 전부, 고른 별칭, 고르지 못한 별칭의 항목)``. 없으면 sqlite3 전부."""
+    databases = settings.DATABASES
+    sqlite = {
+        alias: config
+        for alias, config in databases.items()
+        if isinstance(config, Mapping) and config.get("ENGINE") == ENGINE
+    }
+    if aliases is None:
+        return sqlite, list(sqlite), []
+    selected: list[str] = []
+    items: list[Item] = []
+    for alias in dict.fromkeys(aliases):
+        if alias not in databases:
+            items.append(Item(section, alias, "alias", "error", None, None, "not in DATABASES"))
+        elif alias not in sqlite:
+            items.append(
+                Item(
+                    section,
+                    alias,
+                    "alias",
+                    "unknown",
+                    databases[alias].get("ENGINE"),
+                    ENGINE,
+                    "not a sqlite3 database; not diagnosed",
+                )
+            )
+        else:
+            selected.append(alias)
+    return sqlite, selected, items
+
+
 def diagnose(
     aliases: Iterable[str] | None = None,
     *,
@@ -911,35 +945,8 @@ def diagnose(
         items.append(Item("settings", None, "profile", "ok", profile))
     rec = recommended(profile)
 
-    databases = settings.DATABASES
-    sqlite = {
-        alias: config
-        for alias, config in databases.items()
-        if isinstance(config, Mapping) and config.get("ENGINE") == ENGINE
-    }
-    if aliases is None:
-        selected = list(sqlite)
-    else:
-        selected = []
-        for alias in dict.fromkeys(aliases):
-            if alias not in databases:
-                items.append(
-                    Item("database", alias, "alias", "error", None, None, "not in DATABASES")
-                )
-            elif alias not in sqlite:
-                items.append(
-                    Item(
-                        "database",
-                        alias,
-                        "alias",
-                        "unknown",
-                        databases[alias].get("ENGINE"),
-                        ENGINE,
-                        "not a sqlite3 database; not diagnosed",
-                    )
-                )
-            else:
-                selected.append(alias)
+    sqlite, selected, alias_items = select_aliases(aliases, "database")
+    items.extend(alias_items)
 
     # 별칭마다 실제로 여는 대상을 한 번 정하고 모든 섹션이 그것을 쓴다(연결하지 않는다).
     targets = {alias: _target(alias, config) for alias, config in sqlite.items()}
