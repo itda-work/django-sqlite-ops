@@ -16,7 +16,7 @@ PyPI 배포 전이다([D-4·D-9](docs/DECISIONS.md)). 패키지 이름 `django-s
 | [channels-lite 패치](#channels-lite-패치) | 구현됨 | [#8](https://github.com/itda-work/django-sqlite-ops/issues/8) |
 | [배포 프로필 문서](#배포-프로필) | 구현됨 | [#9](https://github.com/itda-work/django-sqlite-ops/issues/9) |
 | 회귀 랩(Docker 로 실패 경계 L1–L8 재현, 프로필 Dockerfile·compose 종단 검증, PRAGMA 벤치). 수동 실행(`scripts/lab.sh`, GitHub Actions `lab.yml`), 기본 CI 밖. arm64·amd64 모두 통과 | 구현됨 | [#10](https://github.com/itda-work/django-sqlite-ops/issues/10) · [lab/README.md](lab/README.md) · [결과](docs/research/lab-2026-10-08.md) |
-| 복원 검증 `sqlite_doctor --restore-test` | 설계 확정([#52](https://github.com/itda-work/django-sqlite-ops/issues/52)), 구현 예정 | [DESIGN §6-2](docs/DESIGN.md#6-2-sqlite_doctor-명시-실행-실제-연결) |
+| [복원 검증](#복원-검증---restore-test) `sqlite_doctor --restore-test` | 구현됨 | [#52](https://github.com/itda-work/django-sqlite-ops/issues/52)(설계) · [#54](https://github.com/itda-work/django-sqlite-ops/issues/54) · [DESIGN §6-2](docs/DESIGN.md#6-2-sqlite_doctor-명시-실행-실제-연결) |
 | VFS 읽기 복제본용 DB 라우터 | 예정(2단계) | [DESIGN §3-2](docs/DESIGN.md#3-2-2단계-이후) |
 
 ## 설치
@@ -376,6 +376,88 @@ summary: 1 warning(s), 0 error(s), 0 unknown -> exit 1
 
 `call_command("sqlite_doctor")` 로 부르면 종료 코드가 0 이 아닐 때 `SystemExit` 가 난다.
 
+#### 복원 검증 (`--restore-test`)
+
+헬스는 "지금 복제가 따라오는가"만 본다. `--restore-test` 는 **복제본으로 실제 복구할 수 있는가**를 본다. 쓰기 DB 마다 복제본을 `--restore-dir` 아래 새 작업 디렉터리에 실제로 복원하고, 복원 TXID 를 복원 직전의 원격 TXID 와 비교한 뒤, 복원본에 `PRAGMA integrity_check` 를 돌린다. **단독 모드다**: 이 옵션을 주면 `restore` 섹션만 내고 위의 다른 진단은 하지 않는다.
+
+```bash
+python manage.py sqlite_doctor --restore-test \
+    --restore-dir /var/backups/dso-restore \
+    --litestream-config /etc/litestream.yml \
+    --database default --json
+```
+
+| 옵션 | 뜻 |
+|---|---|
+| `--restore-dir DIR` | **필수.** 복원본을 둘 디렉터리. 미리 만들어 둔 실제 디렉터리여야 한다(마지막 구성요소까지 링크 아님, 부모에도 링크 없음). 그 아래에 실행마다 `dso-restore-XXXX/`(권한 0700)를 새로 만든다. 기본값이 없는 이유: `/tmp` 가 tmpfs 인 서버에서 큰 DB 를 복원하면 RAM 을 먹는다 |
+| `--litestream-config PATH` | **필수.** 복원할 설정 파일. DB 경로가 설정의 `dbs[].path` 와 같은 실제 경로여야 한다([경로 규칙](#경로-규칙)) |
+| `--database ALIAS` | 볼 별칭(반복). 없으면 sqlite3 별칭 전부. 쓰기 파일 DB 만 복원한다 — 메모리·읽기 전용·VFS 별칭은 `unknown` 이므로 보통 `--database` 로 고른다 |
+| `--integrity full\|quick` | `full`(기본, `integrity_check`) 또는 `quick`(`quick_check`) |
+| `--restore-timeout SEC` | 별칭마다 복원의 시간 제한(기본 600초) |
+| `--integrity-timeout SEC` | 무결성 검사의 **별도** 시간 제한(기본 1800초). 넘으면 검사를 끊고 `integrity` `error` |
+| `--keep` | 모두 통과해도 복원본을 남긴다 |
+| `--litestream BIN`·`--json` | 위와 같다 |
+
+**운영 파일을 건드리지 않는다.** Django DB 연결을 열지 않으므로(일반 doctor 와 달리) `init_command` 도 실행되지 않는다. 복원본은 읽기 전용 `immutable` URI 로 연다. `litestream restore -o` 는 운영 DB·`-wal`·`-shm`·메타를 읽지도 쓰지도 않는다(0.5.17, 전후 해시·mtime 비교와 strace 로 재현함, #54). 그래도 `--restore-dir` 이 아래와 같거나 그 안이거나 그것을 품으면 **아무것도 만들기 전에 거부**한다(`restore_dir` `error`, exit 2). 대상은 이번에 실행하는 모든 별칭의 합집합이다.
+
+- 운영 DB 의 **부모 디렉터리**(그 안의 DB·사이드카·boot 잠금·상태 파일·boot 임시 디렉터리가 모두 여기 든다)
+- Litestream 메타: `SQLITE_OPS["HEALTH"]["DATABASES"][alias]["meta_path"]`, 없으면 기본 `.<db>-litestream/`. 메타가 링크면 링크와 그 실체 둘 다
+
+> **메타 판별의 한계.** 이 명령은 Litestream YAML 의 `meta-path` 를 읽지 않는다(YAML 파서를 넣지 않고, `litestream databases -json` 은 메타 경로를 내주지 않는다 — 0.5.17 재현함). YAML 에 `meta-path` 를 DB 디렉터리 **밖**으로 두고 그 경로를 헬스 설정의 `meta_path` 에도 적지 않았다면 그 메타는 보호하지 못한다. 메타를 옮겼다면 헬스 설정에도 같은 `meta_path` 를 적는다.
+
+보고 항목(`section` `restore`):
+
+| key | 값 | 수준 |
+|---|---|---|
+| `space` | 여유 바이트(`expected` = 필요량 추정치) | (로컬 DB + `-wal`) × 1.2 보다 적으면 `error`. 별칭을 시작하기 직전에 잰다 |
+| `restore_dir` | 만든 작업 디렉터리 | `--restore-dir` 이 없음·링크·디렉터리 아님·겹침이면 `error`(별칭 `null`) |
+| `remote_txid` | 복원 직전 원격 최대 TXID(16자리 16진수) | 복제본이 비었으면 `error`(0.5.17 은 복제본 경로 오타도 같은 결과다), 조회 실패·타임아웃이면 `unknown` 이고 복원은 그대로 한다 |
+| `restore` | `restored`/`failed` | 실패·타임아웃이면 `error` 이고 `integrity` 는 내지 않는다 |
+| `restored_txid` | 복원 TXID(`expected` = `remote_txid`) | 원격보다 작으면 `warn`, 원격을 몰랐으면 `unknown` |
+| `integrity` | `full`/`quick` | 열기·검사 실패, 시간 초과면 `error`. 오류 줄 앞 5줄 또는 `timeout` 을 `message` 에 |
+| `duration_ms`·`size`·`tables`·`page_count` | 복원 시간, 복원본 바이트, 테이블 수, 페이지 수 | 보고(`ok`) |
+| `output` | 남긴 작업 디렉터리 | 보고(`ok`). 정리하다 실패하면 `warn` |
+| `alias`·`database`·`config` | 별칭 종류, DB 경로, 설정 파일 | 쓰기 파일 DB 가 아니면 `alias` `unknown`, 경로가 실제 경로가 아니거나 설정에 없으면 `database` `error`, 설정을 읽지 못하면 `config` `error` |
+
+**정리 규칙.** `restore`·`integrity` 가 둘 다 `ok` 면 작업 디렉터리를 지운다. TXID 가 `warn`·`unknown` 이어도 지운다(그 원인은 원격 쪽에 있고 산출물로 설명되지 않는다). 하나라도 `error`(무결성 시간 초과 포함)거나 원격이 비어 멈췄으면 남기고 `output` 에 경로를 적는다. `--keep` 이면 늘 남긴다. **오래된 산출물은 자동으로 지우지 않는다** — 확인한 뒤 운영자가 치운다. 종료 코드는 위 표와 같다(0·1·2). `--restore-dir` 누락 같은 인자 오류도 2 다.
+
+> **비용 경고.** 복원은 스냅샷 전체와 그 뒤 LTX 를 내려받는다. 시간과 S3 egress 가 DB 크기에 비례한다. 처음에 한 번 손으로 돌려 `duration_ms` 와 무결성 검사 시간(`integrity` 의 `message`)을 보고 주기를 정한다(참고: 700MB DB 의 `full` 검사가 macOS 에서 2.6초, `quick` 이 0.4초 — #54 실측). 주기는 1회 소요 시간보다 넉넉히 길게 잡는다.
+
+겹치는 실행은 이름이 충돌하지 않지만 부하가 쌓인다. 명령이 막지 않으므로 cron 에서는 `flock -n` 으로 감싼다:
+
+```cron
+# /etc/cron.d/dso-restore-test — 매일 04:17, 앞 실행이 아직 돌면 건너뛴다
+17 4 * * * app cd /srv/app && flock -n /var/lock/dso-restore-test.lock python manage.py sqlite_doctor --restore-test --restore-dir /var/backups/dso-restore --litestream-config /etc/litestream.yml --database default --json > /var/log/dso-restore-test.json 2>&1
+```
+
+systemd timer 는 같은 유닛이 겹쳐 돌지 않으므로 `flock` 이 필요 없다:
+
+```ini
+# /etc/systemd/system/dso-restore-test.service
+[Unit]
+Description=django-sqlite-ops restore test
+
+[Service]
+Type=oneshot
+User=app
+WorkingDirectory=/srv/app
+ExecStart=/srv/app/.venv/bin/python manage.py sqlite_doctor --restore-test --restore-dir /var/backups/dso-restore --litestream-config /etc/litestream.yml --database default --json
+
+# /etc/systemd/system/dso-restore-test.timer
+[Unit]
+Description=Daily django-sqlite-ops restore test
+
+[Timer]
+OnCalendar=*-*-* 04:17
+RandomizedDelaySec=15m
+Persistent=true
+
+[Install]
+WantedBy=timers.target
+```
+
+`systemctl enable --now dso-restore-test.timer` 로 켜고, 종료 코드 2 를 `OnFailure=` 나 모니터링으로 알린다(1 은 `warn`·`unknown` — 대개 원격 조회 실패라 헬스와 함께 본다).
+
 ### boot CLI
 
 컨테이너가 뜰 때 Litestream 복제본과 로컬 DB 를 비교해 **쓸 수 있으면 그대로, 볼륨이 비었으면 복원, 판정할 수 없으면 기동을 거부**한 뒤 다음 명령으로 넘어간다. Django 를 import 하지 않는 독립 CLI 다. `manage.py` 명령은 `django.setup()` 중에 빈 DB 파일을 만들 수 있고, 그러면 복원이 건너뛰어지기 때문이다([DESIGN §4-1](docs/DESIGN.md)).
@@ -667,7 +749,7 @@ LOGGING = {
 }
 ```
 
-헬스는 "지금 복제가 따라오는가"만 말한다. 복제본으로 실제 복구할 수 있는지는 주기적인 복원 검증(`sqlite_doctor --restore-test`)으로 따로 본다. 이 검증은 **설계만 확정됐고(#52) 구현 예정**이라 아직 명령에 없다. 설계(별도 `--restore-dir` 에 실제 복원, 기본 `full` 무결성, 복원 TXID 와 원격 TXID 비교, 헬스와 분리)는 [DESIGN §6-2](docs/DESIGN.md#6-2-sqlite_doctor-명시-실행-실제-연결) 의 `--restore-test` 소절에 있다.
+헬스는 "지금 복제가 따라오는가"만 말한다. 복제본으로 실제 복구할 수 있는지는 주기적인 [복원 검증](#복원-검증---restore-test)(`sqlite_doctor --restore-test`)으로 따로 본다. 그 결과는 헬스 응답에 섞지 않는다.
 
 ### channels-lite 패치
 
@@ -781,6 +863,9 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 | `[process]` 의 `nofile_soft` 가 compose 에 준 값과 다르다 | doctor 는 자기 프로세스의 한도를 본다. 다른 셸이나 호스트에서 돌렸거나, 앱이 `setrlimit` 으로 바꿨다 | `docker compose exec app ...` 로 컨테이너 안에서 돌리고, 앱 PID 의 `/proc/<pid>/limits` 와 맞춰 본다([fd 한도 가이드 §2](docs/profiles/fd-limits.md#2-현재-한도-확인)) | 재현함(#32) |
 | 읽기 전용 별칭(`mode=ro`)이 `unknown` 이다 | WAL DB 는 읽기 전용 연결도 `-shm` 에 쓰고 `-wal` 을 만들 수 있어 연결하지 않는다 | 같은 파일의 쓰기 별칭이나 `immutable=1` URI 별칭으로 진단한다([주의](#sqlite_doctor)) | 재현함 |
 | DB 파일이 없다는 `error` | 없는 파일에 연결하면 SQLite 가 빈 DB 를 만들어 다음 boot 의 복원을 막으므로 연결하지 않는다 | 경로를 확인하거나 boot 로 먼저 복원한다 | 코드상 확인(`doctor.py`) |
+| `--restore-test` 가 `restore_dir` `error` 로 바로 끝난다 | `--restore-dir` 이 없거나 링크이거나, 운영 DB 디렉터리·메타와 겹친다(아무것도 만들지 않고 거부) | DB 디렉터리·메타 밖의 실제 디렉터리를 미리 만들어 준다([복원 검증](#복원-검증---restore-test)) | 재현함(#54 테스트) |
+| `--restore-test` 의 `remote_txid` 가 `error`(복제본이 비었다) | 복제본에 LTX 가 없다. 0.5.17 은 복제본 경로·prefix 오타도 같은 결과다 | 설정의 복제본 경로를 확인하고 헬스(`remote_txid`)도 본다 | 재현함 |
+| `--restore-test` 산출물이 `--restore-dir` 에 쌓인다 | 실패(또는 `--keep`)한 실행의 작업 디렉터리는 조사용으로 남기고 자동으로 지우지 않는다 | `output` 경로를 확인한 뒤 지운다 | 코드상 확인(`restore_check.py`) |
 
 ### boot
 
