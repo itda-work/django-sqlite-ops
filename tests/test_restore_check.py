@@ -403,15 +403,17 @@ def test_integrity_open_failure_is_error(tmp_path):
 def test_integrity_timeout_interrupts_the_check(tmp_path):
     """제한을 넘긴 full 검사가 ``interrupt()`` 로 실제로 끝난다(#54 실측: 1ms 미만 지연)."""
     db = make_big_db(tmp_path / "big.db")
+    # 첫 검사는 페이지 캐시가 차가워 느리다(macOS 러너에서 두 번째가 4배 넘게 빨랐다). 데운 뒤 잰다.
+    assert rc.check_integrity(db, "full", 600)[0]
     start = time.monotonic()
-    passed, unlimited = rc.check_integrity(db, "full", 600)
+    passed, _ = rc.check_integrity(db, "full", 600)
     full = time.monotonic() - start
     assert passed
-    limit = min(0.02, full / 4)
+    limit = min(0.005, full / 10)
     start = time.monotonic()
     passed, got = rc.check_integrity(db, "full", limit)
     elapsed = time.monotonic() - start
-    assert not passed
+    assert not passed, (full, limit, elapsed)
     assert [(i.key, i.level) for i in got] == [("integrity", "error")]
     assert got[0].message.startswith("timeout: integrity_check did not finish")
     assert elapsed < full / 2, (elapsed, full)
