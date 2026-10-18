@@ -391,14 +391,14 @@ python manage.py sqlite_doctor --restore-test \
 |---|---|
 | `--restore-dir DIR` | **필수.** 복원본을 둘 디렉터리. 미리 만들어 둔 실제 디렉터리여야 한다(마지막 구성요소까지 링크 아님, 부모에도 링크 없음). 그 아래에 실행마다 `dso-restore-XXXX/`(권한 0700)를 새로 만든다. 기본값이 없는 이유: `/tmp` 가 tmpfs 인 서버에서 큰 DB 를 복원하면 RAM 을 먹는다 |
 | `--litestream-config PATH` | **필수.** 복원할 설정 파일. DB 경로가 설정의 `dbs[].path` 와 같은 실제 경로여야 한다([경로 규칙](#경로-규칙)) |
-| `--database ALIAS` | 볼 별칭(반복). 없으면 **쓰기 파일 DB 인 sqlite3 별칭 전부**를 복원하고, 메모리·읽기 전용·VFS·판정 불가 별칭은 `alias` `ok` 'skipped' 로만 적는다(종료 코드에 영향 없음). 직접 고른 별칭이 쓰기 파일 DB 가 아니면 `unknown`. 복원할 쓰기 DB 가 하나도 없으면 `error`(exit 2) |
+| `--database ALIAS` | 볼 별칭(반복). 없으면 **쓰기 파일 DB 인 sqlite3 별칭 전부**를 복원하고, 메모리·읽기 전용·VFS 별칭은 `alias` `ok` 'skipped' 로만 적는다(종료 코드에 영향 없음. URI 를 판정할 수 없는 별칭이 있으면 아래 보호 규칙으로 거부된다). 직접 고른 별칭이 쓰기 파일 DB 가 아니면 `unknown`. 복원할 쓰기 DB 가 하나도 없으면 `error`(exit 2) |
 | `--integrity full\|quick` | `full`(기본, `integrity_check`) 또는 `quick`(`quick_check`) |
 | `--restore-timeout SEC` | 별칭마다 복원의 시간 제한(기본 600초) |
 | `--integrity-timeout SEC` | 무결성 검사의 **별도** 시간 제한(기본 1800초). 넘으면 검사를 끊고 `integrity` `error` |
 | `--keep` | 모두 통과해도 복원본을 남긴다 |
 | `--litestream BIN`·`--json` | 위와 같다 |
 
-**운영 파일을 건드리지 않는다.** Django DB 연결을 열지 않으므로(일반 doctor 와 달리) `init_command` 도 실행되지 않는다. 복원본은 읽기 전용 `immutable` URI 로 연다. `litestream restore -o` 는 운영 DB·`-wal`·`-shm`·메타를 읽지도 쓰지도 않는다(0.5.17, 전후 해시·mtime 비교와 strace 로 재현함, #54). 그래도 `--restore-dir` 이 아래와 같거나 그 안이거나 그것을 품으면 **아무것도 만들기 전에 거부**한다(`restore_dir` `error`, exit 2). 대상은 `--database` 로 무엇을 고르든 `DATABASES` 의 **sqlite3 별칭 전부**의 합집합이다(경로만 계산하고 연결은 열지 않는다). 그중 설정이 잘못돼 경로를 알 수 없는 별칭(`get_connection_params()` 실패)이 있으면 보호할 경로를 다 모르므로 `--database` 와 무관하게 거부한다.
+**운영 파일을 건드리지 않는다.** Django DB 연결을 열지 않으므로(일반 doctor 와 달리) `init_command` 도 실행되지 않는다. 복원본은 읽기 전용 `immutable` URI 로 연다. `litestream restore -o` 는 운영 DB·`-wal`·`-shm`·메타를 읽지도 쓰지도 않는다(0.5.17, 전후 해시·mtime 비교와 strace 로 재현함, #54). 그래도 `--restore-dir` 이 아래와 같거나 그 안이거나 그것을 품으면 **아무것도 만들기 전에 거부**한다(`restore_dir` `error`, exit 2). 대상은 `--database` 로 무엇을 고르든 `DATABASES` 의 **sqlite3 별칭 전부**의 합집합이다(경로만 계산하고 연결은 열지 않는다). 그중 경로를 알 수 없는 별칭 — 설정이 잘못돼 `get_connection_params()` 가 실패하거나, URI 를 판정할 수 없는 별칭(역할 `unknown`: `mode` 중복, 비표준 `mode`/`immutable` 값 등) — 이 있으면 보호할 경로를 다 모르므로 `--database` 와 무관하게 거부한다. 판정 불가 URI 별칭은 실행 대상에서는 'skipped' 지만, 그 설정을 고치기 전까지 이 모드 자체가 돌지 않는다.
 
 - 운영 DB 의 **부모 디렉터리**(그 안의 DB·사이드카·boot 잠금·상태 파일·boot 임시 디렉터리가 모두 여기 든다)
 - Litestream 메타: `SQLITE_OPS["HEALTH"]["DATABASES"][alias]["meta_path"]`, 없으면 기본 `.<db>-litestream/`. 메타가 링크면 링크와 그 실체 둘 다

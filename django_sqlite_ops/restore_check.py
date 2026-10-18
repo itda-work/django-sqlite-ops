@@ -435,10 +435,15 @@ def restore_test(
             )
         )
         return items
-    # 경로를 모르는 sqlite3 별칭이 있으면 합집합이 불완전하다: 판정할 수 없으므로 거부한다(R2-1).
-    unknown = [alias for alias, target in targets.items() if target.role == "error"]
+    # 보호할 로컬 경로를 정할 수 없는 sqlite3 별칭(설정 오류 error, URI 판정 불가 unknown)이 있으면
+    # 합집합이 불완전하다: 판정할 수 없으므로 거부한다(R2-1·R3-1). URI 에서 경로를 짐작해 꺼내지
+    # 않는다. memory·vfs 는 로컬 DB 파일이 없으므로 통과한다.
+    unknown = [
+        f"{alias!r} (role {target.role}: {target.reason or 'no reason given'})"
+        for alias, target in targets.items()
+        if target.role in ("error", "unknown")
+    ]
     if unknown:
-        names = ", ".join(repr(alias) for alias in unknown)
         items.append(
             _item(
                 None,
@@ -446,8 +451,8 @@ def restore_test(
                 "error",
                 restore_dir,
                 None,
-                f"cannot determine the paths of alias {names} (get_connection_params() failed), "
-                "so the operational paths to protect are unknown; fix the DATABASES entry",
+                f"cannot determine the paths of alias {', '.join(unknown)}, so the operational "
+                "paths to protect are unknown; fix the DATABASES entry",
             )
         )
         return items

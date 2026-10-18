@@ -765,20 +765,35 @@ def test_fake_aliases_that_are_not_write_file_dbs_are_unknown(lab):
     assert one(data, "integrity")["level"] == "ok"
 
 
+def _bogus_option(other: Path) -> dict:
+    # Django 6.1 의 get_connection_params() 가 ImproperlyConfigured 를 낸다(역할 error).
+    return sqlite_db(other, transaction_mode="BOGUS")
+
+
+def _ambiguous_uri(other: Path) -> dict:
+    # 역할 키 중복이라 판정할 수 없지만(역할 unknown) 표준 sqlite3 는 이 URI 로 쓰기 연결을 연다.
+    return sqlite_db(f"file:{other}?mode=rwc&mode=rwc", uri=True)
+
+
 @pytest.mark.parametrize("extra", [["--database", "default"], []], ids=["selected", "default"])
-def test_fake_alias_with_unknown_paths_refuses_the_restore_dir(lab, extra):
-    """경로를 알 수 없는 sqlite3 별칭이 있으면 보호 합집합이 불완전하므로 거부한다(리뷰 2 R2-1)."""
+@pytest.mark.parametrize(
+    "config, role",
+    [(_bogus_option, "error"), (_ambiguous_uri, "unknown")],
+    ids=["params-fail", "uri-undeterminable"],
+)
+def test_fake_alias_with_unknown_paths_refuses_the_restore_dir(lab, extra, config, role):
+    """경로를 알 수 없는 sqlite3 별칭이 있으면 보호 합집합이 불완전하므로 거부한다(R2-1·R3-1)."""
     lab, db, fake = lab
     (lab / "other").mkdir()
     other = make_db(lab / "other" / "o.db")
-    # Django 6.1 의 get_connection_params() 가 ImproperlyConfigured 를 낸다.
-    databases = {"default": sqlite_db(db), "other": sqlite_db(other, transaction_mode="BOGUS")}
+    databases = {"default": sqlite_db(db), "other": config(other)}
     before = fingerprint(lab / "other")
     code, data, _ = run(databases, *fake.args(lab / "other", *extra))
     assert code == 2, data
     item = one(data, "restore_dir", alias=None)
     assert item["level"] == "error"
     assert "cannot determine the paths of alias 'other'" in item["message"]
+    assert f"role {role}" in item["message"]
     assert items(data, "restore") == []
     assert fake.commands() == []
     assert fingerprint(lab / "other") == before
