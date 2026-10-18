@@ -26,10 +26,22 @@ from collections.abc import Iterable
 from pathlib import Path
 from urllib.parse import quote
 
+from django.conf import settings
+from django.db import connections
+
 from .boot import litestream
 from .boot.cli import _fold, _overlaps, lock_path, real_path, sidecars, state_path
 from .boot.decide import RemoteEmpty, RemoteError
-from .doctor import Item, _binary, _caller_path, _file_size, _target, select_aliases
+from .doctor import (
+    Item,
+    _binary,
+    _caller_path,
+    _file_size,
+    _one_line,
+    _Target,
+    _target,
+    select_aliases,
+)
 from .health import load_config, redact
 
 __all__ = [
@@ -367,6 +379,26 @@ def _meta_paths() -> tuple[dict[str, str], str | None]:
     return {c.alias: c.meta_path for c in health.databases if c.meta_path is not None}, None
 
 
+def _sqlite_targets() -> tuple[dict[str, _Target], list[tuple[str, str]]]:
+    """보호 합집합을 만들 별칭: ``vendor == "sqlite"`` 인 ``DATABASES`` 별칭 전부(D-25, R4-1).
+
+    ENGINE 문자열 일치가 아니라 백엔드의 ``vendor`` 로 본다(sqlite3 를 상속한 사용자 백엔드·
+    SpatiaLite 도 SQLite 파일을 쓴다). ``connections[alias]`` 는 래퍼만 만들고 연결하지 않는다.
+    백엔드를 불러오지 못하는 별칭은 ``(별칭, 사유 한 줄)`` 로 따로 돌려준다(SQLite 인지 모른다).
+    """
+    targets: dict[str, _Target] = {}
+    unloadable: list[tuple[str, str]] = []
+    for alias, config in settings.DATABASES.items():
+        try:
+            vendor = connections[alias].vendor
+        except Exception as exc:  # noqa: BLE001 - ImproperlyConfigured·ImportError 등을 한 줄로
+            unloadable.append((alias, _one_line(f"{type(exc).__name__}: {exc}")))
+            continue
+        if vendor == "sqlite":
+            targets[alias] = _target(alias, config)
+    return targets, unloadable
+
+
 def restore_test(
     aliases: Iterable[str] | None,
     *,
@@ -387,12 +419,11 @@ def restore_test(
     if integrity not in INTEGRITY_MODES:
         raise ValueError(f"integrity must be one of {INTEGRITY_MODES}, got {integrity!r}")
     explicit = aliases is not None
-    sqlite, selected, items = select_aliases(aliases, SECTION)
+    _, selected, items = select_aliases(aliases, SECTION)
     items = list(items)
     metas, meta_error = _meta_paths()
 
-    # 보호 대상은 고른 별칭과 무관하게 sqlite3 별칭 전부의 운영 경로다(D-25, 연결은 열지 않는다).
-    targets = {alias: _target(alias, config) for alias, config in sqlite.items()}
+    targets, unloadable = _sqlite_targets()
     protected: list[tuple[str | None, str, Path]] = []
     for alias, target in targets.items():
         if target.path is not None:
@@ -443,6 +474,21 @@ def restore_test(
         for alias, target in targets.items()
         if target.role in ("error", "unknown")
     ]
+    if unloadable:
+        names = ", ".join(f"{alias!r} ({reason})" for alias, reason in unloadable)
+        items.append(
+            _item(
+                None,
+                "restore_dir",
+                "error",
+                restore_dir,
+                None,
+                f"cannot load the database backend of alias {names}, so it is unknown whether "
+                "it is a SQLite database whose paths must be protected; fix or remove the "
+                "DATABASES entry",
+            )
+        )
+        return items
     if unknown:
         items.append(
             _item(

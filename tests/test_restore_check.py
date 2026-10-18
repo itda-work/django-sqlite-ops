@@ -98,6 +98,11 @@ def sqlite_db(path: Path, **options) -> dict:
     return config
 
 
+# SQLite 가 아닌 별칭. 드라이버 없이 불러올 수 있는 백엔드를 쓴다: 불러오지 못하는 백엔드(예:
+# psycopg 없는 postgresql)가 있으면 이 모드는 거부한다(R4-1).
+NOT_SQLITE = {"ENGINE": "django.db.backends.dummy", "NAME": "x"}
+
+
 def make_db(path: Path, rows: int = 10, *, wal: bool = True) -> Path:
     conn = sqlite3.connect(path)
     if wal:
@@ -745,7 +750,7 @@ def test_fake_aliases_that_are_not_write_file_dbs_are_unknown(lab):
         "default": sqlite_db(db),
         "mem": sqlite_db(":memory:"),
         "ro": sqlite_db(f"file:{db}?mode=ro"),
-        "pg": {"ENGINE": "django.db.backends.postgresql", "NAME": "x"},
+        "pg": NOT_SQLITE,
     }
     code, data, _ = run(
         databases,
@@ -799,6 +804,55 @@ def test_fake_alias_with_unknown_paths_refuses_the_restore_dir(lab, extra, confi
     assert fingerprint(lab / "other") == before
 
 
+SUBCLASS_BACKEND = """
+from django.db.backends.sqlite3 import base
+
+
+class DatabaseWrapper(base.DatabaseWrapper):
+    pass
+"""
+
+
+@pytest.mark.parametrize("extra", [["--database", "default"], []], ids=["selected", "default"])
+def test_fake_sqlite_subclass_backend_is_protected(lab, extra):
+    """ENGINE 이 sqlite3 와 다른 SQLite 백엔드(vendor sqlite)의 경로도 보호한다(R4-1)."""
+    lab, db, fake = lab
+    package = lab / "pkg" / "mybackend"
+    package.mkdir(parents=True)
+    (package / "__init__.py").write_text("")
+    (package / "base.py").write_text(SUBCLASS_BACKEND)
+    (lab / "other").mkdir()
+    other = make_db(lab / "other" / "o.db")
+    databases = {"default": sqlite_db(db), "other": {"ENGINE": "mybackend", "NAME": str(other)}}
+    before = fingerprint(lab / "other")
+    post = f"import sys\nsys.path.insert(0, {str(lab / 'pkg')!r})\n"
+    code, data, _ = run(databases, *fake.args(lab / "other", *extra), post=post)
+    assert code == 2, data
+    item = one(data, "restore_dir", alias=None)
+    assert "overlaps" in item["message"]
+    assert "alias 'other'" in item["message"]
+    assert fake.commands() == []
+    assert fingerprint(lab / "other") == before
+    # 실행 대상은 지금처럼 ENGINE 일치로 고른다: 겹치지 않는 DIR 이면 default 만 복원한다.
+    code, data, _ = run(databases, *fake.args(lab / "restore", *extra), post=post)
+    assert code == 0, data
+    assert [c[-1] for c in fake.calls() if c[0] == "restore"] == [str(db)]
+
+
+@pytest.mark.parametrize("extra", [["--database", "default"], []], ids=["selected", "default"])
+def test_fake_unloadable_backend_refuses_the_restore_dir(lab, extra):
+    """백엔드를 불러오지 못하는 별칭은 SQLite 인지 알 수 없으므로 거부한다(R4-1)."""
+    lab, db, fake = lab
+    databases = {"default": sqlite_db(db), "x": {"ENGINE": "no_such_backend_dso", "NAME": "x"}}
+    code, data, _ = run(databases, *fake.args(lab / "restore", *extra))
+    assert code == 2, data
+    item = one(data, "restore_dir", alias=None)
+    assert "cannot load the database backend of alias 'x'" in item["message"]
+    assert "no_such_backend_dso" in item["message"]
+    assert fake.commands() == []
+    assert work_dirs(lab / "restore") == []
+
+
 def test_fake_explicit_non_write_alias_only_is_error(lab):
     """``--database`` 로 고른 별칭이 읽기 전용뿐이면 unknown 과 함께 NO_TARGET error(exit 2)."""
     lab, db, fake = lab
@@ -819,7 +873,7 @@ def test_fake_default_selection_skips_aliases_that_are_not_write_file_dbs(lab):
         "default": sqlite_db(db),
         "mem": sqlite_db(":memory:"),
         "ro": sqlite_db(f"file:{db}?mode=ro"),
-        "pg": {"ENGINE": "django.db.backends.postgresql", "NAME": "x"},
+        "pg": NOT_SQLITE,
     }
     code, data, _ = run(databases, *fake.args(lab / "restore"))
     assert code == 0, data
@@ -836,9 +890,9 @@ def test_fake_default_selection_skips_aliases_that_are_not_write_file_dbs(lab):
 @pytest.mark.parametrize(
     "databases",
     [
-        {"default": {"ENGINE": "django.db.backends.postgresql", "NAME": "x"}},
+        {"default": NOT_SQLITE},
         {
-            "default": {"ENGINE": "django.db.backends.postgresql", "NAME": "x"},
+            "default": NOT_SQLITE,
             "mem": sqlite_db(":memory:"),
         },
     ],
