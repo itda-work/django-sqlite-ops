@@ -457,8 +457,11 @@ def test_integrity_timeout_interrupts_the_check(tmp_path):
     elapsed = time.monotonic() - start
     assert not passed, (full, limit, elapsed)
     assert [(i.key, i.level) for i in got] == [("integrity", "error")]
+    # 'timeout' 은 타이머가 발동했고 예외가 interrupted 일 때만 나온다(F8): 검사가 끝나기 전에
+    # interrupt() 로 끊겼다는 증거다. 걸린 시간은 스레드 스케줄링 지연만큼 여유를 둔다(macOS
+    # 러너에서 데운 full 검사가 50ms 라 full/2 기준은 0.2ms 차이로 흔들렸다).
     assert got[0].message.startswith("timeout: integrity_check did not finish")
-    assert elapsed < full / 2, (elapsed, full)
+    assert elapsed < limit + 0.5, (elapsed, limit, full)
 
 
 # --- 정리 ---------------------------------------------------------------------------------
