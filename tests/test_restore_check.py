@@ -175,7 +175,9 @@ if cmd == "version":
     print("0.5.17")
     sys.exit(0)
 if cmd == "databases":
-    print(json.dumps([{{"path": p, "replica": "file"}} for p in spec["dbs"]]))
+    # 0.5.17 은 dir: 항목을 감시 디렉터리가 아니라 실행한 cwd 로 내보낸다(재현함).
+    paths = spec["dbs"] + ([os.getcwd()] if spec.get("dir_entry") else [])
+    print(json.dumps([{{"path": p, "replica": "file"}} for p in paths]))
     sys.exit(0)
 part = spec[cmd]
 time.sleep(part.get("sleep", 0))
@@ -191,6 +193,11 @@ if cmd == "ltx":
 elif cmd == "restore":
     out = args[args.index("-o") + 1]
     shutil.copyfile(part["src"], out)
+    swap = part.get("swap")
+    if swap and not os.path.islink(swap):
+        # 검사를 통과한 --restore-dir 을 복원 중에 링크로 바꿔치기한다(R5-4).
+        os.rename(swap, swap + ".old")
+        os.symlink(swap + ".old", swap)
     print(json.dumps({{"txid": "%016x" % part["txid"], "integrity_check": "none"}}))
 """
 
@@ -853,6 +860,91 @@ def test_fake_unloadable_backend_refuses_the_restore_dir(lab, extra):
     assert work_dirs(lab / "restore") == []
 
 
+def _db_behind_a_file_link(lab: Path) -> tuple[str, Path, Path]:
+    """``a/app.db`` → ``vol/b/app.db``: SQLite 는 링크를 따라가 실체 옆에 -wal·-shm 을 만든다."""
+    (lab / "vol" / "b" / "sub").mkdir(parents=True)
+    real = make_db(lab / "vol" / "b" / "app.db")
+    (lab / "a").mkdir()
+    (lab / "a" / "app.db").symlink_to(real)
+    return str(lab / "a" / "app.db"), lab / "vol" / "b", lab / "vol" / "b" / "sub"
+
+
+def _db_behind_dotdot_after_a_link(lab: Path) -> tuple[str, Path, Path]:
+    """``srv/x/../data/app.db`` 이고 ``srv/x`` → ``vol/deep/x``: 실체는 ``vol/deep/data/app.db``."""
+    (lab / "vol" / "deep" / "x").mkdir(parents=True)
+    (lab / "vol" / "deep" / "data").mkdir()
+    make_db(lab / "vol" / "deep" / "data" / "app.db")
+    (lab / "srv").mkdir()
+    (lab / "srv" / "x").symlink_to(lab / "vol" / "deep" / "x")
+    real_dir = lab / "vol" / "deep" / "data"
+    return f"{lab}/srv/x/../data/app.db", real_dir, real_dir
+
+
+@pytest.mark.parametrize("extra", [["--database", "default"], []], ids=["selected", "default"])
+@pytest.mark.parametrize(
+    "layout", [_db_behind_a_file_link, _db_behind_dotdot_after_a_link], ids=["file-link", "dotdot"]
+)
+def test_fake_real_location_behind_links_is_protected(lab, extra, layout):
+    """링크를 따라간 실제 DB 위치(부모 디렉터리·사이드카)도 보호한다(리뷰 5 R5-1)."""
+    lab, db, fake = lab
+    name, real_dir, restore_dir = layout(lab)
+    databases = {"default": sqlite_db(db), "other": sqlite_db(name)}
+    before = fingerprint(real_dir)
+    code, data, _ = run(databases, *fake.args(restore_dir, *extra))
+    assert code == 2, data
+    item = one(data, "restore_dir", alias=None)
+    assert "alias 'other'" in item["message"], item
+    assert fake.commands() == []
+    assert fingerprint(real_dir) == before
+
+
+def test_fake_database_file_that_is_a_symlink_is_error(lab):
+    """실행 대상의 DB 파일이 링크면 boot(D-15)와 같이 거부한다. 다른 별칭은 그대로 돈다(R5-1)."""
+    lab, db, fake = lab
+    name, _, _ = _db_behind_a_file_link(lab)
+    databases = {"default": sqlite_db(db), "linked": sqlite_db(name)}
+    code, data, _ = run(databases, *fake.args(lab / "restore"))
+    assert code == 2, data
+    item = one(data, "database", "linked")
+    assert item["level"] == "error"
+    assert "symlink" in item["message"]
+    assert one(data, "integrity")["level"] == "ok"
+    assert [c[-1] for c in fake.calls() if c[0] == "restore"] == [str(db)]
+
+
+def test_fake_dir_entry_in_the_litestream_config_is_refused(lab):
+    """``dir:`` 항목이 있으면 감시 디렉터리를 모르므로 아무것도 만들기 전에 거부한다(R5-2, D-26)."""
+    lab, db, fake = lab
+    fake.spec["dir_entry"] = True
+    fake.save()
+    code, data, _ = run({"default": sqlite_db(db)}, *fake.args(lab / "restore"))
+    assert code == 2, data
+    item = one(data, "config", alias=None)
+    assert item["level"] == "error"
+    assert "dir: entry" in item["message"]
+    assert fake.commands() == ["databases"]
+    assert work_dirs(lab / "restore") == []
+
+
+def test_fake_restore_dir_swapped_after_the_check_is_refused(lab):
+    """검사 뒤 ``--restore-dir`` 이 링크로 바뀌면 다음 별칭의 mkdtemp 전에 멈춘다(R5-4)."""
+    lab, db, fake = lab
+    (lab / "b").mkdir()
+    second = make_db(lab / "b" / "b.db")
+    fake.spec["dbs"].append(str(second))
+    fake.spec["restore"]["swap"] = str(lab / "restore")
+    fake.save()
+    databases = {"default": sqlite_db(db), "b": sqlite_db(second)}
+    code, data, _ = run(databases, *fake.args(lab / "restore"))
+    assert code == 2, data
+    assert one(data, "integrity")["level"] == "ok"
+    item = one(data, "restore_dir", "b")
+    assert item["level"] == "error"
+    assert "changed since it was checked" in item["message"]
+    assert [c[-1] for c in fake.calls() if c[0] == "restore"] == [str(db)]
+    assert list((lab / "restore.old").iterdir()) == []
+
+
 def test_fake_explicit_non_write_alias_only_is_error(lab):
     """``--database`` 로 고른 별칭이 읽기 전용뿐이면 unknown 과 함께 NO_TARGET error(exit 2)."""
     lab, db, fake = lab
@@ -1142,6 +1234,29 @@ def test_real_not_enough_space(real):
     assert code == 2
     assert one(data, "space")["level"] == "error"
     assert work_dirs(lab / "restore") == []
+
+
+@needs_litestream
+def test_real_dir_entry_in_the_config_is_refused(real):
+    """실제 0.5.17: ``dir:`` 항목은 cwd 로 나열된다. 그것을 보고 거부한다(R5-2)."""
+    lab, db, config, _ = real
+    (lab / "tenants").mkdir()
+    config.write_text(
+        config.read_text()
+        + f"  - dir: {lab / 'tenants'}\n"
+        + '    pattern: "*.db"\n'
+        + "    recursive: true\n"
+        + "    watch: true\n"
+        + "    replica:\n"
+        + "      type: file\n"
+        + f"      path: {lab / 'replica-tenants'}\n"
+    )
+    code, data, _ = run({"default": sqlite_db(db)}, *real_args(lab, config))
+    assert code == 2, data
+    assert "dir: entry" in one(data, "config", alias=None)["message"]
+    assert "restore" not in keys(data)
+    assert work_dirs(lab / "restore") == []
+    assert list((lab / "tenants").iterdir()) == []
 
 
 @needs_litestream

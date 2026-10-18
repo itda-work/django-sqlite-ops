@@ -276,6 +276,7 @@ def _one(
     restore_timeout: float,
     integrity_timeout: float,
     keep: bool,
+    identity: tuple[int, int] | None = None,
 ) -> list[Item]:
     items: list[Item] = []
     # 1. 용량: 이 별칭을 시작하기 직전의 여유로 본다(앞 별칭이 남긴 산출물이 자연히 반영된다).
@@ -290,7 +291,12 @@ def _one(
         return [_item(alias, "space", "error", free, need, f"not enough free space; {estimate}")]
     items.append(_item(alias, "space", "ok", free, need, estimate))
 
-    # 2. 작업 디렉터리: 실행마다 새로 만든다(0700). 겹치는 실행끼리 충돌하지 않는다.
+    # 2. 작업 디렉터리: 실행마다 새로 만든다(0700). 겹치는 실행끼리 충돌하지 않는다. 검사한
+    #    --restore-dir 이 그대로인지(같은 디렉터리, 링크 아님) 바로 앞에서 다시 본다(R5-4).
+    if identity is None or _dir_identity(root) != identity:
+        message = "--restore-dir changed since it was checked (replaced or turned into a symlink)"
+        items.append(_item(alias, "restore_dir", "error", str(root), None, message))
+        return items
     try:
         work = Path(tempfile.mkdtemp(prefix="dso-restore-", dir=root))
     except OSError as exc:
@@ -379,6 +385,45 @@ def _meta_paths() -> tuple[dict[str, str], str | None]:
     return {c.alias: c.meta_path for c in health.databases if c.meta_path is not None}, None
 
 
+def _base_paths(name: str) -> list[Path]:
+    """보호 합집합의 기준 경로: 글자 그대로 접은 경로와, 커널처럼 링크를 따라간 실체(R5-1).
+
+    ``abspath`` 는 ``..`` 를 글자 단위로 먼저 접으므로 ``srv/x/../data``(``srv/x`` 가 링크)의 실체를
+    놓친다. ``realpath`` 는 구성요소를 차례로 풀어 링크 뒤의 ``..`` 를 커널과 같이 처리한다.
+    DB 파일이 링크면 SQLite 는 실체 옆에 사이드카를 만들므로 실체 기준의 부모 디렉터리·사이드카도
+    넣는다.
+    """
+    literal = Path(os.path.normpath(os.path.abspath(name)))
+    real = Path(os.path.realpath(name))
+    return [literal] if real == literal else [literal, real]
+
+
+def _dir_identity(path: Path) -> tuple[int, int] | None:
+    """링크가 아닌 디렉터리의 ``(st_dev, st_ino)``. 아니거나 읽지 못하면 ``None``."""
+    try:
+        st = os.lstat(path)
+    except OSError:
+        return None
+    if not stat.S_ISDIR(st.st_mode):
+        return None
+    return st.st_dev, st.st_ino
+
+
+def _dir_entry(listed: Iterable[str], cwd: str) -> str | None:
+    """``databases -json`` 목록에서 ``dir:`` 항목의 흔적(조회한 임시 cwd 또는 그 아래)을 찾는다.
+
+    0.5.17 은 ``dir:`` 항목을 감시 디렉터리가 아니라 실행한 cwd 로 내보낸다(절대 경로 ``dir:`` 도,
+    재현함 #54). 그래서 감시 디렉터리는 모르지만 항목이 있다는 것은 안다. 상대 ``path:`` 도 cwd
+    아래로 풀려 여기 걸린다 — replicate 가 어디서 도는지 모르면 위치를 모르므로 함께 거부한다.
+    """
+    roots = {os.path.normpath(cwd), os.path.realpath(cwd)}
+    for path in listed:
+        for root in roots:
+            if path == root or path.startswith(root.rstrip(os.sep) + os.sep):
+                return path
+    return None
+
+
 def _sqlite_targets() -> tuple[dict[str, _Target], list[tuple[str, str]]]:
     """보호 합집합을 만들 별칭: ``vendor == "sqlite"`` 인 ``DATABASES`` 별칭 전부(D-25, R4-1).
 
@@ -426,11 +471,12 @@ def restore_test(
     targets, unloadable = _sqlite_targets()
     protected: list[tuple[str | None, str, Path]] = []
     for alias, target in targets.items():
-        if target.path is not None:
-            raw = Path(os.path.normpath(os.path.abspath(target.path)))
-            meta = metas.get(alias)
-            meta_path = Path(os.path.normpath(meta)) if meta else litestream.default_meta_path(raw)
-            protected.extend((alias, what, p) for what, p in protected_paths(raw, meta_path))
+        if target.path is None:
+            continue
+        meta = metas.get(alias)
+        for base in _base_paths(target.path):
+            meta_path = Path(os.path.normpath(meta)) if meta else litestream.default_meta_path(base)
+            protected.extend((alias, what, p) for what, p in protected_paths(base, meta_path))
 
     runnable: list[tuple[str, Path]] = []
     for alias in selected:
@@ -449,6 +495,12 @@ def restore_test(
             db = real_path(target.path)
         except ValueError as exc:
             items.append(_item(alias, "database", "error", target.path, None, str(exc)))
+            continue
+        if db.is_symlink():
+            # boot(D-15)와 같은 계약: DB 는 정규 파일 경로로만 받는다. SQLite 는 링크를 따라가
+            # 실체 옆에 사이드카를 만들어, 이 경로와 Litestream 설정의 경로가 어긋난다.
+            message = "the database file is a symlink; use the real file path (D-15)"
+            items.append(_item(alias, "database", "error", str(db), None, message))
             continue
         runnable.append((alias, db))
 
@@ -506,6 +558,8 @@ def restore_test(
     if problem is not None:
         items.append(_item(None, "restore_dir", "error", restore_dir, None, problem))
         return items
+    # 별칭마다 mkdtemp 직전에 같은 디렉터리인지 다시 본다(앞 별칭의 복원·검사 동안 바뀔 수 있다).
+    identity = _dir_identity(root)
     if not runnable:
         # 아무것도 검증하지 않고 성공하면 감시(cron·systemd)에서 거짓 초록이 된다(리뷰 1 F1).
         if not any(i.level == "error" for i in items):
@@ -519,6 +573,22 @@ def restore_test(
         listed = litestream.config_databases(config, binary=binary, cwd=cwd)
     if isinstance(listed, str):
         items.append(_item(None, "config", "error", config, None, redact(listed)))
+        return items
+    entry = _dir_entry(listed, cwd)
+    if entry is not None:
+        items.append(
+            _item(
+                None,
+                "config",
+                "error",
+                config,
+                None,
+                "the litestream config has a dir: entry (or a relative path): litestream "
+                f"databases lists {entry} under its working directory, so the watched directory "
+                "cannot be determined and a restore under --restore-dir may be picked up and "
+                "replicated (D-26)",
+            )
+        )
         return items
     in_config = set(listed)
     for alias, db in runnable:
@@ -545,6 +615,7 @@ def restore_test(
                 restore_timeout=restore_timeout,
                 integrity_timeout=integrity_timeout,
                 keep=keep,
+                identity=identity,
             )
         )
     return items
