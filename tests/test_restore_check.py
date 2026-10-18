@@ -176,7 +176,9 @@ if cmd == "version":
     sys.exit(0)
 if cmd == "databases":
     # 0.5.17 은 dir: 항목을 감시 디렉터리가 아니라 실행한 cwd 로 내보낸다(재현함).
+    # 상대 path: 는 실행한 cwd 아래로 풀린다(재현함).
     paths = spec["dbs"] + ([os.getcwd()] if spec.get("dir_entry") else [])
+    paths += [os.path.join(os.getcwd(), r) for r in spec.get("relative", [])]
     print(json.dumps([{{"path": p, "replica": "file"}} for p in paths]))
     sys.exit(0)
 part = spec[cmd]
@@ -926,6 +928,41 @@ def test_fake_dir_entry_in_the_litestream_config_is_refused(lab):
     assert work_dirs(lab / "restore") == []
 
 
+def test_fake_relative_path_in_the_litestream_config_is_refused(lab):
+    """상대 ``path:`` 는 replicate 의 cwd 에 따라 위치가 바뀌므로 거부한다(R6-1, D-26)."""
+    lab, db, fake = lab
+    fake.spec["relative"] = ["data/app.db"]
+    fake.save()
+    code, data, _ = run({"default": sqlite_db(db)}, *fake.args(lab / "restore"))
+    assert code == 2, data
+    item = one(data, "config", alias=None)
+    assert item["level"] == "error"
+    assert "relative path" in item["message"]
+    assert "dir: entry" not in item["message"]
+    assert item["message"].endswith(
+        "/data/app.db in the litestream config; its location depends "
+        "on where litestream runs, so the paths to protect are "
+        "unknown (D-26)"
+    )
+    assert fake.commands() == ["databases"]
+    assert work_dirs(lab / "restore") == []
+
+
+def test_fake_alias_with_a_nul_in_its_path_refuses_the_restore_dir(lab):
+    """NAME 에 NUL 이 든 별칭은 보호 경로를 정할 수 없으므로 거부한다(R6-2)."""
+    lab, db, fake = lab
+    databases = {"default": sqlite_db(db), "weird": sqlite_db(str(lab / "app" / "x\0y.db"))}
+    code, data, _ = run(databases, *fake.args(lab / "restore"))
+    assert code == 2, data
+    item = one(data, "restore_dir", alias=None)
+    assert item["level"] == "error"
+    assert "cannot determine the paths of alias 'weird'" in item["message"]
+    assert "null" in item["message"]
+    assert items(data, "restore") == []
+    assert fake.commands() == []
+    assert work_dirs(lab / "restore") == []
+
+
 def test_fake_restore_dir_swapped_after_the_check_is_refused(lab):
     """검사 뒤 ``--restore-dir`` 이 링크로 바뀌면 다음 별칭의 mkdtemp 전에 멈춘다(R5-4)."""
     lab, db, fake = lab
@@ -1257,6 +1294,26 @@ def test_real_dir_entry_in_the_config_is_refused(real):
     assert "restore" not in keys(data)
     assert work_dirs(lab / "restore") == []
     assert list((lab / "tenants").iterdir()) == []
+
+
+@needs_litestream
+def test_real_relative_path_in_the_config_is_refused(real):
+    """실제 0.5.17: 상대 ``path:`` 는 cwd 아래로 나열된다. 그것을 보고 거부한다(R6-1)."""
+    lab, db, config, _ = real
+    config.write_text(
+        config.read_text()
+        + "  - path: data/other.db\n"
+        + "    replica:\n"
+        + "      type: file\n"
+        + f"      path: {lab / 'replica-other'}\n"
+    )
+    code, data, _ = run({"default": sqlite_db(db)}, *real_args(lab, config))
+    assert code == 2, data
+    message = one(data, "config", alias=None)["message"]
+    assert "relative path" in message
+    assert message.split(" in the litestream config")[0].endswith(f"{os.sep}data{os.sep}other.db")
+    assert "restore" not in keys(data)
+    assert work_dirs(lab / "restore") == []
 
 
 @needs_litestream

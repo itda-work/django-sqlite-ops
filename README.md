@@ -407,6 +407,8 @@ python manage.py sqlite_doctor --restore-test \
 검사를 통과한 `--restore-dir` 이 실행 중(앞 별칭의 복원·검사 동안) 다른 디렉터리나 링크로 바뀌면 다음 별칭의 작업 디렉터리를 만들기 전에 `restore_dir` `error` 로 멈춘다.
 
 > **Litestream `dir:`(테넌트) 구성은 거부된다.** 설정에 `dir:` 항목이 있으면 `config` `error`(exit 2)로 아무것도 만들기 전에 끝난다. `dir:`+`recursive`+`watch` 감시 아래에 복원하면 운영 replicate 가 복원본을 새 DB 로 잡아 복제하는데(0.5.17 재현함), `litestream databases -json` 은 감시 디렉터리를 내주지 않아 겹치는지 판정할 수 없기 때문이다(D-26). 감시 디렉터리를 명시로 받는 것은 후속이다. **같은 호스트의 다른 설정 파일**로 도는 replicate 의 `dir:` 감시는 판별하지 못한다 — `--restore-dir` 은 어떤 Litestream `dir:` 감시 대상 아래에도 두지 않는다.
+>
+> **상대 `path:` 도 거부된다.** 실제 위치가 replicate 를 띄운 작업 디렉터리에 따라 바뀌어 보호할 경로를 정할 수 없기 때문이다(D-26). `dbs[].path` 는 절대 경로로 쓴다.
 
 > **DATABASES 밖의 DB.** Litestream 설정에는 있지만 `DATABASES` 에 없는 DB(같은 `litestream.yml` 로 복제하는 다른 서비스의 DB 등)의 디렉터리와 메타는 보호하지 않는다(후속 이슈). 그런 디렉터리를 `--restore-dir` 로 주지 않는다.
 
@@ -426,7 +428,7 @@ python manage.py sqlite_doctor --restore-test \
 | `integrity` | `full`/`quick` | 열기·검사 실패, 시간 초과면 `error`. 오류 줄 앞 5줄 또는 `timeout` 을 `message` 에 |
 | `duration_ms`·`size`·`tables`·`page_count` | 복원 시간, 복원본 바이트, 테이블 수, 페이지 수 | 보고(`ok`) |
 | `output` | 남긴 작업 디렉터리 | 보고(`ok`). 정리하다 실패하면 `warn` |
-| `alias`·`database`·`config` | 별칭 종류, DB 경로, 설정 파일 | 기본 선택에서 쓰기 파일 DB 가 아니면 `alias` `ok`(skipped), 직접 고른 별칭이면 `unknown`, 복원할 쓰기 DB 가 하나도 없으면 별칭 `null` 의 `alias` `error`, 경로가 실제 경로가 아니거나 DB 파일이 링크이거나 설정에 없으면 `database` `error`, 설정을 읽지 못하거나 `dir:` 항목이 있으면 `config` `error` |
+| `alias`·`database`·`config` | 별칭 종류, DB 경로, 설정 파일 | 기본 선택에서 쓰기 파일 DB 가 아니면 `alias` `ok`(skipped), 직접 고른 별칭이면 `unknown`, 복원할 쓰기 DB 가 하나도 없으면 별칭 `null` 의 `alias` `error`, 경로가 실제 경로가 아니거나 DB 파일이 링크이거나 설정에 없으면 `database` `error`, 설정을 읽지 못하거나 `dir:` 항목·상대 `path:` 가 있으면 `config` `error` |
 
 **정리 규칙.** `restore`·`integrity` 가 둘 다 `ok` 면 작업 디렉터리를 지운다. TXID 가 `warn`·`unknown` 이어도 지운다(그 원인은 원격 쪽에 있고 산출물로 설명되지 않는다). 하나라도 `error`(무결성 시간 초과 포함)거나 원격이 비어 멈췄으면 남기고 `output` 에 경로를 적는다. `--keep` 이면 늘 남긴다. **오래된 산출물은 자동으로 지우지 않는다** — 확인한 뒤 운영자가 치운다. 종료 코드는 위 표와 같다(0·1·2). `--restore-dir` 누락 같은 인자 오류도 2 다.
 

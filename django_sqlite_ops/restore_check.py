@@ -409,18 +409,20 @@ def _dir_identity(path: Path) -> tuple[int, int] | None:
     return st.st_dev, st.st_ino
 
 
-def _dir_entry(listed: Iterable[str], cwd: str) -> str | None:
-    """``databases -json`` 목록에서 ``dir:`` 항목의 흔적(조회한 임시 cwd 또는 그 아래)을 찾는다.
+def _dir_entry(listed: Iterable[str], cwd: str) -> tuple[str, bool] | None:
+    """``databases -json`` 목록에서 조회한 임시 cwd 기준으로 풀린 항목 ``(경로, dir: 항목인가)``.
 
-    0.5.17 은 ``dir:`` 항목을 감시 디렉터리가 아니라 실행한 cwd 로 내보낸다(절대 경로 ``dir:`` 도,
-    재현함 #54). 그래서 감시 디렉터리는 모르지만 항목이 있다는 것은 안다. 상대 ``path:`` 도 cwd
-    아래로 풀려 여기 걸린다 — replicate 가 어디서 도는지 모르면 위치를 모르므로 함께 거부한다.
+    0.5.17 은 ``dir:`` 항목을 감시 디렉터리가 아니라 실행한 cwd 자체로 내보내고(절대·상대 ``dir:``
+    모두), 상대 ``path:`` 는 cwd 아래로 푼다(재현함 #54). 앞은 감시 디렉터리를, 뒤는 replicate 가
+    어디서 도느냐에 따라 바뀌는 DB 위치를 알 수 없다. 둘 다 거부한다(D-26).
     """
     roots = {os.path.normpath(cwd), os.path.realpath(cwd)}
     for path in listed:
         for root in roots:
-            if path == root or path.startswith(root.rstrip(os.sep) + os.sep):
-                return path
+            if path == root:
+                return path, True
+            if path.startswith(root.rstrip(os.sep) + os.sep):
+                return path, False
     return None
 
 
@@ -470,13 +472,20 @@ def restore_test(
 
     targets, unloadable = _sqlite_targets()
     protected: list[tuple[str | None, str, Path]] = []
+    # 경로 계산이 ValueError(NUL 등)를 내는 별칭은 보호 경로를 정할 수 없다(R6-2).
+    unresolvable: list[str] = []
     for alias, target in targets.items():
         if target.path is None:
             continue
         meta = metas.get(alias)
-        for base in _base_paths(target.path):
-            meta_path = Path(os.path.normpath(meta)) if meta else litestream.default_meta_path(base)
-            protected.extend((alias, what, p) for what, p in protected_paths(base, meta_path))
+        try:
+            for base in _base_paths(target.path):
+                meta_path = (
+                    Path(os.path.normpath(meta)) if meta else litestream.default_meta_path(base)
+                )
+                protected.extend((alias, what, p) for what, p in protected_paths(base, meta_path))
+        except ValueError as exc:
+            unresolvable.append(f"{alias!r} ({_one_line(str(exc))})")
 
     runnable: list[tuple[str, Path]] = []
     for alias in selected:
@@ -525,7 +534,7 @@ def restore_test(
         f"{alias!r} (role {target.role}: {target.reason or 'no reason given'})"
         for alias, target in targets.items()
         if target.role in ("error", "unknown")
-    ]
+    ] + unresolvable
     if unloadable:
         names = ", ".join(f"{alias!r} ({reason})" for alias, reason in unloadable)
         items.append(
@@ -576,19 +585,19 @@ def restore_test(
         return items
     entry = _dir_entry(listed, cwd)
     if entry is not None:
-        items.append(
-            _item(
-                None,
-                "config",
-                "error",
-                config,
-                None,
-                "the litestream config has a dir: entry (or a relative path): litestream "
-                f"databases lists {entry} under its working directory, so the watched directory "
-                "cannot be determined and a restore under --restore-dir may be picked up and "
-                "replicated (D-26)",
+        path, is_dir = entry
+        if is_dir:
+            message = (
+                "the litestream config has a dir: entry: litestream databases lists it as its "
+                f"working directory {path}, so the watched directory cannot be determined and a "
+                "restore under --restore-dir may be picked up and replicated (D-26)"
             )
-        )
+        else:
+            message = (
+                f"relative path {path} in the litestream config; its location depends on where "
+                "litestream runs, so the paths to protect are unknown (D-26)"
+            )
+        items.append(_item(None, "config", "error", config, None, message))
         return items
     in_config = set(listed)
     for alias, db in runnable:
