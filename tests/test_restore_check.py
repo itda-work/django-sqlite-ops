@@ -762,6 +762,38 @@ def test_fake_aliases_that_are_not_write_file_dbs_are_unknown(lab):
     assert one(data, "integrity")["level"] == "ok"
 
 
+@pytest.mark.parametrize("extra", [["--database", "default"], []], ids=["selected", "default"])
+def test_fake_alias_with_unknown_paths_refuses_the_restore_dir(lab, extra):
+    """경로를 알 수 없는 sqlite3 별칭이 있으면 보호 합집합이 불완전하므로 거부한다(리뷰 2 R2-1)."""
+    lab, db, fake = lab
+    (lab / "other").mkdir()
+    other = make_db(lab / "other" / "o.db")
+    # Django 6.1 의 get_connection_params() 가 ImproperlyConfigured 를 낸다.
+    databases = {"default": sqlite_db(db), "other": sqlite_db(other, transaction_mode="BOGUS")}
+    before = fingerprint(lab / "other")
+    code, data, _ = run(databases, *fake.args(lab / "other", *extra))
+    assert code == 2, data
+    item = one(data, "restore_dir", alias=None)
+    assert item["level"] == "error"
+    assert "cannot determine the paths of alias 'other'" in item["message"]
+    assert items(data, "restore") == []
+    assert fake.commands() == []
+    assert fingerprint(lab / "other") == before
+
+
+def test_fake_explicit_non_write_alias_only_is_error(lab):
+    """``--database`` 로 고른 별칭이 읽기 전용뿐이면 unknown 과 함께 NO_TARGET error(exit 2)."""
+    lab, db, fake = lab
+    databases = {"default": sqlite_db(db), "ro": sqlite_db(f"file:{db}?mode=ro")}
+    code, data, _ = run(databases, *fake.args(lab / "restore", "--database", "ro"))
+    assert code == 2, data
+    assert one(data, "alias", "ro")["level"] == "unknown"
+    item = one(data, "alias", alias=None)
+    assert (item["level"], item["message"]) == ("error", rc.NO_TARGET)
+    assert fake.commands() == []
+    assert work_dirs(lab / "restore") == []
+
+
 def test_fake_default_selection_skips_aliases_that_are_not_write_file_dbs(lab):
     """``--database`` 가 없으면 쓰기 파일 DB 만 실행하고, 나머지는 ok 'skipped' 로만 남긴다."""
     lab, db, fake = lab

@@ -398,7 +398,7 @@ python manage.py sqlite_doctor --restore-test \
 | `--keep` | 모두 통과해도 복원본을 남긴다 |
 | `--litestream BIN`·`--json` | 위와 같다 |
 
-**운영 파일을 건드리지 않는다.** Django DB 연결을 열지 않으므로(일반 doctor 와 달리) `init_command` 도 실행되지 않는다. 복원본은 읽기 전용 `immutable` URI 로 연다. `litestream restore -o` 는 운영 DB·`-wal`·`-shm`·메타를 읽지도 쓰지도 않는다(0.5.17, 전후 해시·mtime 비교와 strace 로 재현함, #54). 그래도 `--restore-dir` 이 아래와 같거나 그 안이거나 그것을 품으면 **아무것도 만들기 전에 거부**한다(`restore_dir` `error`, exit 2). 대상은 `--database` 로 무엇을 고르든 `DATABASES` 의 **sqlite3 별칭 전부**의 합집합이다(경로만 계산하고 연결은 열지 않는다).
+**운영 파일을 건드리지 않는다.** Django DB 연결을 열지 않으므로(일반 doctor 와 달리) `init_command` 도 실행되지 않는다. 복원본은 읽기 전용 `immutable` URI 로 연다. `litestream restore -o` 는 운영 DB·`-wal`·`-shm`·메타를 읽지도 쓰지도 않는다(0.5.17, 전후 해시·mtime 비교와 strace 로 재현함, #54). 그래도 `--restore-dir` 이 아래와 같거나 그 안이거나 그것을 품으면 **아무것도 만들기 전에 거부**한다(`restore_dir` `error`, exit 2). 대상은 `--database` 로 무엇을 고르든 `DATABASES` 의 **sqlite3 별칭 전부**의 합집합이다(경로만 계산하고 연결은 열지 않는다). 그중 설정이 잘못돼 경로를 알 수 없는 별칭(`get_connection_params()` 실패)이 있으면 보호할 경로를 다 모르므로 `--database` 와 무관하게 거부한다.
 
 - 운영 DB 의 **부모 디렉터리**(그 안의 DB·사이드카·boot 잠금·상태 파일·boot 임시 디렉터리가 모두 여기 든다)
 - Litestream 메타: `SQLITE_OPS["HEALTH"]["DATABASES"][alias]["meta_path"]`, 없으면 기본 `.<db>-litestream/`. 메타가 링크면 링크와 그 실체 둘 다

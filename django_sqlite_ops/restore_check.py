@@ -435,6 +435,22 @@ def restore_test(
             )
         )
         return items
+    # 경로를 모르는 sqlite3 별칭이 있으면 합집합이 불완전하다: 판정할 수 없으므로 거부한다(R2-1).
+    unknown = [alias for alias, target in targets.items() if target.role == "error"]
+    if unknown:
+        names = ", ".join(repr(alias) for alias in unknown)
+        items.append(
+            _item(
+                None,
+                "restore_dir",
+                "error",
+                restore_dir,
+                None,
+                f"cannot determine the paths of alias {names} (get_connection_params() failed), "
+                "so the operational paths to protect are unknown; fix the DATABASES entry",
+            )
+        )
+        return items
     root, problem = check_restore_dir(restore_dir, protected)
     if problem is not None:
         items.append(_item(None, "restore_dir", "error", restore_dir, None, problem))
