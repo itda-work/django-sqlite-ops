@@ -391,19 +391,21 @@ python manage.py sqlite_doctor --restore-test \
 |---|---|
 | `--restore-dir DIR` | **필수.** 복원본을 둘 디렉터리. 미리 만들어 둔 실제 디렉터리여야 한다(마지막 구성요소까지 링크 아님, 부모에도 링크 없음). 그 아래에 실행마다 `dso-restore-XXXX/`(권한 0700)를 새로 만든다. 기본값이 없는 이유: `/tmp` 가 tmpfs 인 서버에서 큰 DB 를 복원하면 RAM 을 먹는다 |
 | `--litestream-config PATH` | **필수.** 복원할 설정 파일. DB 경로가 설정의 `dbs[].path` 와 같은 실제 경로여야 한다([경로 규칙](#경로-규칙)) |
-| `--database ALIAS` | 볼 별칭(반복). 없으면 sqlite3 별칭 전부. 쓰기 파일 DB 만 복원한다 — 메모리·읽기 전용·VFS 별칭은 `unknown` 이므로 보통 `--database` 로 고른다 |
+| `--database ALIAS` | 볼 별칭(반복). 없으면 **쓰기 파일 DB 인 sqlite3 별칭 전부**를 복원하고, 메모리·읽기 전용·VFS·판정 불가 별칭은 `alias` `ok` 'skipped' 로만 적는다(종료 코드에 영향 없음). 직접 고른 별칭이 쓰기 파일 DB 가 아니면 `unknown`. 복원할 쓰기 DB 가 하나도 없으면 `error`(exit 2) |
 | `--integrity full\|quick` | `full`(기본, `integrity_check`) 또는 `quick`(`quick_check`) |
 | `--restore-timeout SEC` | 별칭마다 복원의 시간 제한(기본 600초) |
 | `--integrity-timeout SEC` | 무결성 검사의 **별도** 시간 제한(기본 1800초). 넘으면 검사를 끊고 `integrity` `error` |
 | `--keep` | 모두 통과해도 복원본을 남긴다 |
 | `--litestream BIN`·`--json` | 위와 같다 |
 
-**운영 파일을 건드리지 않는다.** Django DB 연결을 열지 않으므로(일반 doctor 와 달리) `init_command` 도 실행되지 않는다. 복원본은 읽기 전용 `immutable` URI 로 연다. `litestream restore -o` 는 운영 DB·`-wal`·`-shm`·메타를 읽지도 쓰지도 않는다(0.5.17, 전후 해시·mtime 비교와 strace 로 재현함, #54). 그래도 `--restore-dir` 이 아래와 같거나 그 안이거나 그것을 품으면 **아무것도 만들기 전에 거부**한다(`restore_dir` `error`, exit 2). 대상은 이번에 실행하는 모든 별칭의 합집합이다.
+**운영 파일을 건드리지 않는다.** Django DB 연결을 열지 않으므로(일반 doctor 와 달리) `init_command` 도 실행되지 않는다. 복원본은 읽기 전용 `immutable` URI 로 연다. `litestream restore -o` 는 운영 DB·`-wal`·`-shm`·메타를 읽지도 쓰지도 않는다(0.5.17, 전후 해시·mtime 비교와 strace 로 재현함, #54). 그래도 `--restore-dir` 이 아래와 같거나 그 안이거나 그것을 품으면 **아무것도 만들기 전에 거부**한다(`restore_dir` `error`, exit 2). 대상은 `--database` 로 무엇을 고르든 `DATABASES` 의 **sqlite3 별칭 전부**의 합집합이다(경로만 계산하고 연결은 열지 않는다).
 
 - 운영 DB 의 **부모 디렉터리**(그 안의 DB·사이드카·boot 잠금·상태 파일·boot 임시 디렉터리가 모두 여기 든다)
 - Litestream 메타: `SQLITE_OPS["HEALTH"]["DATABASES"][alias]["meta_path"]`, 없으면 기본 `.<db>-litestream/`. 메타가 링크면 링크와 그 실체 둘 다
 
 > **메타 판별의 한계.** 이 명령은 Litestream YAML 의 `meta-path` 를 읽지 않는다(YAML 파서를 넣지 않고, `litestream databases -json` 은 메타 경로를 내주지 않는다 — 0.5.17 재현함). YAML 에 `meta-path` 를 DB 디렉터리 **밖**으로 두고 그 경로를 헬스 설정의 `meta_path` 에도 적지 않았다면 그 메타는 보호하지 못한다. 메타를 옮겼다면 헬스 설정에도 같은 `meta_path` 를 적는다.
+>
+> **bind mount 의 한계.** 겹침은 경로 문자열과 `--restore-dir` 자신·조상의 (장치, inode)로만 비교한다. DB 디렉터리 안의 하위 디렉터리를 bind mount 로 다른 경로에 노출했다면(예: 컨테이너에서 `/srv/app` 을 `/data`, `/srv/app/restore` 를 `/restore` 로 따로 마운트) 그 경로가 DB 디렉터리 안이라는 것을 판별하지 못한다. 그런 디렉터리를 `--restore-dir` 로 주지 않는다.
 
 보고 항목(`section` `restore`):
 
@@ -417,7 +419,7 @@ python manage.py sqlite_doctor --restore-test \
 | `integrity` | `full`/`quick` | 열기·검사 실패, 시간 초과면 `error`. 오류 줄 앞 5줄 또는 `timeout` 을 `message` 에 |
 | `duration_ms`·`size`·`tables`·`page_count` | 복원 시간, 복원본 바이트, 테이블 수, 페이지 수 | 보고(`ok`) |
 | `output` | 남긴 작업 디렉터리 | 보고(`ok`). 정리하다 실패하면 `warn` |
-| `alias`·`database`·`config` | 별칭 종류, DB 경로, 설정 파일 | 쓰기 파일 DB 가 아니면 `alias` `unknown`, 경로가 실제 경로가 아니거나 설정에 없으면 `database` `error`, 설정을 읽지 못하면 `config` `error` |
+| `alias`·`database`·`config` | 별칭 종류, DB 경로, 설정 파일 | 기본 선택에서 쓰기 파일 DB 가 아니면 `alias` `ok`(skipped), 직접 고른 별칭이면 `unknown`, 복원할 쓰기 DB 가 하나도 없으면 별칭 `null` 의 `alias` `error`, 경로가 실제 경로가 아니거나 설정에 없으면 `database` `error`, 설정을 읽지 못하면 `config` `error` |
 
 **정리 규칙.** `restore`·`integrity` 가 둘 다 `ok` 면 작업 디렉터리를 지운다. TXID 가 `warn`·`unknown` 이어도 지운다(그 원인은 원격 쪽에 있고 산출물로 설명되지 않는다). 하나라도 `error`(무결성 시간 초과 포함)거나 원격이 비어 멈췄으면 남기고 `output` 에 경로를 적는다. `--keep` 이면 늘 남긴다. **오래된 산출물은 자동으로 지우지 않는다** — 확인한 뒤 운영자가 치운다. 종료 코드는 위 표와 같다(0·1·2). `--restore-dir` 누락 같은 인자 오류도 2 다.
 
@@ -442,6 +444,8 @@ Type=oneshot
 User=app
 WorkingDirectory=/srv/app
 ExecStart=/srv/app/.venv/bin/python manage.py sqlite_doctor --restore-test --restore-dir /var/backups/dso-restore --litestream-config /etc/litestream.yml --database default --json
+# 종료 코드 1(warn·unknown)은 성공으로 친다. 2(error)만 유닛을 failed 로 만든다
+SuccessExitStatus=1
 
 # /etc/systemd/system/dso-restore-test.timer
 [Unit]
@@ -456,7 +460,7 @@ Persistent=true
 WantedBy=timers.target
 ```
 
-`systemctl enable --now dso-restore-test.timer` 로 켜고, 종료 코드 2 를 `OnFailure=` 나 모니터링으로 알린다(1 은 `warn`·`unknown` — 대개 원격 조회 실패라 헬스와 함께 본다).
+`systemctl enable --now dso-restore-test.timer` 로 켠다. systemd 는 `Type=oneshot` 에서도 0 이 아닌 종료 코드를 실패로 보므로, `SuccessExitStatus=1` 이 없으면 exit 1 에도 유닛이 failed 가 되고 `OnFailure=` 가 돈다([systemd.service(5) `SuccessExitStatus=`](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#SuccessExitStatus=)). 위 예는 **2 만 실패로 본다** — `OnFailure=` 나 모니터링으로 2 를 알리고, 1(`warn`·`unknown`, 대개 원격 조회 실패)은 JSON 출력이나 헬스로 따로 본다.
 
 ### boot CLI
 

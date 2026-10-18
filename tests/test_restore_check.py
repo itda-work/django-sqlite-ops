@@ -301,6 +301,9 @@ def test_restore_dir_must_exist_and_be_a_real_directory(tmp_path):
         f"{lab}/real/../real": "must not contain '..'",
         "/": "filesystem root",
         "": "empty",
+        ".": "pass the directory's real absolute path",
+        f"{lab}/real/.": "pass the directory's real absolute path",
+        f"{lab}/real/..": "pass the directory's real absolute path",
     }
     for raw, needle in cases.items():
         path, problem = rc.check_restore_dir(raw, [])
@@ -334,7 +337,9 @@ def test_restore_dir_overlapping_a_custom_meta_is_refused(tmp_path):
         path, problem = rc.check_restore_dir(raw, protected(db, meta))
         assert path is None, raw
         assert "litestream meta" in problem
-    # 메타가 아직 없어도(대소문자만 다른 이름도) 막는다.
+    # 메타가 아직 없어도(대소문자만 다른 이름도) 막는다. 대소문자 무시 볼륨(macOS)에서는
+    # lab/GHOST 의 lstat 이 lab/ghost 를 돌려 (st_dev, st_ino) 비교가 먼저 잡으므로, _fold 비교
+    # 경로는 대소문자 구분 볼륨(Linux CI)에서만 증명된다.
     ghost = lab / "ghost"
     ghost.mkdir()
     path, problem = rc.check_restore_dir(ghost, protected(db, lab / "GHOST" / "meta"))
@@ -398,6 +403,43 @@ def test_integrity_open_failure_is_error(tmp_path):
     passed, got = rc.check_integrity(tmp_path / "not-sqlite.db", "full", 30)
     assert not passed
     assert [(i.key, i.level) for i in got] == [("integrity", "error")]
+
+
+def test_integrity_other_error_after_the_timer_fired_reports_both(tmp_path, monkeypatch):
+    """타이머가 발동했어도 예외가 ``interrupted`` 가 아니면 ``timeout`` 이라고만 하지 않는다."""
+    db = make_db(tmp_path / "ok.db", wal=False)
+
+    class Slow:
+        def __init__(self, conn):
+            self.conn = conn
+            self.interrupted = False
+
+        def interrupt(self):
+            self.interrupted = True
+
+        def execute(self, sql):
+            time.sleep(0.2)
+            raise sqlite3.DatabaseError("database disk image is malformed")
+
+        def close(self):
+            self.conn.close()
+
+    opened = []
+    real_connect = rc._connect_ro
+
+    def connect(path):
+        opened.append(Slow(real_connect(path)))
+        return opened[-1]
+
+    monkeypatch.setattr(rc, "_connect_ro", connect)
+    passed, got = rc.check_integrity(db, "full", 0.01)
+    assert not passed
+    assert opened[0].interrupted
+    assert [(i.key, i.level) for i in got] == [("integrity", "error")]
+    message = got[0].message
+    assert not message.startswith("timeout")
+    assert "database disk image is malformed" in message
+    assert "--integrity-timeout 0.01s timer had also fired" in message
 
 
 def test_integrity_timeout_interrupts_the_check(tmp_path):
@@ -520,6 +562,22 @@ def test_fake_restored_below_remote_warns_and_still_cleans_up(lab):
         "0000000000000009",
     )
     assert items(data, "output") == []
+    assert work_dirs(lab / "restore") == []
+
+
+def test_fake_restored_above_remote_is_ok(lab):
+    """복원 중 새 업로드로 복원 TXID 가 원격보다 크면 정상이다(D-22 '이상')."""
+    lab, db, fake = lab
+    fake.spec["restore"]["txid"] = 9
+    fake.save()
+    code, data, _ = run({"default": sqlite_db(db)}, *fake.args(lab / "restore"))
+    assert code == 0, data
+    txid = one(data, "restored_txid")
+    assert (txid["level"], txid["value"], txid["expected"]) == (
+        "ok",
+        "0000000000000009",
+        "0000000000000005",
+    )
     assert work_dirs(lab / "restore") == []
 
 
@@ -668,13 +726,14 @@ def test_fake_restore_dir_inside_another_alias_directory(lab):
     (lab / "other").mkdir()
     other = make_db(lab / "other" / "o.db")
     databases = {"default": sqlite_db(db), "other": sqlite_db(other)}
-    code, data, _ = run(databases, *fake.args(lab / "other", "--database", "default"))
-    assert code == 0, data
-    # --database 로 고른 별칭만 보호 대상이다: other 는 실행 대상이 아니어서 막지 않는다.
-    assert one(data, "restore_dir")["level"] == "ok"
-    code, data, _ = run(databases, *fake.args(lab / "other"))
-    assert code == 2
-    assert "alias 'other'" in one(data, "restore_dir", alias=None)["message"]
+    before = fingerprint(lab / "other")
+    # 보호 대상은 고른 별칭과 무관하게 sqlite3 별칭 전부다(D-25, 2026-10-18).
+    for extra in (["--database", "default"], []):
+        code, data, _ = run(databases, *fake.args(lab / "other", *extra))
+        assert code == 2, extra
+        assert "alias 'other'" in one(data, "restore_dir", alias=None)["message"]
+    assert fake.commands() == []
+    assert fingerprint(lab / "other") == before
 
 
 def test_fake_aliases_that_are_not_write_file_dbs_are_unknown(lab):
@@ -701,6 +760,60 @@ def test_fake_aliases_that_are_not_write_file_dbs_are_unknown(lab):
     assert one(data, "alias", "pg")["level"] == "unknown"
     assert one(data, "alias", "nope")["level"] == "error"
     assert one(data, "integrity")["level"] == "ok"
+
+
+def test_fake_default_selection_skips_aliases_that_are_not_write_file_dbs(lab):
+    """``--database`` 가 없으면 쓰기 파일 DB 만 실행하고, 나머지는 ok 'skipped' 로만 남긴다."""
+    lab, db, fake = lab
+    databases = {
+        "default": sqlite_db(db),
+        "mem": sqlite_db(":memory:"),
+        "ro": sqlite_db(f"file:{db}?mode=ro"),
+        "pg": {"ENGINE": "django.db.backends.postgresql", "NAME": "x"},
+    }
+    code, data, _ = run(databases, *fake.args(lab / "restore"))
+    assert code == 0, data
+    for alias, role in (("mem", "memory"), ("ro", "read-only")):
+        skipped = one(data, "alias", alias)
+        assert (skipped["level"], skipped["value"]) == ("ok", role), skipped
+        assert skipped["message"].startswith(f"skipped ({role})")
+        assert keys(data, alias) == ["alias"]
+    assert items(data, alias="pg") == []
+    assert one(data, "integrity")["level"] == "ok"
+    assert [c[-1] for c in fake.calls() if c[0] == "restore"] == [str(db)]
+
+
+@pytest.mark.parametrize(
+    "databases",
+    [
+        {"default": {"ENGINE": "django.db.backends.postgresql", "NAME": "x"}},
+        {
+            "default": {"ENGINE": "django.db.backends.postgresql", "NAME": "x"},
+            "mem": sqlite_db(":memory:"),
+        },
+    ],
+    ids=["no-sqlite-alias", "only-non-write-alias"],
+)
+def test_fake_nothing_to_restore_test_is_error(lab, databases):
+    """실행한 쓰기 DB 가 없으면 아무것도 검증하지 않은 성공(exit 0)이 아니라 error 다(리뷰 1 F1)."""
+    lab, _, fake = lab
+    args = fake.args(lab / "restore")
+    args[args.index("--litestream-config") + 1] = str(lab / "no-such.yml")
+    code, data, _ = run(databases, *args)
+    assert code == 2, data
+    item = one(data, "alias", alias=None)
+    assert (item["level"], item["message"]) == ("error", rc.NO_TARGET)
+    assert fake.commands() == []
+    assert work_dirs(lab / "restore") == []
+
+
+def test_fake_nothing_to_run_with_another_error_adds_no_extra_item(lab):
+    lab, db, fake = lab
+    args = fake.args(lab / "restore", "--database", "nope")
+    code, data, _ = run({"default": sqlite_db(db)}, *args)
+    assert code == 2
+    assert one(data, "alias", "nope")["level"] == "error"
+    assert items(data, "alias", alias=None) == []
 
 
 def test_fake_db_not_in_config_or_not_real_path(lab):

@@ -53,6 +53,7 @@ _SPACE_FACTOR = (6, 5)
 # 무결성 실패 때 message 에 담는 오류 줄 수.
 _MAX_PROBLEMS = 5
 _PRAGMAS = {"full": "integrity_check", "quick": "quick_check"}
+NO_TARGET = "no write file database to restore-test"
 
 
 def _item(alias: str | None, key: str, level: str, value=None, expected=None, message=""):
@@ -112,6 +113,8 @@ def check_restore_dir(
     stripped = text.rstrip(os.sep)
     if not stripped:
         return None, f"--restore-dir {text} is the filesystem root"
+    if os.path.basename(stripped) in (".", ".."):
+        return None, f"--restore-dir {text}: pass the directory's real absolute path"
     try:
         path = real_path(stripped)
     except ValueError as exc:
@@ -183,10 +186,16 @@ def check_integrity(
         elapsed = time.monotonic() - start
         took = f"{elapsed * 1000:.0f} ms"
         if failure is not None:
-            if fired.is_set():
+            if fired.is_set() and "interrupt" in str(failure):
                 message = (
                     f"timeout: {pragma} did not finish within --integrity-timeout {timeout:g}s "
                     f"(interrupted after {elapsed:.1f}s)"
+                )
+            elif fired.is_set():
+                # 타이머가 발동했지만 다른 오류로 끝났다: 두 사실을 함께 적는다(리뷰 1 F8).
+                message = (
+                    f"{pragma} failed after {took}: {failure} "
+                    f"(the --integrity-timeout {timeout:g}s timer had also fired)"
                 )
             else:
                 message = f"{pragma} failed after {took}: {failure}"
@@ -369,36 +378,41 @@ def restore_test(
     integrity_timeout: float = DEFAULT_INTEGRITY_TIMEOUT,
     keep: bool = False,
 ) -> list[Item]:
-    """별칭마다 차례로 복원 검증한 항목. 대상은 쓰기 파일 DB 뿐이다(DESIGN §6-2)."""
+    """별칭마다 차례로 복원 검증한 항목. 대상은 쓰기 파일 DB 뿐이다(DESIGN §6-2).
+
+    ``aliases`` 가 없으면 쓰기 파일 DB 인 sqlite3 별칭만 실행하고 나머지는 ``alias`` ``ok``
+    'skipped' 로 남긴다. 명시한 별칭이 쓰기 파일 DB 가 아니면 ``unknown`` 이다. 하나도 실행하지
+    못했고 다른 ``error`` 도 없으면 ``alias`` ``error``(별칭 ``null``)다.
+    """
     if integrity not in INTEGRITY_MODES:
         raise ValueError(f"integrity must be one of {INTEGRITY_MODES}, got {integrity!r}")
+    explicit = aliases is not None
     sqlite, selected, items = select_aliases(aliases, SECTION)
     items = list(items)
     metas, meta_error = _meta_paths()
 
-    runnable: list[tuple[str, Path]] = []
+    # 보호 대상은 고른 별칭과 무관하게 sqlite3 별칭 전부의 운영 경로다(D-25, 연결은 열지 않는다).
+    targets = {alias: _target(alias, config) for alias, config in sqlite.items()}
     protected: list[tuple[str | None, str, Path]] = []
-    for alias in selected:
-        target = _target(alias, sqlite[alias])
+    for alias, target in targets.items():
         if target.path is not None:
             raw = Path(os.path.normpath(os.path.abspath(target.path)))
             meta = metas.get(alias)
             meta_path = Path(os.path.normpath(meta)) if meta else litestream.default_meta_path(raw)
             protected.extend((alias, what, p) for what, p in protected_paths(raw, meta_path))
+
+    runnable: list[tuple[str, Path]] = []
+    for alias in selected:
+        target = targets[alias]
         if target.role == "error":
             items.append(_item(alias, "alias", "error", None, None, target.reason or ""))
             continue
         if target.role != "write" or target.path is None:
-            items.append(
-                _item(
-                    alias,
-                    "alias",
-                    "unknown",
-                    target.role,
-                    "write",
-                    "only write file databases are restore-tested",
-                )
-            )
+            # --database 로 고른 별칭이면 판정할 수 없다는 뜻이고, 기본 선택이면 대상이 아닐 뿐이다.
+            level, message = ("unknown", "only write file databases are restore-tested")
+            if not explicit:
+                level, message = "ok", f"skipped ({target.role}): {message}"
+            items.append(_item(alias, "alias", level, target.role, "write", message))
             continue
         try:
             db = real_path(target.path)
@@ -426,6 +440,9 @@ def restore_test(
         items.append(_item(None, "restore_dir", "error", restore_dir, None, problem))
         return items
     if not runnable:
+        # 아무것도 검증하지 않고 성공하면 감시(cron·systemd)에서 거짓 초록이 된다(리뷰 1 F1).
+        if not any(i.level == "error" for i in items):
+            items.append(_item(None, "alias", "error", None, None, NO_TARGET))
         return items
 
     config = _caller_path(litestream_config)
