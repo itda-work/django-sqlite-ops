@@ -18,8 +18,19 @@
 - **이슈 먼저.** 구현 전에 GitHub 이슈가 있어야 한다. 진행 상황(착수, 리뷰 결과, 반영·기각 사유, 막힘, 완료)은 그 이슈의 코멘트로 남긴다. 브랜치는 `issue-<N>-<slug>`, PR 본문에 `Closes #N` 을 쓴다.
 - **메인 Claude 세션은 오케스트레이터다.** 이슈·브리프 작성, 위임, 결과 검증(테스트·CI 직접 실행), 이슈 기록, 병합을 맡는다. 구현 코드를 직접 쓰지 않는다.
 - **구현**: herdr pane 의 Claude Code 를 **`cc-alt`**(두 번째 계정, `--dangerously-skip-permissions`)로 띄운다. `herdr agent start` 는 `claude` 바이너리를 직접 불러 alias 가 닿지 않으므로, 셸 pane 에서 `herdr pane run <id> "cc-alt --model claude-opus-5-5 --effort medium"` 로 띄운 뒤 `herdr agent rename <id> impl` 로 이름을 붙인다. 이슈가 바뀌면 문맥을 비우기 위해 새로 띄운다(슬래시 명령은 prompt 로 보내면 실행되지 않는다).
-- **리뷰**: herdr pane 의 Codex 를 두 번째 계정 `codex-alt` 로 띄운다 — 셸 pane 에서 `herdr pane run <id> "codex-alt -m gpt-6-astra -c model_reasoning_effort=medium --sandbox workspace-write"` 뒤 `herdr agent rename <id> review`(결과 파일을 써야 하므로 workspace-write. 쓰기는 `.work/` 아래만 허용한다고 브리프에 적는다. 이 샌드박스에서는 Docker 소켓이 막혀 있으니 Docker 상태 확인은 오케스트레이터가 한다). 지적은 구현자에게 돌려 고친다. 리뷰가 통과하고 CI 가 초록일 때만 병합한다.
-- **pane 수명**: 이슈마다 구현·리뷰 pane 을 `herdr pane split --current --cwd "$PWD" --no-focus` 로 새로 만들고, **그 이슈를 병합(또는 중단)하면 바로 `herdr pane close <id>` 로 닫는다.** 끝난 pane 을 다음 이슈에 재사용하거나 남겨 두지 않는다. 오케스트레이터가 만든 pane 만 닫는다.
+- **리뷰**: 기본은 구현과 다른 herdr pane 의 Claude Code 다(2026-10-14 부터, 마스터 지시 — Codex 주간 한도). 셸 pane 에서 `herdr pane run <id> "cc-alt --model claude-opus-5-5 --effort medium"` 뒤 `herdr agent rename <id> review`. 브리프(`.work/issue-<N>/review-brief.md`)에 다음을 적는다.
+  - 코드를 고치지 않고, 저장소 작업 트리·브랜치를 바꾸지 않는다(구현자와 같은 작업 트리다). 쓰기는 `.work/issue-<N>/` 의 결과 파일만 한다.
+  - 실행 검증·변이 시험은 저장소 밖 임시 worktree 에서 한다. **한 명령 안에서**(또는 `.work/issue-<N>/mut.sh` 스크립트로) `set -euo pipefail` 아래 `git worktree add` → `cd "$W"` → `[ "$(pwd)" = "$W" ]` 확인 → 끝에 `worktree remove` 순서로 한다. Claude Code 는 저장소 밖으로 `cd` 한 셸 위치를 다음 명령에서 되돌리므로, 상대 경로를 다음 명령으로 넘기면 메인 작업 트리를 바꾼다(#54 리뷰에서 시도돼 거부함 — #73 코멘트에 기록).
+  - 결과는 지적마다 P1/P2/P3·근거(재현함/코드상 확인/미검증)·고칠 방향을 적고, 마지막 줄은 `VERDICT: PASS|CHANGES` 로 한다.
+  - 대안으로 Codex `codex-alt` 를 쓸 수 있다: `herdr pane run <id> "codex-alt -m gpt-6-astra -c model_reasoning_effort=medium --sandbox workspace-write"`. 결과 파일을 써야 하므로 workspace-write 이고, 쓰기는 `.work/` 아래만 허용한다고 브리프에 적는다. 이 샌드박스에서는 Docker 소켓이 막혀 있으니 Docker 상태 확인은 오케스트레이터가 한다.
+  - 지적은 구현자에게 돌려 고친다. 리뷰가 통과하고 CI 가 초록일 때만 병합한다.
+- **확인 창**: 전역 ask 규칙(`git push`·`cp`·`rm`·`curl`·`chmod` 등)은 `--dangerously-skip-permissions` 에서도 확인 창을 띄워 pane 을 멈춘다. 오케스트레이터는 다음과 같이 다룬다.
+  - 대기 루프에서 완료 파일과 함께 `Do you want to proceed` 를 감지한다.
+  - 명령 전체·브랜치·`git status`·대상 경로를 확인한 뒤에만 승인한다(`herdr pane send-keys <id> Enter` 또는 `1`).
+  - 명령 앞부분이 화면 밖이라 `cd` 위치나 대상을 확인할 수 없으면 Esc 로 거부하고, 같은 일을 스크립트 파일로 쓰게 한 뒤 읽고 실행을 지시한다(#68).
+  - `.work/issue-<N>/` 안의 단독 `rm -f -- ...` 는 훅이 승인한다(아래). 단 pane 의 cwd 가 메인 저장소일 때만이다. worktree cwd 의 pane 에서는 그 상대 경로가 없어 훅이 닿지 않으므로 확인 창으로 다룬다(#73 리뷰 재현).
+- **pane 수명**: 이슈마다 구현·리뷰 pane 을 `herdr pane split --current --direction right --cwd "$PWD" --no-focus`(리뷰 pane 은 `--direction down`) 로 새로 만들고, **그 이슈를 병합(또는 중단)하면 바로 `herdr pane close <id>` 로 닫는다.** 끝난 pane 을 다음 이슈에 재사용하거나 남겨 두지 않는다. 오케스트레이터가 만든 pane 만 닫는다.
+- **동시 진행**: 메인 작업 트리를 다른 구현자가 쓰고 있으면 `git worktree add -b issue-<N>-<slug> .work/issue-<N>/wt origin/main` 으로 worktree 를 만들고, 그 cwd 의 pane 으로 띄운다(#68·#71). 브리프에 '이 worktree 에서만, 메인 작업 트리는 건드리지 않는다'를 적는다. Docker 랩은 한 번에 하나만 돌린다(프로젝트 이름이 같다). 병합 뒤에는 `git worktree remove .work/issue-<N>/wt` → `git branch -D issue-<N>-<slug>`(squash 병합이라 `-d` 는 거부된다. `gh pr merge --delete-branch` 가 이미 지웠으면 생략) → `rm -rf -- ".work/issue-${N:?}"` 순서로 정리한다. 디렉터리를 먼저 지우면 worktree 메타가 남아 `git worktree prune` 이 필요하다.
 - **README 는 활용 가이드다**(#11). 기능을 추가하는 PR 은 README 의 해당 절(설치·빠른 시작·사용 예·함정)을 함께 갱신한다. 없는 기능은 '예정'으로만 적는다.
 - **실측·테스트 디렉터리는 비우지 말고 매번 새로 만든다.** 꼭 지워야 하면 `rm -rf -- "${D:?}"` 처럼 `:?` 로 빈 값을 막고 와일드카드 없이 디렉터리 하나만 지정한다. `cd X && rm -rf *`, `rm -rf "$D"/*` 는 쓰지 않는다(cwd 가 틀리거나 변수가 비면 저장소나 `/` 를 지운다 — #3·#7 에서 실제로 시도돼 거부함).
 - **정본 문서가 현재 상태와 어긋나면 발견한 즉시 고친다.** 구현 상태, 모듈 구성, 버전, 상류 이슈·PR 상태처럼 시간이 지나면 바뀌는 사실은 확인한 날짜를 함께 적는다. 작업 중인 이슈와 관련 있으면 그 PR 에 넣고, 아니면 docs 이슈를 따로 연다. `docs/research/` 는 당시 기록이므로 고치지 않고 정본(DESIGN·README·CLAUDE.md)에 현재 상태를 적는다.
