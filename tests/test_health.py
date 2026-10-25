@@ -608,24 +608,12 @@ def test_monitor_one_hanging_alias_delays_the_others(tmp_path, refresh):
     assert m.report()["databases"]["slow"]["code"] == "remote_error"
 
 
-def test_stale_reason_names_the_alias_being_checked(tmp_path):
-    """#72: 한 별칭의 원격 조회가 매달려 정상 별칭이 ``stale`` 이 되면, 사유에 갱신 스레드가 지금
-    조회 중인 별칭과 그 경과 초가 나온다. 조회 중이 아니면 기존 문장 그대로다. 판정은 같다."""
+def hang_monitor(tmp_path, remote, refresh, mono):
     db = tmp_path / "app.sqlite3"
     db.write_bytes(b"x" * 4096)
-    mono = [0.0]
-    seen = []
-
-    def remote(cfg, path):
-        if cfg.alias == "slow" and m.refreshes == 1:
-            mono[0] += 100.0  # 두 번째 갱신에서 slow 가 100초째 매달린 순간에 보고를 본다
-            seen.append(m.report()["databases"])
-            return RemoteError("litestream ltx timed out after 30s")
-        return SAME
-
-    aliases = (AliasConfig("slow", "/etc/a.yml"), AliasConfig("fast", "/etc/b.yml"))
-    m = Monitor(
-        HealthConfig(aliases, 2.0, 60.0),
+    aliases = (AliasConfig("fast", "/etc/a.yml"), AliasConfig("slow", "/etc/b.yml"))
+    return Monitor(
+        HealthConfig(aliases, refresh, 60.0),
         remote=remote,
         local=lambda path, meta: 5,
         files=lambda path, meta: IDLE,
@@ -633,9 +621,28 @@ def test_stale_reason_names_the_alias_being_checked(tmp_path):
         path_of=lambda alias: (str(db), None),
         monotonic=lambda: mono[0],
     )
-    m.refresh_once()
-    mono[0] += 2.0
-    m.refresh_once()
+
+
+def test_stale_reason_names_the_alias_being_checked(tmp_path):
+    """#72: 한 별칭의 원격 조회가 매달려 정상 별칭이 ``stale`` 이 되면, 사유에 갱신 스레드가 지금
+    조회 중인 별칭과 그 경과 초가 나온다. 경과 초는 라운드가 아니라 그 별칭의 조회 시작부터다
+    (앞의 ``fast`` 가 5초 걸린다). 판정은 같다."""
+    mono = [0.0]
+    seen = []
+
+    def remote(cfg, path):
+        if cfg.alias == "fast":
+            mono[0] += 5.0
+        elif m.refreshes == 1:
+            mono[0] += 100.0  # 두 번째 갱신에서 slow 가 100초째 매달린 순간에 보고를 본다
+            seen.append(m.report()["databases"])
+            return RemoteError("litestream ltx timed out after 30s")
+        return SAME
+
+    m = hang_monitor(tmp_path, remote, 6.0, mono)
+    m.refresh_once()  # fast 0→5, slow 5→5
+    mono[0] += 6.0
+    m.refresh_once()  # fast 11→16, slow 16→116 매달림
     (during,) = seen
     for alias, target in (("fast", "alias 'slow'"), ("slow", "this alias")):
         assert during[alias]["code"] == "stale" and during[alias]["status"] == "unknown"
@@ -643,11 +650,42 @@ def test_stale_reason_names_the_alias_being_checked(tmp_path):
             f"the last check is {during[alias]['age']:.0f}s old (more than 3 x REFRESH); "
             f"the refresh thread has been checking {target} for 100s"
         ), during[alias]
-    # 조회가 끝난 뒤에는 '조회 중' 표시가 남지 않는다: 늦게 본 보고는 기존 문장이다
+    # 조회가 끝나 쉬는 동안에는 직전 라운드의 가장 느린 조회를 밝힌다('조회 중' 표시는 없다)
     mono[0] += 100.0
-    fast = m.report()["databases"]["fast"]
-    assert fast["code"] == "stale"
-    assert fast["reason"].endswith("; the refresh thread may be stuck"), fast
+    after = m.report()["databases"]
+    assert after["fast"]["reason"].endswith("; the last refresh spent 100s on alias 'slow'")
+    assert after["slow"]["reason"].endswith("; the last refresh spent 100s on this alias")
+    # 가장 느린 조회가 REFRESH 보다 짧으면(fast 5초 < 6초) 기존 문장이다
+    m.refresh_once()
+    mono[0] += 100.0
+    late = m.report()["databases"]["fast"]
+    assert late["code"] == "stale"
+    assert late["reason"].endswith("; the refresh thread may be stuck"), late
+
+
+def test_stale_reason_while_resting_after_a_later_alias_hung(tmp_path):
+    """#72 리뷰 1: 매달린 별칭이 정상 별칭보다 뒤에 있으면, 매달림이 끝나고 스레드가 ``REFRESH`` 를
+    쉬는 동안 정상 별칭은 ``stale`` 인데 조회 중인 별칭이 없다. 그때도 원인 별칭이 나온다."""
+    mono = [0.0]
+
+    def remote(cfg, path):
+        if cfg.alias == "slow" and m.refreshes == 1:
+            mono[0] += litestream.DEFAULT_LTX_TIMEOUT
+            return RemoteError("litestream ltx timed out after 30s")
+        return SAME
+
+    m = hang_monitor(tmp_path, remote, 2.0, mono)
+    m.refresh_once()
+    mono[0] += 2.0
+    m.refresh_once()  # fast 는 2초에 관측, slow 가 2→32초 매달린 뒤 remote_error
+    mono[0] += 1.0  # 스레드가 쉬는 중(32→34초)
+    db = m.report()["databases"]
+    assert db["slow"]["code"] == "remote_error"
+    assert db["fast"]["code"] == "stale" and db["fast"]["status"] == "unknown"
+    assert db["fast"]["reason"] == (
+        "the last check is 31s old (more than 3 x REFRESH); "
+        "the last refresh spent 30s on alias 'slow'"
+    ), db["fast"]
 
 
 def test_checking_mark_is_cleared_after_a_failed_refresh(tmp_path):
