@@ -462,10 +462,12 @@ class Fakes:
         self.files = files
         self.wal = wal
         self.calls = 0
+        self.callers = set()  # remote_fn 을 부른 스레드
         self.fail = False
 
     def remote_fn(self, cfg, path):
         self.calls += 1
+        self.callers.add(threading.current_thread())
         if self.fail:
             raise RuntimeError("probe exploded")
         return self.remote
@@ -558,7 +560,9 @@ def test_monitor_survives_exceptions(tmp_path):
         assert m.running
         fakes.fail = False
         before = m.refreshes
-        assert wait_for(lambda: m.refreshes >= before + 1)
+        # before 를 읽을 때 진행 중이던 실패 갱신이 before + 1 을 채울 수 있다. + 2 여야 한 갱신이
+        # 처음부터 fail=False 로 돌았다
+        assert wait_for(lambda: m.refreshes >= before + 2)
         assert m.report()["status"] == CAUGHT_UP
     finally:
         m.stop(5)
@@ -576,9 +580,7 @@ def test_monitor_survives_clock_and_path_exceptions(tmp_path):
 
 
 def test_monitor_restarts_after_pid_change(tmp_path, monkeypatch):
-    # 새 스레드의 첫 갱신이 before 를 읽기 전에 끝날 수 있어 다음 갱신이 곧 와야 한다.
-    # report 를 보지 않으므로 짧은 REFRESH 여도 stale 위험은 없다
-    m, fakes = monitor(tmp_path, refresh=0.05)
+    m, fakes = monitor(tmp_path)
     m.ensure_started()
     first, first_stop = m._thread, m._stop
     try:
@@ -590,8 +592,9 @@ def test_monitor_restarts_after_pid_change(tmp_path, monkeypatch):
         assert not m.running  # 다른 PID(포크 전 부모)의 스레드는 이 프로세스의 것이 아니다
         m.ensure_started()
         assert m._thread is not first and m._thread.is_alive() and m.running
-        before = fakes.calls
-        assert wait_for(lambda: fakes.calls > before)
+        # 옛 스레드도 계속 돌므로 호출 횟수가 아니라 새 스레드가 직접 조회했는지 본다
+        new = m._thread
+        assert wait_for(lambda: new in fakes.callers)
     finally:
         m.stop(5)
         first_stop.set()
