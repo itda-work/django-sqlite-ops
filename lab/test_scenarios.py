@@ -280,7 +280,7 @@ def test_L3_meta_deleted_refused(stack, run_id, rec):
 
 
 def test_L4_s3_down_at_boot_refused(stack, run_id, rec):
-    """S3 끊김 중 부팅 → unknown(remote_error) → 거부. 끊김(연결 거부)과 무응답 둘 다."""
+    """S3 끊김 중 부팅 → unknown(remote_error) → 거부. 끊김(연결 거부)과 양방향 무응답 둘 다."""
     prefix = f"l4-{run_id}"
     v = Volumes.take()
     seed_volume(stack, v, prefix, 20)
@@ -296,8 +296,20 @@ def test_L4_s3_down_at_boot_refused(stack, run_id, rec):
         assert "reason_code=remote_error" in decision(res.text)
         stack.proxy_enabled("s3", True)
 
-        # 무응답: 연결은 받고 데이터를 보내지 않는다. boot 의 --ltx-timeout 이 끊는다.
-        stack.add_toxic("s3", {"name": "hang", "type": "timeout", "attributes": {"timeout": 0}})
+        # 무응답: 연결은 받고 데이터를 양방향 모두 버린다. boot 의 --ltx-timeout 이 끊는다.
+        # toxic 의 stream 기본값은 downstream 뿐이라 upstream 도 넣는다(L8d 와 같다).
+        hang_streams = ("downstream", "upstream")
+        for stream in hang_streams:
+            stack.add_toxic(
+                "s3",
+                {
+                    "name": f"hang_{stream}",
+                    "type": "timeout",
+                    "stream": stream,
+                    "attributes": {"timeout": 0},
+                },
+            )
+        rec["hang_streams"] = list(hang_streams)
         t0 = time.monotonic()
         res = stack.run_boot(env=env(v, prefix, "--ltx-timeout 5"))
         rec["hang_exit_code"] = res.rc
