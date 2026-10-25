@@ -412,7 +412,7 @@ python manage.py sqlite_doctor --restore-test \
 >
 > **상대 `path:` 도 거부된다.** 실제 위치가 replicate 를 띄운 작업 디렉터리에 따라 바뀌어 보호할 경로를 정할 수 없기 때문이다(D-26). `dbs[].path` 는 절대 경로로 쓴다.
 
-> **DATABASES 밖의 DB.** Litestream 설정에는 있지만 `DATABASES` 에 없는 DB(같은 `litestream.yml` 로 복제하는 다른 서비스의 DB 등)의 디렉터리와 메타는 보호하지 않는다(후속 이슈). 그런 디렉터리를 `--restore-dir` 로 주지 않는다.
+> **DATABASES 밖의 DB.** `--litestream-config` 에 있는 DB 는 `DATABASES` 에 없어도(같은 `litestream.yml` 로 복제하는 다른 서비스의 DB 등) 부모 디렉터리와 기본 메타 `.<db>-litestream/` 를 같은 규칙으로 보호한다(메시지에 `litestream config database <경로>`). 그래서 이 모드는 설정 목록(`litestream databases`)을 읽은 뒤에야 `--restore-dir` 검사를 끝낸다 — 목록을 읽지 못하면 `config` `error` 로 아무것도 만들지 않는다. 목록 조회는 임시 디렉터리(TMPDIR)에서 하므로 TMPDIR 이 `--restore-dir` 과 같거나 그 안이면 거부한다(예: Linux 에서 `--restore-dir /tmp`) — TMPDIR 을 다른 곳으로 둔다. 같은 호스트의 **다른** 설정 파일이 복제하는 DB 와 설정의 `meta-path` 는 판별하지 못한다.
 
 > **메타 판별의 한계.** 이 명령은 Litestream YAML 의 `meta-path` 를 읽지 않는다(YAML 파서를 넣지 않고, `litestream databases -json` 은 메타 경로를 내주지 않는다 — 0.5.17 재현함). YAML 에 `meta-path` 를 DB 디렉터리 **밖**으로 두고 그 경로를 헬스 설정의 `meta_path` 에도 적지 않았다면 그 메타는 보호하지 못한다. 메타를 옮겼다면 헬스 설정에도 같은 `meta_path` 를 적는다. **file 복제본 디렉터리**도 경로가 YAML 에만 있어 판별하지 못한다 — 그 안을 `--restore-dir` 로 주지 않는다.
 >

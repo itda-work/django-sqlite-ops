@@ -30,7 +30,7 @@ from django.conf import settings
 from django.db import connections
 
 from .boot import litestream
-from .boot.cli import _fold, _overlaps, lock_path, real_path, sidecars, state_path
+from .boot.cli import _contains, _fold, _overlaps, lock_path, real_path, sidecars, state_path
 from .boot.decide import RemoteEmpty, RemoteError
 from .doctor import (
     Item,
@@ -116,8 +116,8 @@ def check_restore_dir(
 
     마지막 구성요소까지 링크가 아닌 실제 디렉터리여야 한다: 부모는 ``real_path()``(D-15), 마지막
     구성요소는 ``lstat`` 으로 본다. ``protected`` 는 ``(별칭, 역할, 경로)`` 이고, 그중 하나와
-    같거나 조상·자손이면 거부한다(경로 문자열·``(st_dev, st_ino)``·``_fold`` 비교). 아무것도
-    만들지 않는다.
+    같거나 조상·자손이면 거부한다(경로 문자열·``(st_dev, st_ino)``·``_fold`` 비교). 별칭이
+    ``None`` 이면 역할에 주인을 적는다(Litestream 설정에만 있는 DB, #57). 아무것도 만들지 않는다.
     """
     text = os.fspath(raw)
     if not text:
@@ -147,8 +147,9 @@ def check_restore_dir(
         except OSError as exc:
             return None, f"--restore-dir {path}: cannot compare with {other}: {exc}"
         if hit:
+            owner = "" if alias is None else f" of alias {alias!r}"
             return None, (
-                f"--restore-dir {path} overlaps the {what} of alias {alias!r}: {other}; "
+                f"--restore-dir {path} overlaps the {what}{owner}: {other}; "
                 "use a directory outside the database directory and the litestream meta"
             )
     return path, None
@@ -407,6 +408,27 @@ def _base_paths(name: str) -> list[Path]:
     return [literal] if real == literal else [literal, real]
 
 
+def _config_protected(listed: Iterable[str]) -> list[tuple[str | None, str, Path]]:
+    """Litestream 설정의 DB 경로마다 보호 경로(D-25, #57). ``DATABASES`` 에 없는 DB 도 넣는다.
+
+    같은 ``litestream.yml`` 이 복제하는 다른 서비스 DB 의 디렉터리·기본 메타를 막는다. 설정의
+    ``meta-path`` 는 ``databases -json`` 이 내보내지 않으므로(0.5.17) 기본 메타만 넣는다.
+    """
+    out: list[tuple[str | None, str, Path]] = []
+    for path in listed:
+        owner = f" of litestream config database {path}"
+        for base in _base_paths(path):
+            for what, p in protected_paths(base, litestream.default_meta_path(base)):
+                out.append((None, f"{what}{owner}", p))
+    return out
+
+
+def _under(root: Path, path: Path) -> bool:
+    """``path`` 가 ``root`` 와 같거나 그 아래면 참(문자열·파일 동일성·``_fold`` 비교)."""
+    fr, fp = _fold(str(root)).rstrip(os.sep), _fold(str(path))
+    return _contains(root, path) or fp == fr or fp.startswith(fr + os.sep)
+
+
 def _dir_identity(path: Path) -> tuple[int, int] | None:
     """링크가 아닌 디렉터리의 ``(st_dev, st_ino)``. 아니거나 읽지 못하면 ``None``."""
     try:
@@ -586,7 +608,24 @@ def restore_test(
 
     config = _caller_path(litestream_config)
     binary = _binary(litestream_binary)
+    # 설정 목록은 아래 임시 cwd 에서 읽는다. 그 cwd 가 --restore-dir 아래면 설정에만 있는 DB 와의
+    # 겹침을 보기 전에 --restore-dir 안에 무언가를 만드는 셈이다: 판정 전이므로 거부한다(#57).
+    temp_base = Path(os.path.realpath(tempfile.gettempdir()))
+    try:
+        temp_under = _under(root, temp_base)
+    except OSError as exc:
+        temp_under, temp_problem = True, f"cannot compare with {temp_base}: {exc}"
+    else:
+        temp_problem = (
+            f"the temporary directory {temp_base} (TMPDIR) is inside it, and "
+            "litestream databases runs in a new directory there before the overlap check"
+        )
+    if temp_under:
+        message = f"--restore-dir {root}: {temp_problem}; set TMPDIR outside --restore-dir"
+        items.append(_item(None, "restore_dir", "error", restore_dir, None, message))
+        return items
     # 상대 경로·dir: 항목은 Litestream 작업 디렉터리 기준으로 풀리므로 새 임시 cwd 에서 읽는다.
+    # 실패하면 보호 합집합이 불완전하므로 거부한다(작업 디렉터리를 만들기 전이다).
     with tempfile.TemporaryDirectory(prefix="sqlite-doctor-") as cwd:
         listed = litestream.config_databases(config, binary=binary, cwd=cwd)
     if isinstance(listed, str):
@@ -607,6 +646,19 @@ def restore_test(
                 "litestream runs, so the paths to protect are unknown (D-26)"
             )
         items.append(_item(None, "config", "error", config, None, message))
+        return items
+    # 같은 설정이 복제하는 다른 DB(DATABASES 에 없는 것 포함)의 경로도 막는다(D-25, #57). 앞의
+    # 검사로 DATABASES 쪽은 이미 걸렀으므로 메시지가 바뀌지 않는다.
+    try:
+        from_config = _config_protected(listed)
+    except ValueError as exc:
+        message = f"cannot determine the paths of a litestream config database: {exc}"
+        items.append(_item(None, "restore_dir", "error", restore_dir, None, message))
+        return items
+    root, problem = check_restore_dir(restore_dir, [*protected, *from_config])
+    if problem is not None or _dir_identity(root) != identity:
+        message = problem or "--restore-dir changed while the litestream config was read"
+        items.append(_item(None, "restore_dir", "error", restore_dir, None, message))
         return items
     in_config = set(listed)
     for alias, db in runnable:

@@ -176,6 +176,13 @@ if cmd == "version":
     print("0.5.17")
     sys.exit(0)
 if cmd == "databases":
+    if spec.get("databases_rc"):
+        print("cannot read config", file=sys.stderr)
+        sys.exit(spec["databases_rc"])
+    swap = spec.get("swap_on_databases")
+    if swap and not os.path.islink(swap):
+        os.rename(swap, swap + ".old")
+        os.symlink(swap + ".old", swap)
     # 0.5.17 은 dir: 항목을 감시 디렉터리가 아니라 실행한 cwd 로 내보낸다(재현함).
     # 상대 path: 는 실행한 cwd 아래로 풀린다(재현함).
     paths = spec["dbs"] + ([os.getcwd()] if spec.get("dir_entry") else [])
@@ -759,6 +766,67 @@ def test_fake_restore_dir_problems_stop_before_litestream(lab):
     assert fake.commands() == []
 
 
+def test_fake_restore_dir_overlapping_a_config_only_database_is_refused(lab):
+    """``DATABASES`` 에 없고 Litestream 설정에만 있는 DB 의 디렉터리·메타도 보호한다(#57)."""
+    lab, db, fake = lab
+    (lab / "svc").mkdir()
+    svc = make_db(lab / "svc" / "svc.db")
+    svc_meta = ls.default_meta_path(svc)
+    (svc_meta / "ltx" / "0").mkdir(parents=True)
+    fake.spec["dbs"].append(str(svc))
+    fake.save()
+    before = fingerprint(lab / "svc")
+    for target in (lab / "svc", svc_meta, svc_meta / "ltx"):
+        code, data, _ = run({"default": sqlite_db(db)}, *fake.args(target))
+        assert code == 2, target
+        item = one(data, "restore_dir", alias=None)
+        assert item["level"] == "error"
+        assert f"litestream config database {svc}" in item["message"], item["message"]
+        assert "alias" not in item["message"]
+        assert "restore" not in keys(data)
+    assert fingerprint(lab / "svc") == before
+    assert fake.commands() == ["databases"] * 3
+
+
+def test_fake_config_failure_refuses_before_creating_anything(lab):
+    """``databases`` 가 실패하면 보호 합집합이 불완전하므로 작업 디렉터리를 만들지 않는다(#57)."""
+    lab, db, fake = lab
+    fake.spec["databases_rc"] = 1
+    fake.save()
+    code, data, _ = run({"default": sqlite_db(db)}, *fake.args(lab / "restore"))
+    assert code == 2
+    assert one(data, "config", alias=None)["level"] == "error"
+    assert "restore_dir" not in keys(data, alias="default")
+    assert fake.commands() == ["databases"]
+    assert work_dirs(lab / "restore") == []
+
+
+def test_fake_temp_cwd_under_the_restore_dir_is_refused(lab):
+    """``databases`` 의 임시 cwd 가 ``--restore-dir`` 아래에 생기면 검사 전에 만드는 셈이다(#57)."""
+    lab, db, fake = lab
+    tmp = lab / "restore" / "tmp"
+    tmp.mkdir()
+    post = f"import tempfile; tempfile.tempdir = {str(tmp)!r}"
+    code, data, _ = run({"default": sqlite_db(db)}, *fake.args(lab / "restore"), post=post)
+    assert code == 2, data
+    item = one(data, "restore_dir", alias=None)
+    assert "temporary directory" in item["message"], item["message"]
+    assert fake.commands() == []
+    assert list(tmp.iterdir()) == []
+
+
+def test_fake_restore_dir_swapped_while_the_config_is_read_is_refused(lab):
+    """첫 검사와 설정 DB 검사 사이에 ``--restore-dir`` 이 링크로 바뀌면 거부한다(#57)."""
+    lab, db, fake = lab
+    fake.spec["swap_on_databases"] = str(lab / "restore")
+    fake.save()
+    code, data, _ = run({"default": sqlite_db(db)}, *fake.args(lab / "restore"))
+    assert code == 2, data
+    assert "is a symlink" in one(data, "restore_dir", alias=None)["message"]
+    assert fake.commands() == ["databases"]
+    assert list((lab / "restore.old").iterdir()) == []
+
+
 def test_fake_health_meta_path_is_protected(lab):
     lab, db, fake = lab
     meta = lab / "meta"
@@ -1093,7 +1161,8 @@ def test_fake_nothing_to_run_with_another_error_adds_no_extra_item(lab):
 
 def test_fake_db_not_in_config_or_not_real_path(lab):
     lab, db, fake = lab
-    fake.spec["dbs"] = [str(lab / "elsewhere.db")]
+    # 설정에만 있는 DB 의 디렉터리는 보호 대상이므로(#57) --restore-dir 과 겹치지 않게 둔다.
+    fake.spec["dbs"] = [str(lab / "elsewhere" / "x.db")]
     fake.save()
     (lab / "link").symlink_to(lab / "app")
     databases = {"default": sqlite_db(db), "linked": sqlite_db(lab / "link" / "app.db")}
@@ -1356,6 +1425,33 @@ def test_real_relative_path_in_the_config_is_refused(real):
     assert message.split(" in the litestream config")[0].endswith(f"{os.sep}data{os.sep}other.db")
     assert "restore" not in keys(data)
     assert work_dirs(lab / "restore") == []
+
+
+@needs_litestream
+def test_real_restore_dir_overlapping_a_config_only_database_is_refused(real):
+    """실제 0.5.17: 설정에만 있는 DB 의 디렉터리·기본 메타를 ``--restore-dir`` 로 주면 거부(#57)."""
+    lab, db, config, _ = real
+    (lab / "svc").mkdir()
+    svc = make_db(lab / "svc" / "svc.db")
+    svc_meta = ls.default_meta_path(svc)
+    svc_meta.mkdir()
+    config.write_text(
+        config.read_text()
+        + f"  - path: {svc}\n"
+        + "    replica:\n"
+        + "      type: file\n"
+        + f"      path: {lab / 'replica-svc'}\n"
+    )
+    before = fingerprint(lab / "svc")
+    args = real_args(lab, config)
+    for target in (lab / "svc", svc_meta):
+        args[args.index("--restore-dir") + 1] = str(target)
+        code, data, _ = run({"default": sqlite_db(db)}, *args)
+        assert code == 2, data
+        message = one(data, "restore_dir", alias=None)["message"]
+        assert f"litestream config database {svc}" in message, message
+        assert "restore" not in keys(data)
+    assert fingerprint(lab / "svc") == before
 
 
 @needs_litestream
