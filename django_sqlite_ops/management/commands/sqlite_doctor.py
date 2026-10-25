@@ -28,7 +28,8 @@ HELP = (
     "opens no Django connection. It downloads the "
     "whole snapshot (time and S3 egress grow with the database). It refuses a --restore-dir that "
     "overlaps a database directory or a litestream meta directory it knows of for any SQLite "
-    "backend alias, or when an alias's backend cannot be loaded "
+    "backend alias or any database in the --litestream-config, when TMPDIR is inside "
+    "--restore-dir, or when an alias's backend cannot be loaded "
     "(SQLITE_OPS['HEALTH'] meta_path or the default .<db>-litestream); a YAML meta-path outside "
     "the database directory that is not in SQLITE_OPS['HEALTH'] is not protected. "
     "Exit status: 0 no problems, 1 warnings or undeterminable items, 2 errors "
@@ -96,7 +97,7 @@ class Command(BaseCommand):
             "--restore-dir",
             metavar="DIR",
             help="Existing real directory (not a symlink) for the restored copies; required. "
-            "Not /tmp on a tmpfs server, not the database directory.",
+            "Not /tmp on a tmpfs server, not the database directory, not around TMPDIR.",
         )
         group.add_argument(
             "--integrity",

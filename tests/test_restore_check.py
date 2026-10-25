@@ -180,9 +180,13 @@ if cmd == "databases":
         print("cannot read config", file=sys.stderr)
         sys.exit(spec["databases_rc"])
     swap = spec.get("swap_on_databases")
-    if swap and not os.path.islink(swap):
+    if swap and not os.path.exists(swap + ".old"):
+        # 링크(check_restore_dir 가 잡는다) 또는 새 실제 디렉터리(_dir_identity 가 잡는다)로.
         os.rename(swap, swap + ".old")
-        os.symlink(swap + ".old", swap)
+        if spec.get("swap_with_dir"):
+            os.mkdir(swap)
+        else:
+            os.symlink(swap + ".old", swap)
     # 0.5.17 은 dir: 항목을 감시 디렉터리가 아니라 실행한 cwd 로 내보낸다(재현함).
     # 상대 path: 는 실행한 cwd 아래로 풀린다(재현함).
     paths = spec["dbs"] + ([os.getcwd()] if spec.get("dir_entry") else [])
@@ -818,13 +822,20 @@ def test_fake_temp_cwd_under_the_restore_dir_is_refused(lab):
 def test_fake_restore_dir_swapped_while_the_config_is_read_is_refused(lab):
     """첫 검사와 설정 DB 검사 사이에 ``--restore-dir`` 이 링크로 바뀌면 거부한다(#57)."""
     lab, db, fake = lab
-    fake.spec["swap_on_databases"] = str(lab / "restore")
-    fake.save()
-    code, data, _ = run({"default": sqlite_db(db)}, *fake.args(lab / "restore"))
-    assert code == 2, data
-    assert "is a symlink" in one(data, "restore_dir", alias=None)["message"]
-    assert fake.commands() == ["databases"]
-    assert list((lab / "restore.old").iterdir()) == []
+    restore = lab / "restore"
+    for with_dir, needle in (
+        (False, "is a symlink"),
+        (True, "changed while the litestream config was read"),
+    ):
+        fake.spec.update(swap_on_databases=str(restore), swap_with_dir=with_dir)
+        fake.save()
+        code, data, _ = run({"default": sqlite_db(db)}, *fake.args(restore))
+        assert code == 2, data
+        assert needle in one(data, "restore_dir", alias=None)["message"], with_dir
+        assert list((lab / "restore.old").iterdir()) == []
+        restore.unlink() if restore.is_symlink() else restore.rmdir()
+        (lab / "restore.old").rename(restore)
+    assert fake.commands() == ["databases"] * 2
 
 
 def test_fake_health_meta_path_is_protected(lab):

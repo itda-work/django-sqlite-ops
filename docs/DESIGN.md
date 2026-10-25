@@ -389,7 +389,7 @@ django_sqlite_ops/
 
 | key | value | level |
 |---|---|---|
-| `restore_dir` | 작업 디렉터리 | 없음·링크·디렉터리 아님·보호 대상과 겹침 거부 시 `error` |
+| `restore_dir` | 작업 디렉터리 | 없음·링크·디렉터리 아님·보호 대상(설정에만 있는 DB 포함, #57)과 겹침, TMPDIR 이 `DIR` 과 같거나 그 안(Linux `/tmp`), 설정 조회 중 `DIR` 바뀜 거부 시 `error` |
 | `space` | 여유 바이트(`expected` = 추정 필요량) | 부족 `error` |
 | `remote_txid` | 직전 원격 최대 TXID | 빈 목록 `error`, 조회 실패 `unknown` |
 | `restore` | 성공 여부·사유 | 실패·타임아웃 `error` |
@@ -401,7 +401,7 @@ django_sqlite_ops/
 | `output` | 남긴 산출물 경로(있을 때) | `ok`(보고), 정리 실패면 `warn`(남은 경로) |
 | `alias`·`database`·`config` | 별칭 역할·DB 경로·설정 파일 (구현 때 추가) | 쓰기 파일 DB 아님: 기본 선택이면 `ok`(skipped), `--database` 로 고른 별칭이면 `unknown` / 실행한 쓰기 DB 0개(다른 `error` 없음) `error`(별칭 `null`) / `DATABASES` 에 없음 `error` / 실제 경로 아님·설정 목록에 없음 `error` / `litestream databases` 실패 `error` |
 
-- 구현 때 더한 키: `alias`(쓰기 파일 DB 가 아니면 기본 선택에서 `ok` skipped·명시 선택에서 `unknown`, `DATABASES` 에 없으면 `error`, 실행한 쓰기 DB 가 없으면 별칭 `null` 의 `error`), `database`(경로가 D-15 실제 경로가 아니거나 Litestream 설정 목록에 없으면 `error`), `config`(`litestream databases` 실패, 또는 `dir:` 항목·상대 `path:` 가 있으면(D-26) `error`, 별칭 `null`). `restore_dir` 의 `--restore-dir` 자체 거부와 `SQLITE_OPS['HEALTH']` 가 잘못돼 메타 경로를 모를 때, 경로를 모르는 sqlite3 별칭(NAME 에 NUL 이 들어 경로 계산이 실패하는 별칭 포함)이 있을 때의 거부는 별칭 `null` 이다.
+- 구현 때 더한 키: `alias`(쓰기 파일 DB 가 아니면 기본 선택에서 `ok` skipped·명시 선택에서 `unknown`, `DATABASES` 에 없으면 `error`, 실행한 쓰기 DB 가 없으면 별칭 `null` 의 `error`), `database`(경로가 D-15 실제 경로가 아니거나 Litestream 설정 목록에 없으면 `error`), `config`(`litestream databases` 실패, 또는 `dir:` 항목·상대 `path:` 가 있으면(D-26) `error`, 별칭 `null`). `restore_dir` 의 `--restore-dir` 자체 거부(Litestream 설정에만 있는 DB 와 겹침, TMPDIR 이 `DIR` 안, 설정 조회 중 바뀜 포함 — #57)와 `SQLITE_OPS['HEALTH']` 가 잘못돼 메타 경로를 모를 때, 경로를 모르는 sqlite3 별칭(NAME 에 NUL 이 들어 경로 계산이 실패하는 별칭 포함)이 있을 때의 거부는 별칭 `null` 이다.
 - 겹침 비교는 §4-2 방식(경로 문자열 + 있는 경로의 `(st_dev, st_ino)`)에 더해, 경로 전체를 `_fold()` 로 접은 문자열 비교도 한다(아직 없는 메타 경로의 대소문자·정규형 변형도 막는다 — 대소문자 구분 볼륨에서는 보수적으로 더 거부한다). boot 예약 이름(`.restore-*`·`.stale-*`·상태 임시 파일)은 모두 DB 부모 디렉터리 안이라 부모 규칙이 막는다.
 - **JSON 스키마**: 위 `version: 1` 에 `section` 값 `restore` 와 이 `key` 들을 덧붙였다(위 스키마의 `key` 목록). **`version` 은 올리지 않는다.** 근거: 위 스키마 규약상 `key` 목록은 늘어날 수 있고 소비자는 모르는 `key` 를 무시한다. 필드를 빼거나 뜻을 바꾸는 변경이 아니다. 단독 모드라 기존 소비자가 받는 일반 진단 출력은 그대로다.
 - **수준·종료 코드**: 기존 규약 그대로 — 0 문제 없음, 1 `warn`·`unknown`, 2 `error`. `--restore-dir` 누락 등 이 모드의 인자 오류도 exit 2 다(D-20). Django `CommandError` 의 기본 종료 코드는 1 이라 그대로 쓰면 규약과 어긋나므로, 구현 때 `SystemExit(2)` 로 맞춘다.

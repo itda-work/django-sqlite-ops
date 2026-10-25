@@ -423,7 +423,7 @@ python manage.py sqlite_doctor --restore-test \
 | key | 값 | 수준 |
 |---|---|---|
 | `space` | 여유 바이트(`expected` = 필요량 추정치) | (로컬 DB + `-wal`) × 1.2 보다 적으면 `error`. 별칭을 시작하기 직전에 잰다 |
-| `restore_dir` | 만든 작업 디렉터리 | `--restore-dir` 이 없음·링크·디렉터리 아님·겹침이면 `error`(별칭 `null`) |
+| `restore_dir` | 만든 작업 디렉터리 | `--restore-dir` 이 없음·링크·디렉터리 아님·겹침(`DATABASES` 별칭 또는 `--litestream-config` 에만 있는 DB), TMPDIR 이 그 안(Linux `--restore-dir /tmp`), 설정을 읽는 동안 바뀜이면 `error`(별칭 `null`) |
 | `remote_txid` | 복원 직전 원격 최대 TXID(16자리 16진수) | 복제본이 비었으면 `error`(0.5.17 은 복제본 경로 오타도 같은 결과다), 조회 실패·타임아웃이면 `unknown` 이고 복원은 그대로 한다 |
 | `restore` | `restored`/`failed` | 실패·타임아웃이면 `error` 이고 `integrity` 는 내지 않는다 |
 | `restored_txid` | 복원 TXID(`expected` = `remote_txid`) | 원격보다 작으면 `warn`, 원격을 몰랐으면 `unknown` |
@@ -878,7 +878,7 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 | `[process]` 의 `nofile_soft` 가 compose 에 준 값과 다르다 | doctor 는 자기 프로세스의 한도를 본다. 다른 셸이나 호스트에서 돌렸거나, 앱이 `setrlimit` 으로 바꿨다 | `docker compose exec app ...` 로 컨테이너 안에서 돌리고, 앱 PID 의 `/proc/<pid>/limits` 와 맞춰 본다([fd 한도 가이드 §2](docs/profiles/fd-limits.md#2-현재-한도-확인)) | 재현함(#32) |
 | 읽기 전용 별칭(`mode=ro`)이 `unknown` 이다 | WAL DB 는 읽기 전용 연결도 `-shm` 에 쓰고 `-wal` 을 만들 수 있어 연결하지 않는다 | 같은 파일의 쓰기 별칭이나 `immutable=1` URI 별칭으로 진단한다([주의](#sqlite_doctor)) | 재현함 |
 | DB 파일이 없다는 `error` | 없는 파일에 연결하면 SQLite 가 빈 DB 를 만들어 다음 boot 의 복원을 막으므로 연결하지 않는다 | 경로를 확인하거나 boot 로 먼저 복원한다 | 코드상 확인(`doctor.py`) |
-| `--restore-test` 가 `restore_dir` `error` 로 바로 끝난다 | `--restore-dir` 이 없거나 링크이거나, 운영 DB 디렉터리·메타와 겹친다(아무것도 만들지 않고 거부) | DB 디렉터리·메타 밖의 실제 디렉터리를 미리 만들어 준다([복원 검증](#복원-검증---restore-test)) | 재현함(#54 테스트) |
+| `--restore-test` 가 `restore_dir` `error` 로 바로 끝난다 | `--restore-dir` 이 없거나 링크이거나, 운영 DB 디렉터리·메타와 겹친다. 같은 `litestream.yml` 에만 있는 다른 서비스 DB 의 디렉터리와 겹쳐도 거부한다(메시지에 `litestream config database`). TMPDIR 이 `--restore-dir` 과 같거나 그 안이어도 거부한다(Linux 에서 `--restore-dir /tmp`). 모두 아무것도 만들지 않고 거부 | DB 디렉터리·메타 밖의 실제 디렉터리를 미리 만들어 준다. TMPDIR 이 걸리면 `TMPDIR=/var/tmp` 처럼 밖으로 옮기거나 다른 디렉터리를 준다([복원 검증](#복원-검증---restore-test)) | 재현함(#54·#57 테스트) |
 | `--restore-test` 의 `remote_txid` 가 `error`(복제본이 비었다) | 복제본에 LTX 가 없다. 0.5.17 은 복제본 경로·prefix 오타도 같은 결과다 | 설정의 복제본 경로를 확인하고 헬스(`remote_txid`)도 본다 | 재현함 |
 | `--restore-test` 산출물이 `--restore-dir` 에 쌓인다 | 실패(또는 `--keep`)한 실행의 작업 디렉터리는 조사용으로 남기고 자동으로 지우지 않는다 | `output` 경로를 확인한 뒤 지운다 | 코드상 확인(`restore_check.py`) |
 
