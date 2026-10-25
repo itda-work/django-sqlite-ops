@@ -568,14 +568,14 @@ SQLITE_OPS = {
 
 스파이크 랩(`docs/reference/compose.yaml`, `Dockerfile`, `entrypoint.sh`)을 바탕으로 `lab/` 에 다시 만든다. S3 대체는 SeaweedFS 다(MinIO 는 익명 pull 이 막혀 있었다). 장애 주입은 toxiproxy 로 한다.
 
-구현은 `lab/`(설명 `lab/README.md`), 실행은 `scripts/lab.sh run [L1..L8|P1|P2|all]`·`bench`. 기본 `pytest`·CI 에는 들어가지 않는다(`RUN_LAB=1` 일 때만 수집). 결과: [`docs/research/lab-2026-10-08.md`](research/lab-2026-10-08.md), L8c·L8d 는 [`lab-2026-10-25-long-outage.md`](research/lab-2026-10-25-long-outage.md).
+구현은 `lab/`(설명 `lab/README.md`), 실행은 `scripts/lab.sh run [L1..L8|P1|P2|all]`·`bench`. 기본 `pytest`·CI 에는 들어가지 않는다(`RUN_LAB=1` 일 때만 수집). 결과: [`docs/research/lab-2026-10-08.md`](research/lab-2026-10-08.md), L8c·L8d 는 [`lab-2026-10-25-long-outage.md`](research/lab-2026-10-25-long-outage.md), L4 양방향 무응답은 [`lab-2026-10-25-l4-two-way.md`](research/lab-2026-10-25-l4-two-way.md).
 
 | ID | 시나리오 | 기대 | 결과(2026-10-08) |
 |---|---|---|---|
 | L1 | 볼륨 없이 새 컨테이너 | `fresh` → 복원, 행 수 일치 | 통과(200/200, 무상태 교체 D1c 포함) |
 | L2 | 옛 볼륨으로 재부팅(D4) | `unknown` → 거부(exit 2), 복제본 손상 0 | 통과(`remote_ahead`, 복제본 TXID·150건 그대로) |
 | L3 | 로컬 메타만 삭제 | `unknown` → 거부 (스파이크는 여기서 새 DB 를 버렸다) | 통과(`no_local_meta`, DB 해시 그대로) |
-| L4 | S3 끊김 중 부팅 | `unknown` → 거부 | 통과(`remote_error`. 연결 거부도 `ltx` 가 매달려 30초 타임아웃에서 거부) |
+| L4 | S3 끊김 중 부팅 — 연결 거부 / 양방향 무응답(`timeout` toxic, `downstream`+`upstream`) + `--ltx-timeout 5` | `unknown` → 거부 | 통과(`remote_error`. 연결 거부도 `ltx` 가 매달려 30초 타임아웃에서 거부). 양방향 무응답은 2026-10-25 재실행(colima arm64 2회)에서 exit 2 `remote_error`, 5.6초. 2026-10-08 실행의 무응답은 `downstream` 하나라 응답 유실만이었다([`lab-2026-10-25-l4-two-way.md`](research/lab-2026-10-25-l4-two-way.md)) |
 | L5 | 복제되지 않은 로컬 커밋이 있는 상태로 재부팅 | `match` → 진행, 커밋 보존 | 통과(65건 보존, 이후 복제) |
 | L6 | `--on-unknown restore` 진행 중 kill → 재시작 | 반쯤 옮겨진 상태 없음, 재실행으로 완료 | 통과(rename 8곳 모두에서 kill — kill 시 rename 수 = k 확인, 재실행 완료, 템플릿의 DB·사이드카·메타 하위 8항목이 한 격리 디렉터리에 같은 해시, D-14 지점은 격리 2개) |
 | L7 | 복원 실패(S3 객체 손상) | exit 4, 로컬 무변경 | 통과(새 컨테이너·격리 경로 모두 exit 4, 로컬 해시 그대로) |

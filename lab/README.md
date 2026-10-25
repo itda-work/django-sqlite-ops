@@ -80,7 +80,7 @@ P2 는 채널 레이어를 런타임에 쓰지 않는다(channels-nats 를 설�
 | L1 | 볼륨 A 로 200건 → 볼륨 없는 새 컨테이너 | `fresh` → 복원, 200건, 이어 쓴 것도 복제 |
 | L2 | A 50건 → B 가 복원해 150건 → A 로 재부팅 | exit 2 `remote_ahead`, 복제본 TXID·150건 그대로, A 무변경 |
 | L3 | 정상 종료 뒤 로컬 메타 디렉터리만 삭제 | exit 2 `no_local_meta`, DB 무변경 |
-| L4 | toxiproxy `s3` 끔 / `timeout` toxic(무응답)+`--ltx-timeout 5` | 둘 다 exit 2 `remote_error`, 복구 후 `match` |
+| L4 | toxiproxy `s3` 끔 / 양방향 무응답 + `--ltx-timeout 5`: `timeout` toxic(`timeout` 0)을 `stream` `downstream`·`upstream` 둘 다(L8d 와 같은 방식, 결과에 `hang_streams` 로 남김) | 둘 다 exit 2 `remote_error`, 복구 후 `match` |
 | L5 | S3 를 끊고 25건 → SIGKILL → S3 복구 → 재부팅 | `match`(`local_current`), 65건, 뒤이어 복제본 65건 |
 | L6 | L2 의 옛 볼륨 + `--on-unknown restore`. rename 마다 잠드는 훅(`lab_hooks/sitecustomize.py`)으로 k 번째 rename 직후 SIGKILL, 모든 k 에 대해 → 훅 없이 재실행 | kill 직전 훅 로그의 rename 수가 정확히 k. 재실행 성공·150건, `.partial` 없음. kill 전 템플릿의 DB·`-wal`·`-shm`·메타 하위 전부가 **같은 하나의** 격리 디렉터리에 같은 해시로 있고 그 밖에는 manifest 뿐, 템플릿 파일 내용이 그 밖 어디에도 없음. 설치 뒤 kill(D-14)이면 격리 디렉터리 2개, 두 번째는 manifest·복원본 DB(+사이드카)만 (`_checks.quarantine_problems`) |
 | L7 | 복제본의 모든 LTX 객체 가운데 64바이트를 뒤집음(filer API) | 새 컨테이너 exit 4 / 메타 삭제 볼륨 + `--on-unknown restore` exit 4, 로컬 파일 해시 무변경, 격리 없음 |
