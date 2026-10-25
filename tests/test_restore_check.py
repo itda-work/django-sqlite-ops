@@ -524,6 +524,9 @@ class LateStart:
         self.interrupts = 0
         self.interrupts_at_followup = None  # 검사 뒤 첫 문장이 들어온 시점의 interrupt() 호출 수
         self.ran = None  # 실제 검사 문장이 돈 시간(초). 발동을 기다린 시간은 뺀다
+        self.interrupts_at_start = None  # 검사 문장에 들어가기 직전의 interrupt() 호출 수
+        self.rows = None  # 검사 문장이 끝까지 돌아 돌려준 행
+        self.error = None  # 검사 문장이 끊기거나 실패해 낸 예외
 
     def interrupt(self):
         self.interrupts += 1
@@ -533,9 +536,13 @@ class LateStart:
     def execute(self, sql):
         if sql.startswith("PRAGMA") and "check" in sql:
             assert self.fired.wait(30)
+            self.interrupts_at_start = self.interrupts
             start = time.monotonic()
             try:
-                rows = self.conn.execute(sql).fetchall()
+                rows = self.rows = self.conn.execute(sql).fetchall()
+            except sqlite3.Error as exc:
+                self.error = exc
+                raise
             finally:
                 self.ran = time.monotonic() - start
             if self.after is not None:
@@ -558,10 +565,7 @@ def test_integrity_timer_fired_before_the_check_started_still_interrupts(tmp_pat
     다시 끊어야 끝까지 돌지 않는다.
     """
     db = make_big_db(tmp_path / "big.db", 100)
-    assert rc.check_integrity(db, "full", 600)[0]  # 페이지 캐시를 데운다
-    start = time.monotonic()
     assert rc.check_integrity(db, "full", 600)[0]
-    full = time.monotonic() - start
 
     opened = []
     real_connect = rc._connect_ro
@@ -571,19 +575,21 @@ def test_integrity_timer_fired_before_the_check_started_still_interrupts(tmp_pat
         return opened[-1]
 
     monkeypatch.setattr(rc, "_connect_ro", connect)
-    start = time.monotonic()
     passed, got = rc.check_integrity(db, "full", 0.005)
-    elapsed = time.monotonic() - start
+    late = opened[0]
     assert not passed
     assert [(i.key, i.level) for i in got] == [("integrity", "error")]
     message = got[0].message
     assert message.startswith("timeout: integrity_check did not finish"), message
     assert "interrupted after" in message, message
-    assert opened[0].interrupts >= 2
-    # 끝까지 돌지 않았다: 문장 자체는 전체 검사의 절반도 돌지 않고 끊겼다. 전체 경과에는 발동을
-    # 기다린 시간과 스레드 기상 지연이 들어가 부하(yes 20개)에서 흔들려 문장 시간과 따로 본다.
-    assert opened[0].ran < full / 2, (opened[0].ran, elapsed, full)
-    assert elapsed < full, (elapsed, full)
+    # 끊겼다는 증거는 시간이 아니라 사건으로 본다. 문장 전의 interrupt() 는 no-op 이니 문장에 들어간
+    # 뒤 다시 불려야 하고, 문장은 행을 내지 못하고 interrupted 로 끝나야 한다(끝까지 돌지 않음).
+    # 시간 비율(ran < full/2)은 macOS 러너에서 72ms 대 62ms 로 흔들려 뺐다(#68).
+    assert late.interrupts_at_start >= 1, late.interrupts_at_start
+    assert late.interrupts > late.interrupts_at_start, (late.interrupts, late.interrupts_at_start)
+    assert late.rows is None, late.rows
+    assert isinstance(late.error, sqlite3.OperationalError), late.error
+    assert "interrupt" in str(late.error), late.error
 
 
 def test_corrupt_result_with_the_timer_fired_reports_both_and_keeps_the_structure(
