@@ -71,6 +71,13 @@ def test_build_context_differs_from_docs_only_by_substitutions(tmp_path):
     assert os.access(build / "entrypoint.sh", os.X_OK)
     lite = (build / "litestream.yml").read_text(encoding="utf-8")
     assert "endpoint: http://toxiproxy:18333" in lite and "path: ${LAB_PREFIX}" in lite
+    # P2(#66): 문서 Dockerfile 은 그대로, 그 이미지 위에 [nats] extra 를 판 고정으로 얹는다
+    nats_req = (build / "requirements-nats.txt").read_text(encoding="utf-8").splitlines()
+    assert nats_req == [
+        f"django-sqlite-ops[nats] @ file:///app/{wheel.name}",
+        f"channels-nats=={bc.CHANNELS_NATS}",
+    ]
+    assert (build / "nats.Dockerfile").read_text(encoding="utf-8").count("FROM ${BASE}") == 1
 
 
 # --- 랩 판정 함수(lab/_checks.py) — Docker 없이 -------------------------------------------
@@ -426,6 +433,133 @@ def test_l8_ltx_pid_span_pair():
 
 
 # --- PRAGMA 벤치 집계(#26, lab/_benchstat.py) ------------------------------------------------
+
+
+# --- P2 채널 레이어 전달(#66) ----------------------------------------------------------------
+
+CH_A, CH_B = "specific.a!x", "specific.b!y"
+
+
+def _worker(pid, channel, ids, nats_log=(), cancel_times=(), errors=()):
+    return {
+        "pid": pid,
+        "channel": channel,
+        "ids": list(ids),
+        "nats_log": list(nats_log),
+        "cancels": len(cancel_times),
+        "cancel_times": list(cancel_times),
+        "errors": list(errors),
+    }
+
+
+def _trial(*workers, errors=(), jobs=None, t0=10.0, t1=11.0):
+    t = {"workers": list(workers), "errors": list(errors), "senders": [1], "t0": t0, "t1": t1}
+    if jobs is not None:
+        t["jobs"] = jobs
+    return t
+
+
+def _full(channel, dropped):
+    return f"channels_nats: mailbox for {channel} is full (capacity 100); {dropped} message(s) dropped so far"  # noqa: E501
+
+
+def _room(channel, dropped):
+    return (
+        f"channels_nats: mailbox for {channel} has room again after dropping {dropped} message(s)"  # noqa: E501
+    )
+
+
+def test_p2_nats_drops_sums_episodes_per_channel():
+    c = _checks()
+    lines = [_full(CH_A, 1), _full(CH_B, 1), _full(CH_A, 7), _room(CH_A, 9), _full(CH_A, 2)]
+    # 구간 1 은 "room again" 의 9, 구간 2 는 끝까지 차 있어 마지막 누적 2. 다른 채널은 따로.
+    assert c.nats_drops(lines, CH_A) == 11
+    assert c.nats_drops(lines, CH_B) == 1
+    assert c.nats_drops([], CH_A) == 0
+
+
+def test_p2_each_requires_every_id_once_in_order():
+    c = _checks()
+    spec = {"n": 5, "expect": "each"}
+    ok = _trial(_worker(1, CH_A, range(5)), _worker(2, CH_B, range(5)))
+    assert c.delivery_problems(spec, ok) == []
+    lost = _trial(_worker(1, CH_A, [0, 1, 2, 4]), _worker(2, CH_B, range(5)))
+    assert any("received 4/5, lost 1" in p for p in c.delivery_problems(spec, lost))
+    dup = _trial(_worker(1, CH_A, [0, 1, 1, 2, 3, 4]), _worker(2, CH_B, range(5)))
+    assert any("duplicate" in p for p in c.delivery_problems(spec, dup))
+    order = _trial(_worker(1, CH_A, [1, 0, 2, 3, 4]), _worker(2, CH_B, range(5)))
+    assert any("out of order" in p for p in c.delivery_problems(spec, order))
+    one = _trial(_worker(1, CH_A, range(5)))
+    assert any("1 workers reported" in p for p in c.delivery_problems(spec, one))
+
+
+def test_p2_errors_and_unknown_ids_always_fail():
+    c = _checks()
+    spec = {"n": 3, "expect": "record"}
+    bad = _trial(
+        _worker(1, "lab.plain.k", [0, 7], errors=["FlushTimeoutError: x"]),
+        _worker(2, "lab.plain.k", [1]),
+        errors=["0 NoServersError: y"],
+    )
+    problems = c.delivery_problems(spec, bad)
+    assert any("send errors" in p for p in problems)
+    assert any("receive errors" in p for p in problems)
+    assert any("unknown ids [7]" in p for p in problems)
+
+
+def test_p2_split_queue_group_needs_union_once_and_both_workers():
+    c = _checks()
+    spec = {"n": 4, "expect": "split"}
+    ch = "lab.plain.k"
+    assert c.delivery_problems(spec, _trial(_worker(1, ch, [0, 2]), _worker(2, ch, [1, 3]))) == []
+    both = _trial(_worker(1, ch, [0, 1, 2]), _worker(2, ch, [2, 3]))
+    assert any("more than one worker" in p for p in c.delivery_problems(spec, both))
+    starved = _trial(_worker(1, ch, range(4)), _worker(2, ch, []))
+    assert any("no share" in p for p in c.delivery_problems(spec, starved))
+    lost = _trial(_worker(1, ch, [0]), _worker(2, ch, [3]))
+    assert any("lost 2" in p for p in c.delivery_problems(spec, lost))
+
+
+def test_p2_lossy_allows_loss_but_not_drops_or_duplicates():
+    c = _checks()
+    spec = {"n": 10, "expect": "lossy"}
+    ch = "lab.plain.k"
+    assert c.delivery_problems(spec, _trial(_worker(1, ch, [0, 4]), _worker(2, ch, [5]))) == []
+    dropped = _trial(_worker(1, ch, [0], nats_log=[_full(ch, 3)]), _worker(2, ch, []))
+    assert any("mailbox drop" in p for p in c.delivery_problems(spec, dropped))
+
+
+def test_p2_drops_loss_must_equal_logged_drops():
+    c = _checks()
+    spec = {"n": 4, "expect": "drops"}
+    ok = _trial(
+        _worker(1, CH_A, [0, 1], nats_log=[_full(CH_A, 1), _room(CH_A, 2)]),
+        _worker(2, CH_B, range(4)),
+    )
+    assert c.delivery_problems(spec, ok) == []
+    silent = _trial(_worker(1, CH_A, [0, 1]), _worker(2, CH_B, range(4)))
+    assert any("lost 2 != mailbox drops 0" in p for p in c.delivery_problems(spec, silent))
+
+
+def test_p2_worker_sender_must_not_be_the_receiver():
+    c = _checks()
+    spec = {"n": 2, "expect": "each"}
+    workers = (_worker(1, CH_A, range(2)), _worker(2, CH_B, range(2)))
+    good = _trial(*workers, jobs=[{"to": CH_A, "sender": 2}, {"to": CH_B, "sender": 1}])
+    assert c.delivery_problems(spec, good) == []
+    self_send = _trial(*workers, jobs=[{"to": CH_A, "sender": 1}])
+    assert any("its own channel" in p for p in c.delivery_problems(spec, self_send))
+
+
+def test_p2_summary_counts_cancels_near_the_send_window():
+    c = _checks()
+    trial = _trial(
+        _worker(1, "lab.plain.k", [0], cancel_times=[9.0, 9.96, 10.5, 11.04, 12.0]),
+        _worker(2, "lab.plain.k", [1]),
+    )
+    s = c.delivery_summary({"n": 3}, trial)
+    assert s["workers"][0]["cancels_near_send"] == 3
+    assert s["union_lost"] == 1 and s["lost_ids"] == [2] and s["total"] == 2
 
 
 def _benchstat():

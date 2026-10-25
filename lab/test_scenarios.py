@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -16,6 +17,8 @@ import urllib.request
 import pytest
 from _checks import (
     COARSE_SAMPLE_GAP,
+    delivery_problems,
+    delivery_summary,
     error_episodes,
     full_outage_deadline,
     full_outage_problems,
@@ -27,7 +30,7 @@ from _checks import (
     stale_dirs,
     template_fingerprint,
 )
-from _lab import Stack, boot_lines, decision, http_json, log
+from _lab import OUT, RUN_ID, Stack, boot_lines, decision, http_json, log
 
 META = ".app.sqlite3-litestream"
 
@@ -99,7 +102,7 @@ def key_lines(text: str, *needles: str) -> list[str]:
 # --- 배포 프로필 종단 검증 ---------------------------------------------------------------------
 
 
-def _profile_stop_check(stack: Stack, rec: dict, prefix: str, workers: int) -> None:
+def _profile_stop_check(stack: Stack, rec: dict, prefix: str, workers: int, during=None) -> None:
     # 이름 있는 빈 볼륨을 처음 붙일 때 이미지의 /data 소유자가 복사되는가
     owner = (
         stack.compose(
@@ -161,6 +164,9 @@ def _profile_stop_check(stack: Stack, rec: dict, prefix: str, workers: int) -> N
     rec["doctor_channels"] = key_lines(doctor.out, "backend")
     assert doctor.rc == 0, doctor.text
 
+    if during is not None:
+        during(stack, rec)
+
     write_rows(stack.host_port("app"), 400)
     # 쓰기 직후 곧바로 docker stop: 마지막 sync 가 400건을 모두 올리는가(D1a 의 ASGI 판)
     rc, took, logs = stack.stop_app("app")
@@ -176,6 +182,7 @@ def _profile_stop_check(stack: Stack, rec: dict, prefix: str, workers: int) -> N
         "exit",
     )
     assert rc == 0
+    assert took < 30, took  # stop_grace_period 30s 안(SIGKILL 이 아님)
     replica = stack.replica(prefix)
     rec["replica_after_stop"] = replica
     assert replica.get("rows") == 400 and replica.get("integrity") == "ok"
@@ -199,13 +206,110 @@ def test_P1_single_server_compose(run_id, rec):
         stack.down()
 
 
+# P2 채널 레이어 전달(#66). 기대값은 docs/research/lab-2026-10-26-multiproc-nats.md §1.
+# 수신은 uvicorn 워커 2개(notes/chanlab.py), 송신은 별도 프로세스 또는 워커.
+D2_TRIALS = int(os.environ.get("LAB_D2_TRIALS", "20"))
+CHANNEL_SPECS = [
+    {"id": "G-steady", "kind": "group", "pace": 0.002, "expect": "each"},
+    {"id": "G-cancel", "kind": "group", "mode": "cancel", "timeout": 0.001, "pace": 0.002,
+     "expect": "each"},
+    {"id": "G-worker", "kind": "group", "sender": "worker", "pace": 0.002, "expect": "each"},
+    {"id": "S-steady", "kind": "specific", "pace": 0.002, "expect": "each"},
+    {"id": "S-cancel", "kind": "specific", "mode": "cancel", "timeout": 0.001, "pace": 0.002,
+     "expect": "each"},
+    {"id": "S-worker", "kind": "specific", "sender": "worker", "pace": 0.002, "expect": "each"},
+    {"id": "P-steady", "kind": "plain", "pace": 0.002, "expect": "split"},
+    {"id": "P-cancel", "kind": "plain", "mode": "cancel", "timeout": 0.001, "pace": 0.005,
+     "expect": "lossy"},
+    {"id": "BURST", "kind": "group", "pace": 0, "expect": "drops"},
+    {"id": "NOCLOSE", "kind": "group", "pace": 0.002, "expect": "each", "close": False},
+    # D2(docs/research/sqlite-django-package-review-v0.md)와 같은 꼴: 일반 채널 경쟁 수신 둘,
+    # wait_for 0.5초, 200건 버스트. 수신 쪽 capacity 기본(100) / 1000.
+    {"id": "D2-cap100", "kind": "plain", "mode": "cancel", "timeout": 0.5, "pace": 0,
+     "expect": "record", "trials": D2_TRIALS},
+    {"id": "D2-cap1000", "kind": "plain", "mode": "cancel", "timeout": 0.5, "pace": 0,
+     "expect": "record", "trials": D2_TRIALS, "capacity": 1000},
+    # 수신 루프를 남겨 둔 채 docker stop 한다(_profile_stop_check 의 종료 단언).
+    {"id": "LIVE", "kind": "group", "pace": 0.002, "expect": "each", "keep": True},
+]  # fmt: skip
+
+
+def _compact(spec: dict, trial: dict) -> dict:
+    s = delivery_summary(spec, trial)
+    keys = ("received", "lost", "dup", "drops", "cancels", "cancels_near_send", "in_order")
+    return {
+        "workers": [{k: w[k] for k in ("pid", *keys)} for w in s["workers"]],
+        "total": s["total"],
+        "union_lost": s["union_lost"],
+        "lost_ids": s["lost_ids"][:20],
+        "ready_s": trial["ready_s"],
+        "probes_sent": trial["probes_sent"],
+        "send_s": round(trial["t1"] - trial["t0"], 3),
+        "senders": s["senders"],
+    }
+
+
+def _p2_channels(stack: Stack, rec: dict) -> None:
+    versions = stack.compose(
+        "exec", "-T", "app", "python", "-c",
+        "import importlib.metadata as m, json; print(json.dumps({p: m.version(p) for p in "
+        "('channels-nats', 'channels', 'nats-py', 'msgpack', 'Django', 'uvicorn')}))",
+    )  # fmt: skip
+    rec["channel_versions"] = json.loads(versions.out.strip().splitlines()[-1])
+    assert rec["channel_versions"]["channels-nats"] == "0.10.0"
+
+    raw, results, problems = {}, {}, {}
+    for spec in CHANNEL_SPECS:
+        spec = {"n": 200, **spec}
+        t0 = time.monotonic()
+        res = stack.compose(
+            "exec", "-T", "app", "timeout", "300", "python", "/app/lab_tools/chanlab_run.py",
+            json.dumps(spec), check=False, timeout=360,
+        )  # fmt: skip
+        took = round(time.monotonic() - t0, 2)
+        log(f"P2 channels {spec['id']}: rc {res.rc} in {took}s")
+        if res.rc != 0:
+            problems[spec["id"]] = [f"runner rc {res.rc}: {res.text[-1500:]}"]
+            continue
+        out = json.loads(res.out.strip().splitlines()[-1])
+        raw[spec["id"]] = out
+        trials = out["trials"]
+        results[spec["id"]] = {
+            "runner_s": took,
+            "run_s": out["run_s"],
+            "close_s": out.get("close_s"),
+            "trials": [_compact(spec, t) for t in trials],
+        }
+        found = [
+            f"trial {i}: {p}" for i, t in enumerate(trials) for p in delivery_problems(spec, t)
+        ]
+        if found:
+            problems[spec["id"]] = found
+    OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / f"chan-{RUN_ID}.json").write_text(json.dumps(raw), encoding="utf-8")
+    rec["channels"] = results
+    rec["channel_problems"] = problems
+    if problems:
+        rec["app_log_tail"] = stack.logs("app")[-4000:]
+    assert not problems, problems
+
+
 @pytest.mark.profile
 def test_P2_multiproc_compose(run_id, rec):
-    """single-server-multiproc 문서의 compose·entrypoint(uvicorn 워커 2, nats 컨테이너)."""
+    """single-server-multiproc 문서의 compose·entrypoint(uvicorn 워커 2, nats 컨테이너).
+
+    channels-nats([nats] extra)를 넣은 이미지로, 워커 사이 채널 레이어 전달을 함께 본다(#66).
+    """
     stack = Stack("p2", env={"WEB_WORKERS": "2"})
     try:
         stack.up_infra()
-        _profile_stop_check(stack, rec, f"p2-{run_id}", workers=2)
+        # 앱은 --no-deps 로 띄우므로(up_app) 문서 compose 의 depends_on 대신 브로커를 먼저 띄운다
+        # (multiproc 문서 §4 "브로커를 먼저 띄운다"). #66 전의 P2 는 nats 없이 돌았다.
+        stack.compose("up", "-d", "nats")
+        _profile_stop_check(stack, rec, f"p2-{run_id}", workers=2, during=_p2_channels)
+        rec["shutdown_channel_lines"] = key_lines(
+            stack.logs("app"), "channels_nats", "Traceback", "Task was destroyed", "Error"
+        )
     finally:
         stack.down()
 

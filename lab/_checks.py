@@ -4,12 +4,16 @@
   격리 디렉터리에 같은 해시로 있는지(``template_fingerprint``·``quarantine_problems``).
 - L8a: S3 전체 단절 동안 헬스가 제한 시간 안에 ``unknown(stale)`` 로 바뀌고 복구 전까지
   유지되는지(``full_outage_problems``). 표본 인덱스가 아니라 경과 시간과 결과의 age 로 본다.
+- P2(#66): 워커 사이 채널 레이어 전달의 손실·중복·용량 드롭(``delivery_summary``·
+  ``delivery_problems``). 입력은 ``lab_tools/chanlab_run.py`` 의 시도 원자료다.
 
 입력은 ``lab_tools/inspect_data.py`` 의 스냅샷(``{"entries": {상대경로: {...}}}``)과 헬스 표본이다.
 표준 라이브러리만 쓴다.
 """
 
 from __future__ import annotations
+
+import re
 
 DB = "app.sqlite3"
 META = ".app.sqlite3-litestream"
@@ -327,4 +331,114 @@ def ltx_process_problems(
     left = sorted({pid for _t, procs in after for pid, _s in procs} & set(span))
     if left:
         problems.append(f"ltx pids from the outage still running after recovery: {left}")
+    return problems
+
+
+# --- P2 채널 레이어 전달(#66) -------------------------------------------------------------
+
+# channels-nats 0.10.0 의 용량 드롭 경고(layer.py ``_enqueue``). 첫 건과 그 뒤 60초마다
+# "is full … N message(s) dropped so far", 자리가 나면 "has room again after dropping N".
+_FULL = re.compile(r"mailbox for (\S+) is full \(capacity \d+\); (\d+) message\(s\) dropped so far")
+_ROOM = re.compile(r"mailbox for (\S+) has room again after dropping (\d+) message\(s\)")
+
+
+def nats_drops(lines: list[str], channel: str) -> int:
+    """``channel`` 의 mailbox 가 버린 메시지 수. 드롭 구간마다 마지막 누적 값을 더한다."""
+    total = current = 0
+    for line in lines:
+        if (m := _FULL.search(line)) and m[1] == channel:
+            current = int(m[2])
+        elif (m := _ROOM.search(line)) and m[1] == channel:
+            total += int(m[2])
+            current = 0
+    return total + current
+
+
+def delivery_summary(spec: dict, trial: dict, near: float = 0.05) -> dict:
+    """시도 하나의 워커별 수신 요약. ``near`` 는 송신 창 앞뒤로 취소를 세는 여유(초)."""
+    n = spec["n"]
+    want = set(range(n))
+    workers = []
+    for w in trial["workers"]:
+        ids = w["ids"]
+        got = set(ids)
+        workers.append(
+            {
+                "pid": w["pid"],
+                "received": len(ids),
+                "dup": len(ids) - len(got),
+                "unknown": sorted(got - want)[:20],
+                "lost": len(want - got),
+                "in_order": ids == sorted(ids),
+                "drops": nats_drops(w["nats_log"], w["channel"]),
+                "cancels": w["cancels"],
+                "cancels_near_send": sum(
+                    1 for t in w["cancel_times"] if trial["t0"] - near <= t <= trial["t1"] + near
+                ),
+                "errors": w["errors"],
+            }
+        )
+    every = [i for w in trial["workers"] for i in w["ids"]]
+    union = set(every)
+    return {
+        "workers": workers,
+        "total": len(every),
+        "cross_dup": len(every) - len(union),
+        "union_lost": len(want - union),
+        "lost_ids": sorted(want - union)[:50],
+        "send_errors": trial["errors"],
+        "senders": trial["senders"],
+    }
+
+
+def delivery_problems(spec: dict, trial: dict) -> list[str]:
+    """계약에 맞지 않는 것을 문장으로(빈 목록 = 통과). ``spec["expect"]``:
+
+    - ``each``: 워커마다 0..n-1 을 정확히 한 번씩, 보낸 순서로(그룹·프로세스 전용 채널).
+    - ``split``: 일반 채널 큐 그룹. 워커 합이 0..n-1 을 정확히 한 번씩, 두 워커 모두 1건 이상.
+    - ``lossy``: 일반 채널 취소 공백. 손실은 허용, 중복·모르는 id·용량 드롭은 없음.
+    - ``drops``: 버스트. 워커마다 손실 = 그 mailbox 의 용량 드롭 수, 중복 없음.
+    - ``record``: 판정 대상(D2 재현). 중복·모르는 id 만 본다.
+
+    모든 경우에 송신 예외·수신 루프 예외가 없어야 하고, 워커 수가 ``spec["workers"]``(기본 2)다.
+    """
+    s = delivery_summary(spec, trial)
+    n = spec["n"]
+    expect = spec["expect"]
+    problems = []
+    if len(s["workers"]) != spec.get("workers", 2):
+        problems.append(f"{len(s['workers'])} workers reported")
+    if s["send_errors"]:
+        problems.append(f"send errors: {s['send_errors'][:3]}")
+    for w in s["workers"]:
+        tag = f"pid {w['pid']}"
+        if w["errors"]:
+            problems.append(f"{tag}: receive errors {w['errors'][:3]}")
+        if w["unknown"]:
+            problems.append(f"{tag}: unknown ids {w['unknown']}")
+        if w["dup"]:
+            problems.append(f"{tag}: {w['dup']} duplicate(s)")
+        if expect == "each":
+            if w["received"] != n or w["lost"]:
+                problems.append(f"{tag}: received {w['received']}/{n}, lost {w['lost']}")
+            if not w["in_order"]:
+                problems.append(f"{tag}: out of order")
+        elif expect == "drops" and w["lost"] != w["drops"]:
+            problems.append(f"{tag}: lost {w['lost']} != mailbox drops {w['drops']}")
+        elif expect in ("split", "lossy") and w["drops"]:
+            problems.append(f"{tag}: {w['drops']} mailbox drop(s)")
+    if expect in ("split", "lossy", "record"):
+        if s["cross_dup"] - sum(w["dup"] for w in s["workers"]):
+            problems.append("a message reached more than one worker")
+        if s["total"] > n:
+            problems.append(f"received {s['total']} > sent {n}")
+    owner = {w["channel"]: w["pid"] for w in trial["workers"]}
+    for job in trial.get("jobs", []):
+        if owner.get(job["to"]) == job["sender"]:
+            problems.append(f"worker {job['sender']} sent to its own channel")
+    if expect == "split":
+        if s["union_lost"]:
+            problems.append(f"lost {s['union_lost']}: {s['lost_ids'][:10]}")
+        if any(w["received"] == 0 for w in s["workers"]):
+            problems.append("a worker got no share of the queue group")
     return problems

@@ -1,11 +1,12 @@
 # single-server-multiproc 문서의 compose 에 profile-override.yaml 과 함께 덮는다.
-# 더하는 것: 문서 entrypoint(워커 수 WEB_WORKERS), channels-nats 설정, nats 이미지 고정·라벨.
-# 채널 레이어는 런타임에 쓰지 않는다(channels-nats 미설치, 설정 검사만 — #10 범위).
+# 더하는 것: 문서 entrypoint(워커 수 WEB_WORKERS), channels-nats 설정, nats 이미지 고정·라벨,
+# channels-nats 를 넣은 이미지(lab/nats.Dockerfile — 문서 Dockerfile 이미지 + [nats] extra, #66).
 x-labels: &labels
   io.itda.dso-lab: "1"
 
 services:
   app:
+    image: dso-lab-app-nats:${LAB_TAG:-dev}
     entrypoint: ["/app/entrypoint-multiproc.sh"]
     environment:
       WEB_WORKERS: ${WEB_WORKERS:-2}

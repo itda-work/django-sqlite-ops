@@ -54,6 +54,9 @@ build() {
   # uv build 가 .gitignore 도 남긴다. mktemp 로 만든 디렉터리 하나만 지운다.
   rm -rf -- "${dist:?}"
   docker build --label io.itda.dso-lab=1 -t "dso-lab-app:$LAB_TAG" "$BUILD"
+  # P2(#66): 위 이미지에 channels-nats([nats] extra)를 더한 이미지
+  docker build --label io.itda.dso-lab=1 --build-arg "BASE=dso-lab-app:$LAB_TAG" \
+    -f "$BUILD/nats.Dockerfile" -t "dso-lab-app-nats:$LAB_TAG" "$BUILD"
 }
 
 down() {
