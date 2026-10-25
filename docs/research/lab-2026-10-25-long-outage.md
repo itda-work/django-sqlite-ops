@@ -79,6 +79,26 @@
 
 부팅 줄은 읽혔다(`litestream version=0.5.17`, `initialized db`, `replicating to ... endpoint=http://toxiproxy:18333`, `starting compaction monitor` …). 그러니 0줄은 '로그를 못 읽음'이 아니다. **연결 거부든 양방향 무응답이든, 90초 단절 동안 Litestream 은 아무 줄도 남기지 않았다.** 업로드 실패를 알리는 WARN/ERROR 도 없었다. D3 와 같은 결론을 분 단위 단절에서 확인한 것이다. 단절을 알린 로그는 헬스의 `health 'default': remote lookup failed: litestream ltx timed out after 30s` 한 줄뿐이었다(같은 메시지는 반복하지 않는다).
 
+## amd64 실행 (GitHub Actions)
+
+`.github/workflows/lab.yml`(ubuntu-latest, linux/amd64)을 `-f scenarios=L8` 로 돌렸다. 실행은 오케스트레이터가 했고, artifact 는 `gh run download` 로 받아 읽었다.
+
+- **run 40196113088**(2026-10-25 13:06Z, 커밋 `b259463` = 양방향 L8d): L8a·L8b·L8c·L8d 4 passed, 292초. 판정 문제·하네스 문제 0건.
+- run 40194194089(커밋 `500384e`, 리뷰 1 반영 전, L8d 는 `downstream` toxic 만): 4 passed. 응답 유실 실행이라 아래 표에는 넣지 않았다.
+
+| | L8c 연결 거부 | L8d 양방향 무응답 |
+|---|---|---|
+| 헬스 표본 최대 간격 | 1.1초 | 1.1초 |
+| 첫 `stale` | 5.0초 | 5.0초 |
+| `remote_error` 구간 시작 | 31.1, 63.2초 | 31.1, 63.2초 |
+| `ltx` 를 본 표본 / 동시 최대 / 서로 다른 PID / 복구 뒤 | 26 / 1 / 3 / 0 | 26 / 1 / 3 / 0 |
+| 쓰기 성공 / 오류 | 513 / 0 | 484 / 0 |
+| 복구 → `caught_up` | 7.0초 | 1.0초 |
+| 복구 뒤 복제본 | 533 = 533, integrity ok | 504 = 504, ok |
+| 단절 중 Litestream 줄 | 0 | 0 |
+
+arm64(colima)와 같은 모양이다. 첫 `remote_error` 는 31초대이고, 구간 간격은 약 32초다. 러너에서도 표본 간격이 1.1초라 경계(32 ± 2초)까지 여유가 있었다.
+
 ## 여러 DB 별칭 (코드상 확인 + 주입 시계 재현)
 
 랩 앱은 별칭 하나뿐이라 랩에서는 재지 않았다. `Monitor._run` 은 스레드 하나가 `refresh_once()` 에서 모든 별칭을 순서대로 조회한다. 그래서 한 별칭의 조회가 30초 매달리면 정상 별칭의 관측 간격도 `30 + REFRESH`(+ 다른 조회 시간)로 늘어난다. 그 값이 `REFRESH × 3` 을 넘으면 — 즉 매달린 시간이 `2 × REFRESH` 를 넘으면 — **정상 별칭도 `stale`(unknown)** 이 된다.
@@ -90,6 +110,5 @@
 ## 미검증
 
 - 여러 별칭을 가진 실제 컨테이너(랩 확장 필요), `REFRESH` 기본값(15초)에서의 실제 시계열.
-- GitHub Actions amd64 러너에서의 L8c·L8d(`gh workflow run lab.yml -f scenarios=L8`).
 - 분 단위보다 긴 단절(수십 분~시간), 단절 중 Litestream 프로세스의 메모리·L0 누적.
 - 다른 S3 구현·실제 클라우드 S3 에서 연결 거부 시 `ltx` 가 같은 방식으로 매달리는지.

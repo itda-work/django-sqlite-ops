@@ -664,7 +664,9 @@ def _l8_long(stack: Stack, run_id: str, rec: dict, label: str, cut, restore) -> 
         try:
             restore()
         except Exception as exc:  # noqa: BLE001
-            log(f"restore failed ({type(exc).__name__}: {exc}); resetting proxies")
+            # 판정은 reset 뒤 상태로 하지만, 복구 API 가 한 번 실패했다는 사실은 결과에 남긴다
+            rec["restore_error"] = f"{type(exc).__name__}: {exc}"[:300]
+            log(f"restore failed ({rec['restore_error']}); resetting proxies")
             stack.reset_proxies()
     if sampler.ident is not None:
         sampler.join()

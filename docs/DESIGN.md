@@ -580,7 +580,7 @@ SQLITE_OPS = {
 | L6 | `--on-unknown restore` 진행 중 kill → 재시작 | 반쯤 옮겨진 상태 없음, 재실행으로 완료 | 통과(rename 8곳 모두에서 kill — kill 시 rename 수 = k 확인, 재실행 완료, 템플릿의 DB·사이드카·메타 하위 8항목이 한 격리 디렉터리에 같은 해시, D-14 지점은 격리 2개) |
 | L7 | 복원 실패(S3 객체 손상) | exit 4, 로컬 무변경 | 통과(새 컨테이너·격리 경로 모두 exit 4, 로컬 해시 그대로) |
 | L8 | 헬스: S3 20초 끊김 | `backlog` → 복구 후 `caught_up` | 조건부: 업로드만 끊기면(L8b) `backlog` → `caught_up`. 조회까지 끊기면(L8a) 랩의 허용 시간 10초(가정: `REFRESH × 3` + 진행 중 조회 여유 `REFRESH` + 표본 간격 + 1초. 조회 시간에서 도출된 보장 상한은 아니다) 안에 `unknown`(`stale`)으로 바뀌어 유지 → `caught_up` — §7 표대로 원격 조회 실패는 `unknown` 이 먼저다 |
-| L8c·L8d | 헬스: S3 90초 끊김(조회 타임아웃 30초의 3배) — 연결 거부 / 양방향 무응답(`timeout` toxic, `downstream`+`upstream`) | `unknown` 유지(`stale` 과 `remote_error` 가 `REFRESH + 30` 초 주기로 번갈아), strict 503, 매달린 `ltx` 없음 → 복구 후 `caught_up` | 통과(2026-10-25, L8c 3회·양방향 L8d 2회): 첫 `stale` 5.0–5.1초, `remote_error` 구간 31.3–31.6·63.0–64.0초 시작, `ltx` 동시 최대 1·서로 다른 PID 3·복구 뒤 0, 쓰기 오류 0, 복구 2.0–7.1초 뒤 `caught_up`. 단절 중 Litestream 로그 0줄(WARN/ERROR 포함). 처음 두 L8d 실행은 toxic 이 `downstream` 하나라 응답 유실만이었다([`lab-2026-10-25-long-outage.md`](research/lab-2026-10-25-long-outage.md)) |
+| L8c·L8d | 헬스: S3 90초 끊김(조회 타임아웃 30초의 3배) — 연결 거부 / 양방향 무응답(`timeout` toxic, `downstream`+`upstream`) | `unknown` 유지(`stale` 과 `remote_error` 가 `REFRESH + 30` 초 주기로 번갈아), strict 503, 매달린 `ltx` 없음 → 복구 후 `caught_up` | 통과(2026-10-25, colima arm64 에서 L8c 3회·양방향 L8d 2회, GitHub Actions amd64 run 40196113088 에서 1회씩): 첫 `stale` 5.0–5.1초, `remote_error` 구간 31.3–31.6·63.0–64.0초 시작, `ltx` 동시 최대 1·서로 다른 PID 3·복구 뒤 0, 쓰기 오류 0, 복구 2.0–7.1초 뒤 `caught_up`. 단절 중 Litestream 로그 0줄(WARN/ERROR 포함). 처음 두 L8d 실행은 toxic 이 `downstream` 하나라 응답 유실만이었다([`lab-2026-10-25-long-outage.md`](research/lab-2026-10-25-long-outage.md)) |
 
 배포 프로필 종단 검증(P1·P2): 문서의 Dockerfile·compose·entrypoint·settings 를 그대로 띄워 첫 배포·`check --deploy`·`sqlite_doctor`·`docker stop`(uvicorn 워커 1·2: exit 0, 대표 실행 0.47·0.72초, 400/400 복제)·재부팅·빈 볼륨 소유자 복사를 확인했다.
 
@@ -603,7 +603,7 @@ SQLITE_OPS = {
 - PRAGMA 후보의 5% 크기 효과: #26 실행은 반복 간 흔들림(약 7%)이 커서 검출하지 못했다. `cache_size` 단독 악화의 원인은 최소 재현에서 확인했다(#27). 남은 것: 16 스레드에서 더 나빠지는 데 전역 mutex 경합이 얼마나 기여하는지, 16 스레드 pk 읽기의 악화, 혼합 부하에서 `cache_mmap`·`all4` 가 나빠진 두 칸, 랩에서 정렬 비율·`cache_mmap` 을 바꾼 확인(랩 인과), amd64·SQLite 3.37.2 에서의 재현([`cache-size-2026-10-12.md`](research/cache-size-2026-10-12.md)#미검증)
 - 실제 클라우드 S3·R2·Tigris (미검증. 비용이 들어 마스터 승인 필요)
 - 회귀 랩은 SeaweedFS 4.48 + toxiproxy 2.12.0 으로만 돌았다(colima linux/arm64 와 GitHub Actions ubuntu-latest linux/amd64, 둘 다 11/11 통과 — [`lab-2026-10-08.md`](research/lab-2026-10-08.md#amd64-실행-github-actions-25)). 다른 S3 구현은 미검증
-- 긴 S3 단절(#65, 2026-10-25): 90초 단절의 `stale` ↔ `remote_error` 전이와 Litestream 로그(WARN/ERROR 0줄)는 L8c·L8d 로 재현했다(colima arm64). 남은 것: 별칭이 여럿인 컨테이너에서 한 별칭의 매달림이 다른 별칭에 주는 영향(코드상 확인·주입 시계 단언만), 기본 `REFRESH` 15초에서의 실제 시계열, 수십 분 이상의 단절, amd64 러너 실행 (미검증)
+- 긴 S3 단절(#65, 2026-10-25): 90초 단절의 `stale` ↔ `remote_error` 전이와 Litestream 로그(WARN/ERROR 0줄)는 L8c·L8d 로 재현했다(colima arm64). GitHub Actions amd64 러너(run 40196113088, 2026-10-25, 양방향 L8d 포함 4 passed)에서도 같았다. 남은 것: 별칭이 여럿인 컨테이너에서 한 별칭의 매달림이 다른 별칭에 주는 영향(코드상 확인·주입 시계 단언만), 기본 `REFRESH` 15초에서의 실제 시계열, 수십 분 이상의 단절 (미검증)
 - `single-server-multiproc` 의 채널 레이어 런타임(channels-nats 메시지 전달)을 컨테이너에서 (미검증. 랩 P2 는 설정 검사·워커 수까지)
 - Windows 에서 boot CLI 의 파일 잠금과 디렉터리 rename 원자성 [확인 필요]. 그때까지 boot 는 `fcntl` 이 없으면 exit 64 로 거부한다
 - channels-nats D2 의 196/200 이 하네스 문제인지 [확인 필요]
