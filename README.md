@@ -396,7 +396,7 @@ python manage.py sqlite_doctor --restore-test \
 | `--database ALIAS` | 볼 별칭(반복). 없으면 **쓰기 파일 DB 인 sqlite3 별칭 전부**를 복원하고, 메모리·읽기 전용·VFS 별칭은 `alias` `ok` 'skipped' 로만 적는다(종료 코드에 영향 없음. URI 를 판정할 수 없는 별칭이 있으면 아래 보호 규칙으로 거부된다). 직접 고른 별칭이 쓰기 파일 DB 가 아니면 `unknown`. 복원할 쓰기 DB 가 하나도 없으면 `error`(exit 2) |
 | `--integrity full\|quick` | `full`(기본, `integrity_check`) 또는 `quick`(`quick_check`) |
 | `--restore-timeout SEC` | 별칭마다 복원의 시간 제한(기본 600초) |
-| `--integrity-timeout SEC` | 무결성 검사의 **별도** 시간 제한(기본 1800초). 넘으면 검사를 끊고 `integrity` `error` |
+| `--integrity-timeout SEC` | 무결성 검사의 **별도** 시간 제한(기본 1800초). 넘으면 검사를 끊고 `integrity` `error`. 시한이 검사 시작 전에 지나도 10ms 간격으로 다시 끊으므로 검사가 끝까지 돌지 않는다(2026-10-25 확인, #63) |
 | `--keep` | 모두 통과해도 복원본을 남긴다 |
 | `--litestream BIN`·`--json` | 위와 같다 |
 

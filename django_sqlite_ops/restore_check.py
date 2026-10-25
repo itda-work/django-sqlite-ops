@@ -64,6 +64,8 @@ _LTX_TIMEOUT = litestream.DEFAULT_LTX_TIMEOUT
 _SPACE_FACTOR = (6, 5)
 # 무결성 실패 때 message 에 담는 오류 줄 수.
 _MAX_PROBLEMS = 5
+# 시한이 지난 뒤 검사가 끝날 때까지 interrupt() 를 다시 부르는 간격(초, #63).
+_INTERRUPT_RETRY = 0.01
 _PRAGMAS = {"full": "integrity_check", "quick": "quick_check"}
 NO_TARGET = "no write file database to restore-test"
 
@@ -169,8 +171,9 @@ def check_integrity(
     """복원본에 ``PRAGMA integrity_check``/``quick_check`` 를 우리가 실행한다(D-24).
 
     ``(무결성 ok 여부, 항목)``. 항목은 ``integrity`` 하나와, 검사가 끝까지 돌았으면 구조 요약
-    (``tables``·``page_count``)이다. 시간이 ``timeout`` 을 넘으면 타이머 스레드가
-    ``Connection.interrupt()`` 로 끊는다(700MB full 검사에서 1ms 안에 멈춤, #54 실측).
+    (``tables``·``page_count``)이다. 시간이 ``timeout`` 을 넘으면 타이머 스레드가 검사가 끝날
+    때까지 ``_INTERRUPT_RETRY`` 간격으로 ``Connection.interrupt()`` 를 부른다(700MB full 검사에서
+    1ms 안에 멈춤, #54 실측. 문장 시작 전 발동도 다음 재시도에서 끊긴다, #63).
     """
     pragma = _PRAGMAS[mode]
     try:
@@ -179,13 +182,20 @@ def check_integrity(
         return False, [_item(alias, "integrity", "error", mode, None, f"cannot open: {exc}")]
     try:
         fired = threading.Event()
+        done = threading.Event()
 
         def stop() -> None:
+            if done.wait(timeout):
+                return
             fired.set()
-            conn.interrupt()
+            # 실행 중인 문장이 없을 때의 interrupt() 는 no-op 이라(SQLite c3ref/interrupt), 시한이
+            # 문장 시작 전에 지나면 한 번으로는 끊지 못한다. 검사가 끝날 때까지 다시 끊는다(#63).
+            while True:
+                conn.interrupt()
+                if done.wait(_INTERRUPT_RETRY):
+                    return
 
-        timer = threading.Timer(timeout, stop)
-        timer.daemon = True
+        timer = threading.Thread(target=stop, daemon=True)
         start = time.monotonic()
         timer.start()
         try:
@@ -194,7 +204,9 @@ def check_integrity(
         except sqlite3.Error as exc:
             rows, failure = None, exc
         finally:
-            timer.cancel()
+            # 타이머 스레드가 끝난 뒤에만 다음 문장(_structure)을 연다. 그 전에 남은 interrupt 는
+            # 실행 중인 문장이 없을 때 걸린 것이라 다음 문장 시작에서 풀린다.
+            done.set()
             timer.join()
         elapsed = time.monotonic() - start
         took = f"{elapsed * 1000:.0f} ms"
@@ -214,8 +226,8 @@ def check_integrity(
                 message = f"{pragma} failed after {took}: {failure}"
             return False, [_item(alias, "integrity", "error", mode, None, message)]
         if fired.is_set() and rows == [("ok",)]:
-            # 시한이 문장 시작 전에 지나면 interrupt() 는 no-op 이라 검사가 끝까지 돈다(SQLite
-            # c3ref/interrupt, #60 재현함). 결과가 ok 여도 예산을 넘겼으니 시간 초과로 본다(§6-2).
+            # 재시도 사이에 검사가 끝나 interrupt() 가 한 번도 실행 중인 문장에 닿지 못한 경계다
+            # (#60·#63). 결과가 ok 여도 예산을 넘겼으니 시간 초과로 본다(§6-2).
             message = (
                 f"timeout: {pragma} did not finish within --integrity-timeout {timeout:g}s "
                 f"(the timer fired but the check was not interrupted; "
@@ -225,8 +237,14 @@ def check_integrity(
         if rows != [("ok",)]:
             shown = " | ".join(str(r[0]) for r in rows[:_MAX_PROBLEMS])
             more = f" (+{len(rows) - _MAX_PROBLEMS} more)" if len(rows) > _MAX_PROBLEMS else ""
+            # 손상 결과와 타이머 발동이 겹치면 두 사실을 함께 적는다(F8 와 같은 규칙, #62 P3-1).
+            also = (
+                f" (the --integrity-timeout {timeout:g}s timer had also fired)"
+                if fired.is_set()
+                else ""
+            )
             return False, [
-                _item(alias, "integrity", "error", mode, None, f"{pragma}: {shown}{more}"),
+                _item(alias, "integrity", "error", mode, None, f"{pragma}: {shown}{more}{also}"),
                 *_structure(conn, alias),
             ]
         return True, [
