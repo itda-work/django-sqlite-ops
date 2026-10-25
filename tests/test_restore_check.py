@@ -469,10 +469,11 @@ def test_integrity_other_error_after_the_timer_fired_reports_both(tmp_path, monk
 
 
 def test_integrity_timer_fired_before_the_check_started_is_timeout(tmp_path, monkeypatch):
-    """시한이 문장 시작 전에 지나도 ``timeout`` 이다(#60).
+    """interrupt() 가 한 번도 실행 중인 문장에 닿지 못해 끝까지 돈 검사도 ``timeout`` 이다(#60).
 
-    실행 중인 문장이 없을 때의 ``sqlite3_interrupt()`` 는 no-op 이라 검사는 끝까지 돈다
-    (SQLite 문서 c3ref/interrupt). 타이머 발동 뒤에야 ``execute`` 에 들어가게 해 그 순서를 강제한다.
+    실행 중인 문장이 없을 때의 ``sqlite3_interrupt()`` 는 no-op 이다(SQLite 문서 c3ref/interrupt).
+    타이머 발동 뒤에야 ``execute`` 에 들어가게 하고, 재시도(#63)는 넘기지 않아 '재시도 사이에 검사가
+    끝난' 경계를 강제한다.
     """
     db = make_db(tmp_path / "ok.db", wal=False)
 
@@ -482,7 +483,8 @@ def test_integrity_timer_fired_before_the_check_started_is_timeout(tmp_path, mon
             self.fired = threading.Event()
 
         def interrupt(self):
-            self.conn.interrupt()
+            if not self.fired.is_set():
+                self.conn.interrupt()
             self.fired.set()
 
         def execute(self, sql):
@@ -503,6 +505,128 @@ def test_integrity_timer_fired_before_the_check_started_is_timeout(tmp_path, mon
     assert "was not interrupted" in message
 
 
+class Rows:
+    def __init__(self, rows):
+        self.rows = rows
+
+    def fetchall(self):
+        return self.rows
+
+
+class LateStart:
+    """첫 ``interrupt()`` 뒤에야 ``execute`` 에 들어가 '문장 전 발동'을 강제한다(#60·#63)."""
+
+    def __init__(self, conn, *, after=None, pause=0.0):
+        self.conn = conn
+        self.after = after
+        self.pause = pause  # 검사 뒤 문장마다 쉬는 시간(초). 남은 재시도가 있으면 그 사이에 찍힌다
+        self.fired = threading.Event()
+        self.interrupts = 0
+        self.interrupts_at_followup = None  # 검사 뒤 첫 문장이 들어온 시점의 interrupt() 호출 수
+        self.ran = None  # 실제 검사 문장이 돈 시간(초). 발동을 기다린 시간은 뺀다
+
+    def interrupt(self):
+        self.interrupts += 1
+        self.conn.interrupt()
+        self.fired.set()
+
+    def execute(self, sql):
+        if sql.startswith("PRAGMA") and "check" in sql:
+            assert self.fired.wait(30)
+            start = time.monotonic()
+            try:
+                rows = self.conn.execute(sql).fetchall()
+            finally:
+                self.ran = time.monotonic() - start
+            if self.after is not None:
+                self.after(self)
+            return Rows(rows)
+        if self.ran is not None:
+            if self.interrupts_at_followup is None:
+                self.interrupts_at_followup = self.interrupts
+            time.sleep(self.pause)
+        return self.conn.execute(sql)
+
+    def close(self):
+        self.conn.close()
+
+
+def test_integrity_timer_fired_before_the_check_started_still_interrupts(tmp_path, monkeypatch):
+    """시한이 문장 시작 전에 지나도 검사가 시한 근처에서 끊긴다(#63).
+
+    첫 ``interrupt()`` 는 실행 중인 문장이 없어 no-op 이다. 타이머가 검사 종료까지 짧은 간격으로
+    다시 끊어야 끝까지 돌지 않는다.
+    """
+    db = make_big_db(tmp_path / "big.db", 100)
+    assert rc.check_integrity(db, "full", 600)[0]  # 페이지 캐시를 데운다
+    start = time.monotonic()
+    assert rc.check_integrity(db, "full", 600)[0]
+    full = time.monotonic() - start
+
+    opened = []
+    real_connect = rc._connect_ro
+
+    def connect(path):
+        opened.append(LateStart(real_connect(path)))
+        return opened[-1]
+
+    monkeypatch.setattr(rc, "_connect_ro", connect)
+    start = time.monotonic()
+    passed, got = rc.check_integrity(db, "full", 0.005)
+    elapsed = time.monotonic() - start
+    assert not passed
+    assert [(i.key, i.level) for i in got] == [("integrity", "error")]
+    message = got[0].message
+    assert message.startswith("timeout: integrity_check did not finish"), message
+    assert "interrupted after" in message, message
+    assert opened[0].interrupts >= 2
+    # 끝까지 돌지 않았다: 문장 자체는 전체 검사의 절반도 돌지 않고 끊겼다. 전체 경과에는 발동을
+    # 기다린 시간과 스레드 기상 지연이 들어가 부하(yes 20개)에서 흔들려 문장 시간과 따로 본다.
+    assert opened[0].ran < full / 2, (opened[0].ran, elapsed, full)
+    assert elapsed < full, (elapsed, full)
+
+
+def test_corrupt_result_with_the_timer_fired_reports_both_and_keeps_the_structure(
+    tmp_path, monkeypatch
+):
+    """손상 결과와 타이머 발동이 겹치면 둘을 함께 적고, 남은 interrupt 가 구조 요약을 끊지 않는다.
+
+    검사 문장이 끝난 직후 ``interrupt()`` 를 한 번 더 불러 '종료 직전 재시도'를 흉내 낸다. 구조 요약
+    문장마다 재시도 간격보다 길게 쉬어, 타이머 스레드가 그때까지 살아 있으면 호출이 찍히게 한다
+    (join 뒤에만 구조 요약을 연다는 불변식, #63 리뷰 1 P2-1).
+    """
+    db = make_corrupt_db(tmp_path / "corrupt.db")
+    opened = []
+    real_connect = rc._connect_ro
+
+    def connect(path):
+        late = LateStart(
+            real_connect(path),
+            after=lambda late: late.conn.interrupt(),
+            pause=3 * rc._INTERRUPT_RETRY,
+        )
+        opened.append(late)
+        return late
+
+    monkeypatch.setattr(rc, "_connect_ro", connect)
+    passed, got = rc.check_integrity(db, "full", 0.005)
+    late = opened[0]
+    assert late.interrupts_at_followup is not None
+    assert late.interrupts == late.interrupts_at_followup, (
+        late.interrupts,
+        late.interrupts_at_followup,
+    )
+    assert not passed
+    assert [(i.key, i.level) for i in got] == [
+        ("integrity", "error"),
+        ("tables", "ok"),
+        ("page_count", "ok"),
+    ]
+    message = got[0].message
+    assert message.startswith("integrity_check: "), message
+    assert message.endswith("(the --integrity-timeout 0.005s timer had also fired)"), message
+
+
 def test_integrity_timeout_interrupts_the_check(tmp_path):
     """제한을 넘긴 full 검사가 ``interrupt()`` 로 실제로 끝난다(#54 실측: 1ms 미만 지연)."""
     db = make_big_db(tmp_path / "big.db")
@@ -513,14 +637,10 @@ def test_integrity_timeout_interrupts_the_check(tmp_path):
     full = time.monotonic() - start
     assert passed
     limit = min(0.005, full / 10)
-    # 부하로 타이머가 문장 시작 전에 발동하면 interrupt() 는 no-op 이고 검사는 끝까지 돈다(#60).
-    # 그 경로는 'was not interrupted' 로 구분되므로, 실제로 끊긴 경우를 볼 때까지 몇 번 더 잰다.
-    for _ in range(5):
-        start = time.monotonic()
-        passed, got = rc.check_integrity(db, "full", limit)
-        elapsed = time.monotonic() - start
-        if "was not interrupted" not in got[0].message:
-            break
+    # 부하로 타이머가 문장 시작 전에 발동해도 재시도가 끊는다(#63). 그래서 다시 잴 필요가 없다.
+    start = time.monotonic()
+    passed, got = rc.check_integrity(db, "full", limit)
+    elapsed = time.monotonic() - start
     assert not passed, (full, limit, elapsed)
     assert [(i.key, i.level) for i in got] == [("integrity", "error")]
     # 'interrupted after' 는 타이머가 발동했고 예외가 interrupted 일 때만 나온다(F8): 검사가 끝나기
