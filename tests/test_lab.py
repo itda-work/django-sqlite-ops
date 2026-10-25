@@ -287,6 +287,144 @@ def test_l8a_clearly_young_stale_fails():
     assert any("age 5.0 < 6" in p for p in problems), problems
 
 
+def _long_outage_timeline(
+    last_ok: float, first_fail_start: float | None = None, outage: float = 90, timeout=30.0
+):
+    """실제 ``health.alias_status`` 로 만든 긴 단절 표본(1초 간격, 0.1초부터, strict HTTP 포함).
+
+    갱신 스레드처럼: 마지막 성공 관측 ``last_ok`` 뒤 ``REFRESH``(2초)를 쉬고 시작한 조회가
+    ``timeout`` 뒤 ``RemoteError`` 로 끝나고, 다시 2초 쉬고 조회한다(``first_fail_start`` 로 첫
+    실패 조회의 시작을 바꿀 수 있다).
+    """
+    from django_sqlite_ops.boot.decide import RemoteError, RemoteTxid
+    from django_sqlite_ops.health import Sample, alias_status
+    from django_sqlite_ops.wal import IN_SYNC, WalEvidence
+
+    observed = [(last_ok, True)]
+    start = last_ok + 2 if first_fail_start is None else first_fail_start
+    while start + timeout <= outage + timeout:
+        observed.append((start + timeout, False))
+        start += timeout + 2
+    timeline = []
+    for t in [0.1 + i for i in range(int(outage))]:
+        at, ok = max(o for o in observed if o[0] <= t)
+        sample = Sample(
+            observed=at,
+            checked_at=0,
+            local=1,
+            remote=RemoteTxid(1) if ok else RemoteError("litestream ltx timed out after 30s"),
+            wal=WalEvidence(IN_SYNC, "in sync"),
+        )
+        r = alias_status(sample, t, refresh=2, grace=10)
+        http = 200 if r["status"] == "caught_up" else 503
+        timeline.append((round(t, 4), r["status"], r["code"], r["age"], http))
+    return timeline
+
+
+def test_l8_long_expected_oscillation_passes():
+    """#65: 30초 타임아웃 조회가 반복되면 remote_error(약 6초)와 stale 이 32초 주기로 번갈아
+    나온다."""
+    c = _checks()
+    timeline = _long_outage_timeline(last_ok=0.0)
+    assert c.error_episodes(timeline) == [32.1, 64.1]
+    assert {code for _t, _s, code, _a, _h in timeline} >= {"in_sync", "stale", "remote_error"}
+    assert c.long_outage_problems(timeline, refresh=2, outage=90) == []
+    # 단절 직전에 시작해 진행 중이던 조회가 첫 실패(29초 남짓)여도 통과한다
+    early = _long_outage_timeline(last_ok=-1.5, first_fail_start=-0.5)
+    assert c.long_outage_problems(early, refresh=2, outage=90) == []
+
+
+def test_l8_long_fast_failure_or_no_error_fails():
+    c = _checks()
+    # ltx 가 곧바로 실패하면(타임아웃에 매달리지 않음) 기대와 다르다
+    fast = _long_outage_timeline(last_ok=0.0, first_fail_start=2.0, timeout=3.0)
+    problems = c.long_outage_problems(fast, refresh=2, outage=90)
+    assert any("first remote_error" in p for p in problems), problems
+    # 조회가 끝나지 않아 stale 만 계속되면(타임아웃이 듣지 않음) 실패
+    stuck = _long_outage_timeline(last_ok=0.0, timeout=500.0)
+    assert "never became remote_error" in c.long_outage_problems(stuck, refresh=2, outage=90)
+
+
+def test_l8_long_wrong_http_or_gap_fails():
+    c = _checks()
+    timeline = _long_outage_timeline(last_ok=0.0)
+    bad_http = [row[:4] + (200,) if row[2] == "stale" else row for row in timeline]
+    assert any("strict HTTP 200" in p for p in c.long_outage_problems(bad_http, 2, 90))
+    # 두 번째 remote_error 가 없으면(구간 수 부족) 실패
+    one = [row if row[0] < 60 else (row[0], "unknown", "stale", 7.0, 503) for row in timeline]
+    assert any("episode(s)" in p for p in c.long_outage_problems(one, 2, 90))
+
+
+def test_l8_ltx_process_checks():
+    c = _checks()
+    outage = [(t, [(100, "S")]) for t in range(0, 31, 3)] + [(33, []), (36, [(200, "S")])]
+    after = [(1, []), (3, [(300, "S")])]
+    assert c.ltx_process_problems(outage, after) == []
+    two = outage + [(39, [(200, "S"), (201, "S")])]
+    assert any("2 ltx processes" in p for p in c.ltx_process_problems(two, after))
+    zombie = outage + [(39, [(200, "Z")])]
+    assert any("zombie" in p for p in c.ltx_process_problems(zombie, after))
+    long = [(t, [(100, "S")]) for t in range(0, 61, 3)]
+    assert any("seen for 60" in p for p in c.ltx_process_problems(long, after))
+    left = c.ltx_process_problems(outage, [(1, [(200, "S")])])
+    assert any("still running" in p for p in left)
+
+
+def test_l8_long_first_error_and_upper_bound_pairs():
+    """리뷰 1 P3-1: 첫 remote_error 경계 쌍.
+
+    하한 29초(28 실패·30 통과), 상한 36초(35 통과·37 실패).
+    """
+    c = _checks()
+
+    def first_at(t0):
+        timeline = _long_outage_timeline(last_ok=0.0, first_fail_start=t0 - 30)
+        assert c.error_episodes(timeline)[0] == round(t0 + 0.1, 4)
+        return any("first remote_error" in p for p in c.long_outage_problems(timeline, 2, 90))
+
+    assert first_at(28.0) and not first_at(30.0)
+    assert not first_at(35.0) and first_at(37.0)
+
+
+def test_l8_long_remote_error_age_guard():
+    """리뷰 1 P3-4: 판정 순서가 바뀌어 age > 문턱인 remote_error 가 나오면 잡는다(직접 만든 행)."""
+    c = _checks()
+    timeline = _long_outage_timeline(last_ok=0.0)
+    i = next(i for i, row in enumerate(timeline) if row[2] == "stale" and row[0] > 40)
+    timeline[i] = (timeline[i][0], "unknown", "remote_error", 7.0, 503)
+    assert any("remote_error at" in p for p in c.long_outage_problems(timeline, 2, 90))
+
+
+def test_l8_max_sample_gap():
+    c = _checks()
+    assert c.max_sample_gap([]) == 0.0
+    assert c.max_sample_gap([(0.1, "x"), (1.1, "x"), (3.4, "x"), (4.4, "x")]) == 2.3
+
+
+def test_l8_ltx_empty_samples_fail():
+    """리뷰 1 P2-1: 검출기가 고장 나 빈 표본만 쌓이면 '매달린 ltx 없음'으로 통과하지 않는다."""
+    c = _checks()
+    problems = c.ltx_process_problems([(t, []) for t in range(0, 90, 3)], [(1, [])])
+    assert any("outage sample(s)" in p for p in problems), problems
+    assert any("distinct ltx pid(s)" in p for p in problems), problems
+    one_pid = [(t, [(100, "S")]) for t in range(0, 28, 3)]
+    assert any("1 distinct" in p for p in c.ltx_process_problems(one_pid, [(1, [])]))
+
+
+def test_l8_ltx_pid_span_pair():
+    """리뷰 1 P3-1: 한 PID 의 관측 상한 40초(39 통과·42 실패)."""
+    c = _checks()
+
+    def outage(span):
+        first = [(float(t), [(100, "S")]) for t in range(0, span, 3)] + [
+            (float(span), [(100, "S")])
+        ]
+        return first + [(span + 3.0, [(200, "S")]), (span + 6.0, [(200, "S")])]
+
+    assert c.ltx_process_problems(outage(39), [(1, [])]) == []
+    assert any("seen for 42" in p for p in c.ltx_process_problems(outage(42), [(1, [])]))
+
+
 # --- PRAGMA 벤치 집계(#26, lab/_benchstat.py) ------------------------------------------------
 
 

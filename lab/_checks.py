@@ -182,3 +182,149 @@ def full_outage_problems(timeline: list, refresh: float, sample_interval: float 
         if c == "stale" and (age is None or age < limit - AGE_ROUNDING):
             problems.append(f"stale at {t}s with age {age} < {limit}")
     return problems
+
+
+# --- L8c·L8d: 조회 타임아웃보다 긴 단절(#65) -------------------------------------------------
+# boot/litestream.py: DEFAULT_LTX_TIMEOUT(헬스의 원격 조회 타임아웃, HEALTH 설정 키 없음)과
+# 시간 초과 뒤 SIGKILL 한 프로세스를 거두는 여유 _KILL_GRACE.
+LTX_TIMEOUT = 30.0
+KILL_GRACE = 5.0
+
+
+def long_outage_bounds(
+    refresh: float, ltx_timeout: float = LTX_TIMEOUT, sample_interval: float = 1.0
+) -> dict[str, float]:
+    """L8c·L8d 의 시간 경계(초). 모두 **랩의 허용 시간(가정)**이다(보장 상한 아님).
+
+    - ``stale_by``: L8a 와 같다(``full_outage_deadline``).
+    - ``first_error_after``: 단절 시점에 진행 중이던 조회는 정상 조회 시간(1초 미만으로 가정) 안에
+      시작했으므로 ``ltx_timeout − 1`` 전에는 타임아웃으로 끝나지 않는다.
+    - ``first_error_by``: 단절 직후 성공으로 끝난 조회의 여유(REFRESH 로 가정) + 다음 조회까지의
+      REFRESH + 그 조회의 타임아웃 + 표본 간격 + 1초.
+    - ``period``: ``remote_error`` 관측 뒤 REFRESH 를 쉬고 시작한 조회가 다시 타임아웃으로
+      끝나기까지. ``period_slack`` 은 표본 간격 + 1초.
+    """
+    return {
+        "stale_by": full_outage_deadline(refresh, sample_interval),
+        "first_error_after": ltx_timeout - 1.0,
+        "first_error_by": refresh + refresh + ltx_timeout + sample_interval + 1.0,
+        "period": refresh + ltx_timeout,
+        "period_slack": sample_interval + 1.0,
+    }
+
+
+def error_episodes(timeline: list) -> list[float]:
+    """``remote_error`` 구간이 시작한 표본 시각들(바로 앞 표본이 ``remote_error`` 가 아닌 것)."""
+    starts, prev = [], None
+    for t, _s, c, *_ in timeline:
+        if c == "remote_error" and prev != "remote_error":
+            starts.append(t)
+        prev = c
+    return starts
+
+
+def long_outage_problems(
+    timeline: list,
+    refresh: float,
+    outage: float,
+    ltx_timeout: float = LTX_TIMEOUT,
+    sample_interval: float = 1.0,
+) -> list[str]:
+    """L8c·L8d 판정. ``timeline`` 은 ``(단절 뒤 초, status, code, age, strict HTTP 코드)`` 표본.
+
+    - L8a 의 판정(``full_outage_problems``)을 그대로 통과한다: 제한 시간 안에 ``unknown``, 단절
+      끝까지 유지, ``caught_up``·``stale`` 의 age.
+    - 첫 ``remote_error`` 는 ``[first_error_after, first_error_by]`` 안에 시작한다.
+    - 그 뒤 ``remote_error`` 와 ``stale`` 이 번갈아 나온다: 구간 시작 사이 간격이
+      ``period ± period_slack`` 이고, 단절 길이에서 기대되는 수 이상이다.
+    - ``remote_error`` 표본의 age 는 stale 문턱 이하다(반올림 허용). health.py 의 판정 순서
+      (age > 문턱이면 오류보다 ``stale`` 이 먼저)상 지금은 늘 참이다. 그 순서가 바뀌는 회귀를
+      잡는 안전망이다.
+    - strict 응답: ``unknown`` 은 503, ``caught_up`` 은 200.
+    """
+    problems = full_outage_problems([row[:4] for row in timeline], refresh, sample_interval)
+    b = long_outage_bounds(refresh, ltx_timeout, sample_interval)
+    limit = refresh * STALE_FACTOR
+    starts = error_episodes(timeline)
+    if not starts:
+        problems.append("never became remote_error")
+    else:
+        if not b["first_error_after"] <= starts[0] <= b["first_error_by"]:
+            problems.append(
+                f"first remote_error at {starts[0]}s, outside "
+                f"[{b['first_error_after']}, {b['first_error_by']}]s"
+            )
+        for a, z in zip(starts, starts[1:], strict=False):
+            if abs((z - a) - b["period"]) > b["period_slack"]:
+                problems.append(
+                    f"remote_error episodes {a}s -> {z}s: gap {round(z - a, 1)}s, "
+                    f"expected {b['period']}±{b['period_slack']}s"
+                )
+        want = 1 + int(max(0.0, outage - b["first_error_by"]) // (b["period"] + b["period_slack"]))
+        if len(starts) < want:
+            problems.append(f"{len(starts)} remote_error episode(s), expected >= {want}: {starts}")
+    for t, s, c, age, http in timeline:
+        if c == "remote_error" and (age is None or age > limit + AGE_ROUNDING):
+            problems.append(f"remote_error at {t}s with age {age} > {limit}")
+        want_http = 200 if s == "caught_up" else 503
+        if http != want_http:
+            problems.append(f"strict HTTP {http} at {t}s for {s}/{c}, expected {want_http}")
+    return problems
+
+
+def max_sample_gap(timeline: list) -> float:
+    """표본 시각 사이의 가장 긴 간격(초). 표본이 둘 미만이면 0."""
+    times = [row[0] for row in timeline]
+    return max((b - a for a, b in zip(times, times[1:], strict=False)), default=0.0)
+
+
+# 이보다 거친 헬스 표본은 시각 판정(구간 시작·간격)을 믿을 수 없다(하네스 문제, 판정 실패와 구분).
+COARSE_SAMPLE_GAP = 1.5
+
+
+def ltx_process_problems(
+    outage: list,
+    after: list,
+    ltx_timeout: float = LTX_TIMEOUT,
+    sample_slack: float = 5.0,
+    min_pids: int = 2,
+    min_busy_samples: int = 3,
+) -> list[str]:
+    """앱 컨테이너 안 ``litestream ltx`` 프로세스 표본 판정.
+
+    ``outage``·``after`` 는 ``(초, [(pid, state), ...])`` 목록(단절 중 / 복구 뒤).
+
+    - 검출기가 고장 나 빈 표본만 쌓여도 통과하지 않도록, 단절 중 ``ltx`` 를 본 표본이
+      ``min_busy_samples`` 개 이상, 서로 다른 PID 가 ``min_pids`` 개 이상이어야 한다(90초 단절에서
+      30초 조회가 2~3번 돈다).
+    - 어느 표본에서도 2개 이상 동시에 있지 않다(갱신 스레드 하나가 순차 조회).
+    - 좀비(``Z``)가 없다(시간 초과 뒤 거둔다).
+    - 같은 PID 가 ``ltx_timeout + KILL_GRACE + sample_slack`` 보다 오래 보이지 않는다.
+    - 단절 중 본 PID 가 복구 뒤 표본에 남지 않는다.
+    """
+    problems = []
+    span: dict[int, list[float]] = {}
+    for phase, samples in (("outage", outage), ("after", after)):
+        for t, procs in samples:
+            if len(procs) > 1:
+                problems.append(f"{len(procs)} ltx processes at {phase} {t}s: {procs}")
+            for pid, state in procs:
+                if state == "Z":
+                    problems.append(f"zombie ltx pid {pid} at {phase} {t}s")
+                if phase == "outage":
+                    span.setdefault(pid, [t, t])[1] = t
+    busy = sum(1 for _t, procs in outage if procs)
+    if busy < min_busy_samples:
+        problems.append(f"ltx seen in {busy} outage sample(s), expected >= {min_busy_samples}")
+    if len(span) < min_pids:
+        problems.append(
+            f"{len(span)} distinct ltx pid(s) during the outage, expected >= {min_pids}"
+        )
+    bound = ltx_timeout + KILL_GRACE + sample_slack
+    for pid, (first, last) in sorted(span.items()):
+        if last - first > bound:
+            problems.append(f"ltx pid {pid} seen for {round(last - first, 1)}s > {bound}s")
+    left = sorted({pid for _t, procs in after for pid, _s in procs} & set(span))
+    if left:
+        problems.append(f"ltx pids from the outage still running after recovery: {left}")
+    return problems

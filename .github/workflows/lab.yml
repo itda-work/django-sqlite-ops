@@ -13,7 +13,7 @@ on:
         description: "scripts/lab.sh run 의 선택(all 또는 pytest -k 로 좁힐 시나리오)"
         type: choice
         default: all
-        options: [all, P1, P2, L1, L2, L3, L4, L5, L6, L7, L8]
+        options: [all, P1, P2, L1, L2, L3, L4, L5, L6, L7, L8, L8c, L8d]
 
 permissions:
   contents: read

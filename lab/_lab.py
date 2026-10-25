@@ -156,7 +156,7 @@ class Stack:
 
     def add_toxic(self, proxy: str, toxic: dict) -> None:
         self.toxi("POST", f"/proxies/{proxy}/toxics", toxic)
-        log(f"toxiproxy {proxy} + {toxic['type']}")
+        log(f"toxiproxy {proxy} + {toxic['type']} {toxic.get('stream', 'downstream')}")
 
     def remove_toxic(self, proxy: str, name: str) -> None:
         self.toxi("DELETE", f"/proxies/{proxy}/toxics/{name}")
