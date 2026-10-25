@@ -370,6 +370,61 @@ def test_l8_ltx_process_checks():
     assert any("still running" in p for p in left)
 
 
+def test_l8_long_first_error_and_upper_bound_pairs():
+    """리뷰 1 P3-1: 첫 remote_error 경계 쌍.
+
+    하한 29초(28 실패·30 통과), 상한 36초(35 통과·37 실패).
+    """
+    c = _checks()
+
+    def first_at(t0):
+        timeline = _long_outage_timeline(last_ok=0.0, first_fail_start=t0 - 30)
+        assert c.error_episodes(timeline)[0] == round(t0 + 0.1, 4)
+        return any("first remote_error" in p for p in c.long_outage_problems(timeline, 2, 90))
+
+    assert first_at(28.0) and not first_at(30.0)
+    assert not first_at(35.0) and first_at(37.0)
+
+
+def test_l8_long_remote_error_age_guard():
+    """리뷰 1 P3-4: 판정 순서가 바뀌어 age > 문턱인 remote_error 가 나오면 잡는다(직접 만든 행)."""
+    c = _checks()
+    timeline = _long_outage_timeline(last_ok=0.0)
+    i = next(i for i, row in enumerate(timeline) if row[2] == "stale" and row[0] > 40)
+    timeline[i] = (timeline[i][0], "unknown", "remote_error", 7.0, 503)
+    assert any("remote_error at" in p for p in c.long_outage_problems(timeline, 2, 90))
+
+
+def test_l8_max_sample_gap():
+    c = _checks()
+    assert c.max_sample_gap([]) == 0.0
+    assert c.max_sample_gap([(0.1, "x"), (1.1, "x"), (3.4, "x"), (4.4, "x")]) == 2.3
+
+
+def test_l8_ltx_empty_samples_fail():
+    """리뷰 1 P2-1: 검출기가 고장 나 빈 표본만 쌓이면 '매달린 ltx 없음'으로 통과하지 않는다."""
+    c = _checks()
+    problems = c.ltx_process_problems([(t, []) for t in range(0, 90, 3)], [(1, [])])
+    assert any("outage sample(s)" in p for p in problems), problems
+    assert any("distinct ltx pid(s)" in p for p in problems), problems
+    one_pid = [(t, [(100, "S")]) for t in range(0, 28, 3)]
+    assert any("1 distinct" in p for p in c.ltx_process_problems(one_pid, [(1, [])]))
+
+
+def test_l8_ltx_pid_span_pair():
+    """리뷰 1 P3-1: 한 PID 의 관측 상한 40초(39 통과·42 실패)."""
+    c = _checks()
+
+    def outage(span):
+        first = [(float(t), [(100, "S")]) for t in range(0, span, 3)] + [
+            (float(span), [(100, "S")])
+        ]
+        return first + [(span + 3.0, [(200, "S")]), (span + 6.0, [(200, "S")])]
+
+    assert c.ltx_process_problems(outage(39), [(1, [])]) == []
+    assert any("seen for 42" in p for p in c.ltx_process_problems(outage(42), [(1, [])]))
+
+
 # --- PRAGMA 벤치 집계(#26, lab/_benchstat.py) ------------------------------------------------
 
 

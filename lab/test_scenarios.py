@@ -15,12 +15,14 @@ import urllib.request
 
 import pytest
 from _checks import (
+    COARSE_SAMPLE_GAP,
     error_episodes,
     full_outage_deadline,
     full_outage_problems,
     long_outage_bounds,
     long_outage_problems,
     ltx_process_problems,
+    max_sample_gap,
     quarantine_problems,
     stale_dirs,
     template_fingerprint,
@@ -655,13 +657,18 @@ def _l8_long(stack: Stack, run_id: str, rec: dict, label: str, cut, restore) -> 
         while time.monotonic() - t0 < LONG_OUTAGE:
             timeline.append((round(time.monotonic() - t0, 1), *_health_strict(port)))
             time.sleep(1)
+        logs_outage = stack.logs("labapp")  # 복구 전에 읽는다(복구 시점의 줄이 섞이지 않게)
     finally:
-        restore()
+        # 복구가 실패해도 표본 스레드는 멈추고, 프록시는 reset 으로 한 번 더 되돌린다
         sampler.stop.set()
+        try:
+            restore()
+        except Exception as exc:  # noqa: BLE001
+            log(f"restore failed ({type(exc).__name__}: {exc}); resetting proxies")
+            stack.reset_proxies()
     if sampler.ident is not None:
         sampler.join()
     t1 = time.monotonic()
-    logs_outage = stack.logs("labapp")
     recovery = []
     deadline = t1 + 300  # 관측용 상한. 판정은 아래 120초(랩 가정)
     while time.monotonic() < deadline:
@@ -684,6 +691,8 @@ def _l8_long(stack: Stack, run_id: str, rec: dict, label: str, cut, restore) -> 
     rec["outage_s"] = LONG_OUTAGE
     rec["bounds"] = long_outage_bounds(2)
     rec["outage_timeline"] = timeline
+    gap = max_sample_gap(timeline)
+    rec["max_sample_gap_s"] = round(gap, 2)
     rec["remote_error_episodes"] = error_episodes(timeline)
     rec["outage_statuses"] = sorted({(s, c) for _, s, c, _a, _h in timeline})
     rec["outage_http"] = sorted({h for *_x, h in timeline})
@@ -701,7 +710,10 @@ def _l8_long(stack: Stack, run_id: str, rec: dict, label: str, cut, restore) -> 
     rec["replica_after_stop"] = wait_replica_rows(stack, prefix, final)
     rec["final_rows"] = final
 
-    problems = long_outage_problems(timeline, refresh=2, outage=LONG_OUTAGE)
+    # 시각 판정의 표본 여유는 실제 최대 표본 간격으로 둔다(1초보다 좁히지 않는다)
+    problems = long_outage_problems(
+        timeline, refresh=2, outage=LONG_OUTAGE, sample_interval=max(1.0, gap)
+    )
     problems += ltx_process_problems(sampler.samples, after_procs)
     if sampler.failures:
         problems.append(f"ltx sampler failures: {sampler.failures[:3]}")
@@ -715,8 +727,13 @@ def _l8_long(stack: Stack, run_id: str, rec: dict, label: str, cut, restore) -> 
         problems.append(f"strict HTTP {recovery[-1][4]} after recovery")
     if writer.errors:
         problems.append(f"{writer.errors} write errors")
+    # 표본이 거칠면 판정 실패와 따로 알린다(러너 흔들림인지 헬스 문제인지 구분)
+    harness = []
+    if gap > COARSE_SAMPLE_GAP:
+        harness.append(f"coarse health samples: max gap {round(gap, 2)}s > {COARSE_SAMPLE_GAP}s")
     rec["problems"] = problems
-    assert not problems, problems
+    rec["harness_problems"] = harness
+    assert not harness and not problems, {"harness": harness, "problems": problems}
 
 
 def test_L8c_health_long_refused_outage(stack, run_id, rec):
@@ -737,18 +754,23 @@ def test_L8c_health_long_refused_outage(stack, run_id, rec):
 
 
 def test_L8d_health_long_blackhole_outage(stack, run_id, rec):
-    """같은 90초 단절을 무응답으로: toxiproxy ``timeout`` toxic.
+    """같은 90초 단절을 양방향 무응답으로: toxiproxy ``timeout`` toxic 을 두 방향에.
 
-    ``timeout`` 0 은 연결을 받고 데이터를 버린다(닫지 않는다).
-
-    기대는 L8c 와 같다. 복구는 toxic 을 지운다.
+    ``timeout`` 0 은 연결을 받고 데이터를 버린다(닫지 않는다). toxic 의 ``stream`` 기본값은
+    ``downstream``(server → client)이라 그것만 넣으면 요청은 S3 에 닿는다(toxiproxy 2.12.0
+    README). ``upstream``(client → server)도 넣는다. 기대는 L8c 와 같다. 복구는 reset.
     """
-    toxic = {"name": "blackhole", "type": "timeout", "attributes": {"timeout": 0}}
-    _l8_long(
-        stack,
-        run_id,
-        rec,
-        "l8d",
-        cut=lambda: stack.add_toxic("s3", toxic),
-        restore=stack.reset_proxies,
-    )
+
+    def cut():
+        for stream in ("downstream", "upstream"):
+            stack.add_toxic(
+                "s3",
+                {
+                    "name": f"blackhole_{stream}",
+                    "type": "timeout",
+                    "stream": stream,
+                    "attributes": {"timeout": 0},
+                },
+            )
+
+    _l8_long(stack, run_id, rec, "l8d", cut=cut, restore=stack.reset_proxies)

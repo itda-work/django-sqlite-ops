@@ -86,8 +86,8 @@ P2 는 채널 레이어를 런타임에 쓰지 않는다(channels-nats 를 설�
 | L7 | 복제본의 모든 LTX 객체 가운데 64바이트를 뒤집음(filer API) | 새 컨테이너 exit 4 / 메타 삭제 볼륨 + `--on-unknown restore` exit 4, 로컬 파일 해시 무변경, 격리 없음 |
 | L8a | 쓰기를 계속하며 `s3` 20초 끔(업로드·헬스 조회 모두) | 경과 시간 기준: 랩의 허용 시간(가정) `REFRESH × 3` + 진행 중 조회 여유(`REFRESH` 로 가정) + 표본 간격 + 1초 안에 `unknown`(`stale`/`remote_error`)로 바뀌고 단절이 끝날 때까지 유지. 전환 전 `caught_up` 은 age ≤ `REFRESH × 3`, `stale` 은 age > 그 값(응답 age 의 반올림 0.0005 허용, `_checks.full_outage_problems`). 복구 뒤 `caught_up`, 쓰기 오류 0 |
 | L8b | 헬스 조회는 `s3h` 로 두고 업로드 경로 `s3` 만 20초 끔 | `backlog`(`local_ahead`) → 복구 뒤 `caught_up` |
-| L8c | 쓰기를 계속하며 `s3` 를 90초 끔(조회 타임아웃 30초의 3배, 연결 거부) | 랩의 허용 시간(가정, `_checks.long_outage_bounds`): 10초 안에 `stale`, 첫 `remote_error` 는 29–36초, 그 뒤 `remote_error`(약 6초)와 `stale`(약 26초)이 32±2초 주기로 번갈아(90초에 2구간 이상) 단절 내내 `unknown`. strict 는 단절 내내 503·복구 뒤 200. 앱 컨테이너의 `litestream ltx`(`lab_tools/procs.py` 로 `/proc` 를 3초마다)는 1개 이하·좀비 없음·한 PID 가 40초 넘게 보이지 않음·복구 뒤 단절 중 PID 없음. 쓰기 오류 0, 복구 뒤 120초 안 `caught_up`, 복제본 행 수 = 최종 행 수. Litestream WARN/ERROR 줄 수·대표 줄을 기록 |
-| L8d | 같은 90초를 무응답으로: `s3` 에 `timeout` toxic(`timeout` 0 = 연결은 받고 데이터를 버림) | L8c 와 같다 |
+| L8c | 쓰기를 계속하며 `s3` 를 90초 끔(조회 타임아웃 30초의 3배, 연결 거부) | 랩의 허용 시간(가정, `_checks.long_outage_bounds`): 10초 안에 `stale`, 첫 `remote_error` 는 29–36초, 그 뒤 `remote_error`(약 6초)와 `stale`(약 26초)이 32±2초 주기로 번갈아(90초에 2구간 이상) 단절 내내 `unknown`. strict 는 단절 내내 503·복구 뒤 200. 앱 컨테이너의 `litestream ltx`(`lab_tools/procs.py` 로 `/proc` 를 3초마다)는 1개 이하·좀비 없음·한 PID 가 40초 넘게 보이지 않음·복구 뒤 단절 중 PID 없음, 그리고 검출기가 동작한다는 하한(단절 중 `ltx` 를 본 표본 ≥ 3, 서로 다른 PID ≥ 2). 시각 판정의 표본 여유는 실제 최대 헬스 표본 간격이고, 그 간격이 1.5초를 넘으면 '표본이 거칠다'로 판정 실패와 따로 알린다. 쓰기 오류 0, 복구 뒤 120초 안 `caught_up`, 복제본 행 수 = 최종 행 수. Litestream WARN/ERROR 줄 수·대표 줄을 기록 |
+| L8d | 같은 90초를 양방향 무응답으로: `s3` 에 `timeout` toxic(`timeout` 0 = 연결은 받고 데이터를 버림)을 `stream` `downstream`·`upstream` 둘 다(기본값은 `downstream` 뿐이라 하나만 넣으면 요청은 S3 에 닿는다 — toxiproxy 2.12.0 README) | L8c 와 같다 |
 
 L8 은 `LAB_HEALTH_REFRESH=2`, `LAB_HEALTH_GRACE=10` 으로 줄여 돈다(기본 15·60초면 20초 끊김이 grace 안에 든다). 헬스의 원격 조회 타임아웃은 `boot/litestream.py` 의 `DEFAULT_LTX_TIMEOUT`(30초)이고 `HEALTH` 설정으로 바꿀 수 없다(2026-10-25 확인). L8c·L8d 가 각각 약 2분 30초 걸린다.
 

@@ -237,7 +237,9 @@ def long_outage_problems(
     - 첫 ``remote_error`` 는 ``[first_error_after, first_error_by]`` 안에 시작한다.
     - 그 뒤 ``remote_error`` 와 ``stale`` 이 번갈아 나온다: 구간 시작 사이 간격이
       ``period ± period_slack`` 이고, 단절 길이에서 기대되는 수 이상이다.
-    - ``remote_error`` 표본의 age 는 stale 문턱 이하다(반올림 허용).
+    - ``remote_error`` 표본의 age 는 stale 문턱 이하다(반올림 허용). health.py 의 판정 순서
+      (age > 문턱이면 오류보다 ``stale`` 이 먼저)상 지금은 늘 참이다. 그 순서가 바뀌는 회귀를
+      잡는 안전망이다.
     - strict 응답: ``unknown`` 은 503, ``caught_up`` 은 200.
     """
     problems = full_outage_problems([row[:4] for row in timeline], refresh, sample_interval)
@@ -270,16 +272,31 @@ def long_outage_problems(
     return problems
 
 
+def max_sample_gap(timeline: list) -> float:
+    """표본 시각 사이의 가장 긴 간격(초). 표본이 둘 미만이면 0."""
+    times = [row[0] for row in timeline]
+    return max((b - a for a, b in zip(times, times[1:], strict=False)), default=0.0)
+
+
+# 이보다 거친 헬스 표본은 시각 판정(구간 시작·간격)을 믿을 수 없다(하네스 문제, 판정 실패와 구분).
+COARSE_SAMPLE_GAP = 1.5
+
+
 def ltx_process_problems(
     outage: list,
     after: list,
     ltx_timeout: float = LTX_TIMEOUT,
     sample_slack: float = 5.0,
+    min_pids: int = 2,
+    min_busy_samples: int = 3,
 ) -> list[str]:
     """앱 컨테이너 안 ``litestream ltx`` 프로세스 표본 판정.
 
     ``outage``·``after`` 는 ``(초, [(pid, state), ...])`` 목록(단절 중 / 복구 뒤).
 
+    - 검출기가 고장 나 빈 표본만 쌓여도 통과하지 않도록, 단절 중 ``ltx`` 를 본 표본이
+      ``min_busy_samples`` 개 이상, 서로 다른 PID 가 ``min_pids`` 개 이상이어야 한다(90초 단절에서
+      30초 조회가 2~3번 돈다).
     - 어느 표본에서도 2개 이상 동시에 있지 않다(갱신 스레드 하나가 순차 조회).
     - 좀비(``Z``)가 없다(시간 초과 뒤 거둔다).
     - 같은 PID 가 ``ltx_timeout + KILL_GRACE + sample_slack`` 보다 오래 보이지 않는다.
@@ -296,6 +313,13 @@ def ltx_process_problems(
                     problems.append(f"zombie ltx pid {pid} at {phase} {t}s")
                 if phase == "outage":
                     span.setdefault(pid, [t, t])[1] = t
+    busy = sum(1 for _t, procs in outage if procs)
+    if busy < min_busy_samples:
+        problems.append(f"ltx seen in {busy} outage sample(s), expected >= {min_busy_samples}")
+    if len(span) < min_pids:
+        problems.append(
+            f"{len(span)} distinct ltx pid(s) during the outage, expected >= {min_pids}"
+        )
     bound = ltx_timeout + KILL_GRACE + sample_slack
     for pid, (first, last) in sorted(span.items()):
         if last - first > bound:

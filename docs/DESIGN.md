@@ -453,7 +453,7 @@ SQLITE_OPS = {
 | 그 밖(원격 == 로컬, WAL 커밋이 모두 L0 안) | `caught_up` | `in_sync` |
 
 **원격 조회가 매달릴 때 (#65, 2026-10-25 확인)** — 헬스의 원격 조회 타임아웃은 `boot/litestream.py` 의 `DEFAULT_LTX_TIMEOUT`(30초)이고 `HEALTH` 설정으로 바꿀 수 없다. 시간이 넘으면 프로세스 그룹을 SIGKILL 하고 거둔다(`_KILL_GRACE` 5초). 갱신 스레드는 하나이고 별칭을 순서대로 조회한 뒤 `REFRESH` 를 쉬며, 관측 시각은 조회가 끝난 뒤 찍힌다. 그래서:
-- S3 가 연결을 거부하든 응답하지 않든 `ltx` 는 30초 매달린다. 단절이 30초보다 길면 `stale`(age > `REFRESH × 3`) → 조회가 타임아웃으로 끝난 뒤 `remote_error`(age ≤ 문턱인 동안) → 다음 조회가 매달리는 동안 다시 `stale` … 이 `REFRESH + 30` 초 주기로 번갈아 나온다. 둘 다 `unknown` 이라 strict 는 계속 503 이다. 매달린 `ltx` 는 동시에 하나뿐이고 남지 않는다. 랩 L8c·L8d(REFRESH 2초, 90초 단절)에서 재현함: 첫 `stale` 5.1초, `remote_error` 31초대·63–64초대, 복구 1–3초 뒤 `caught_up`([`lab-2026-10-25-long-outage.md`](research/lab-2026-10-25-long-outage.md)).
+- S3 가 연결을 거부하든 양방향으로 응답하지 않든 `ltx` 는 30초 매달린다. 단절이 30초보다 길면 `stale`(age > `REFRESH × 3`) → 조회가 타임아웃으로 끝난 뒤 `remote_error`(age ≤ 문턱인 동안) → 다음 조회가 매달리는 동안 다시 `stale` … 이 `REFRESH + 30` 초 주기로 번갈아 나온다. 둘 다 `unknown` 이라 strict 는 계속 503 이다. 매달린 `ltx` 는 동시에 하나뿐이고 남지 않는다. 랩 L8c·L8d(REFRESH 2초, 90초 단절)에서 재현함: 첫 `stale` 5.0–5.1초, `remote_error` 31초대·63–64초대, 복구 2–7초 뒤 `caught_up`(복구 순간 진행 중이던 조회가 남은 만큼 늦다. [`lab-2026-10-25-long-outage.md`](research/lab-2026-10-25-long-outage.md)).
 - **한 별칭의 조회가 매달리면 다른 별칭의 관측도 밀린다.** 매달린 시간이 `2 × REFRESH` 를 넘으면 정상 별칭도 `stale` 이다(기본 `REFRESH` 15초면 30 + 15 = 45 = 문턱이라 다른 조회 시간만큼만). 코드상 확인, 주입 시계로 단언(`test_monitor_one_hanging_alias_delays_the_others`). 별칭이 여럿인 컨테이너에서는 재지 않았다(§12).
 
 **DB 본 파일 상태 (#40)** — WAL·로컬 메타·복제본은 DB 본 파일과 따로 남는다. DB 만 지워지거나(이름 변경·잘못된 정리) 0바이트가 되어도 `-wal` 과 메타가 남으면 TXID 와 WAL 위치가 맞아 `caught_up/in_sync` 였다(#40 재현: `replicate -once` 뒤 DB 만 옮김 → `in_sync`, DB 를 0바이트로 → `in_sync`. `-wal` 도 없으면 `no_wal_evidence`). 그 WAL 이 붙을 DB 가 없으면 정상이라 할 수 없다.
@@ -580,7 +580,7 @@ SQLITE_OPS = {
 | L6 | `--on-unknown restore` 진행 중 kill → 재시작 | 반쯤 옮겨진 상태 없음, 재실행으로 완료 | 통과(rename 8곳 모두에서 kill — kill 시 rename 수 = k 확인, 재실행 완료, 템플릿의 DB·사이드카·메타 하위 8항목이 한 격리 디렉터리에 같은 해시, D-14 지점은 격리 2개) |
 | L7 | 복원 실패(S3 객체 손상) | exit 4, 로컬 무변경 | 통과(새 컨테이너·격리 경로 모두 exit 4, 로컬 해시 그대로) |
 | L8 | 헬스: S3 20초 끊김 | `backlog` → 복구 후 `caught_up` | 조건부: 업로드만 끊기면(L8b) `backlog` → `caught_up`. 조회까지 끊기면(L8a) 랩의 허용 시간 10초(가정: `REFRESH × 3` + 진행 중 조회 여유 `REFRESH` + 표본 간격 + 1초. 조회 시간에서 도출된 보장 상한은 아니다) 안에 `unknown`(`stale`)으로 바뀌어 유지 → `caught_up` — §7 표대로 원격 조회 실패는 `unknown` 이 먼저다 |
-| L8c·L8d | 헬스: S3 90초 끊김(조회 타임아웃 30초의 3배) — 연결 거부 / 무응답(`timeout` toxic) | `unknown` 유지(`stale` 과 `remote_error` 가 `REFRESH + 30` 초 주기로 번갈아), strict 503, 매달린 `ltx` 없음 → 복구 후 `caught_up` | 통과(2026-10-25, 두 실행 모두): 첫 `stale` 5.1초, `remote_error` 구간 31.3–31.6·63.0–64.0초 시작, `ltx` 동시 최대 1·복구 뒤 0, 쓰기 오류 0, 복구 1.1–3.2초 뒤 `caught_up`. 단절 중 Litestream 로그 WARN/ERROR 0줄([`lab-2026-10-25-long-outage.md`](research/lab-2026-10-25-long-outage.md)) |
+| L8c·L8d | 헬스: S3 90초 끊김(조회 타임아웃 30초의 3배) — 연결 거부 / 양방향 무응답(`timeout` toxic, `downstream`+`upstream`) | `unknown` 유지(`stale` 과 `remote_error` 가 `REFRESH + 30` 초 주기로 번갈아), strict 503, 매달린 `ltx` 없음 → 복구 후 `caught_up` | 통과(2026-10-25, L8c 3회·양방향 L8d 2회): 첫 `stale` 5.0–5.1초, `remote_error` 구간 31.3–31.6·63.0–64.0초 시작, `ltx` 동시 최대 1·서로 다른 PID 3·복구 뒤 0, 쓰기 오류 0, 복구 2.0–7.1초 뒤 `caught_up`. 단절 중 Litestream 로그 0줄(WARN/ERROR 포함). 처음 두 L8d 실행은 toxic 이 `downstream` 하나라 응답 유실만이었다([`lab-2026-10-25-long-outage.md`](research/lab-2026-10-25-long-outage.md)) |
 
 배포 프로필 종단 검증(P1·P2): 문서의 Dockerfile·compose·entrypoint·settings 를 그대로 띄워 첫 배포·`check --deploy`·`sqlite_doctor`·`docker stop`(uvicorn 워커 1·2: exit 0, 대표 실행 0.47·0.72초, 400/400 복제)·재부팅·빈 볼륨 소유자 복사를 확인했다.
 
