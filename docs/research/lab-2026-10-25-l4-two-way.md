@@ -17,17 +17,18 @@
 - 실행: `LAB_PROJECT=dso-lab-i71 scripts/lab.sh run L4` 두 번, 둘 다 1 passed.
   - 1회차: `lab/.out/run-20261025-231616.log`, `results-20261025-231617.jsonl`(테스트 45.9초).
   - 2회차: `run-20261025-231756.log`, `results-20261025-231756.jsonl`(테스트 43.6초).
+  - GitHub Actions(ubuntu-latest amd64): run 40202081248(`gh workflow run lab.yml -f scenarios=L4`, 커밋 `03f3644`, 2026-10-25) — 1 passed, 잡 54.8초. artifact `lab-L4-40202081248` 의 `results-20261025-142502.jsonl`(테스트 42.8초).
   - 끝난 뒤 `docker ps -a`·`docker volume ls`·`docker network ls --filter label=io.itda.dso-lab=1` 이 비었다.
 
 ## 결과
 
-| 단계 | 2026-10-08(#10) | 2026-10-25 1회차 | 2026-10-25 2회차 |
-|---|---|---|---|
-| 연결 거부(프록시 끔), 기본 `--ltx-timeout` 30 | exit 2 `remote_error`, 30.5초 | exit 2 `remote_error`, 30.6초 | exit 2 `remote_error`, 30.6초 |
-| 무응답 + `--ltx-timeout 5` | `downstream` 만(응답 유실): exit 2 `remote_error`, 5.5초 | **양방향**: exit 2 `remote_error`, 5.6초 | **양방향**: exit 2 `remote_error`, 5.6초 |
-| 복구 뒤 같은 볼륨 | `match`, DB 해시 그대로 | `match`, 20건, DB 해시 그대로 | 같음 |
+| 단계 | 2026-10-08(#10) | 2026-10-25 1회차 | 2026-10-25 2회차 | 2026-10-25 amd64(run 40202081248) |
+|---|---|---|---|---|
+| 연결 거부(프록시 끔), 기본 `--ltx-timeout` 30 | exit 2 `remote_error`, 30.5초 | exit 2 `remote_error`, 30.6초 | exit 2 `remote_error`, 30.6초 | exit 2 `remote_error`, 30.5초 |
+| 무응답 + `--ltx-timeout 5` | `downstream` 만(응답 유실): exit 2 `remote_error`, 5.5초 | **양방향**: exit 2 `remote_error`, 5.6초 | **양방향**: exit 2 `remote_error`, 5.6초 | **양방향**(`hang_streams` = `downstream`·`upstream`): exit 2 `remote_error`, 5.5초 |
+| 복구 뒤 같은 볼륨 | `match`, DB 해시 그대로 | `match`, 20건, DB 해시 그대로 | 같음 | 같음(통과) |
 
-양방향 무응답의 boot 줄(두 회차 같음):
+양방향 무응답의 boot 줄(세 실행 같음):
 
 ```
 [boot] inputs: local_exists=True local_empty=False local_txid=2 remote=error: litestream ltx timed out after 5s
@@ -37,5 +38,5 @@
 
 ## 결론
 
-- 양방향 무응답에서도 boot 는 `--ltx-timeout`(5초) 뒤 `remote_error` 로 거부한다(재현함, 2회). 응답 유실만이던 이전 값(5.5초)과 판정·시간이 같다. 이슈에서 '영향 없을 것(미검증)'이라 본 것이 이 실행으로 확인됐다.
-- 이 결과는 arm64(colima)에서만이다. GitHub 러너(amd64, `lab.yml -f scenarios=L4`)는 별도로 돈다.
+- 양방향 무응답에서도 boot 는 `--ltx-timeout`(5초) 뒤 `remote_error` 로 거부한다(재현함, arm64 2회·amd64 1회). 응답 유실만이던 이전 값(5.5초)과 판정·시간이 같다. 이슈에서 '영향 없을 것(미검증)'이라 본 것이 이 실행으로 확인됐다.
+- arm64(colima)와 amd64(GitHub 러너)의 수치가 0.1초 안에서 같다.
