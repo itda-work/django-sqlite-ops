@@ -435,7 +435,7 @@ SQLITE_OPS = {
 | 조건 | 상태 | `code` |
 |---|---|---|
 | 아직 첫 조회 전 | `unknown` | `not_checked` |
-| 마지막 관측의 나이(monotonic) < 0 또는 > `REFRESH × 3`(갱신 스레드 멈춤 — 원격 조회가 타임아웃까지 매달린 경우 포함) | `unknown` | `stale` |
+| 마지막 관측의 나이(monotonic) < 0 또는 > `REFRESH × 3`(갱신 스레드 멈춤 — 원격 조회가 타임아웃까지 매달린 경우 포함). 사유에 갱신 스레드가 지금 조회 중인 별칭과 그 경과 초를, 조회 중이 아니면 직전 라운드의 가장 느린 조회(`REFRESH` 이상일 때)를 덧붙인다(#72) | `unknown` | `stale` |
 | 조회 전에 정해진 사유: 경로 규칙 위반 / 파일 DB 아님 / 갱신 중 예외 | `unknown` | `path_not_real` / `not_file_db` / `refresh_failed` |
 | **DB 본 파일**(아래)이 없음 / 0바이트 / 정규 파일 아님 / `lstat` 실패 — WAL·TXID 가 맞아도 | `unknown` | `db_missing` / `db_empty` / `db_not_regular` / `db_stat_failed` |
 | 부팅 상태 파일의 `unknown_at_boot` 가 참 | `unknown` | `unknown_at_boot` |
@@ -455,6 +455,7 @@ SQLITE_OPS = {
 **원격 조회가 매달릴 때 (#65, 2026-10-25 확인)** — 헬스의 원격 조회 타임아웃은 `boot/litestream.py` 의 `DEFAULT_LTX_TIMEOUT`(30초)이고 `HEALTH` 설정으로 바꿀 수 없다. 시간이 넘으면 프로세스 그룹을 SIGKILL 하고 거둔다(`_KILL_GRACE` 5초). 갱신 스레드는 하나이고 별칭을 순서대로 조회한 뒤 `REFRESH` 를 쉬며, 관측 시각은 조회가 끝난 뒤 찍힌다. 그래서:
 - S3 가 연결을 거부하든 양방향으로 응답하지 않든 `ltx` 는 30초 매달린다. 단절이 30초보다 길면 `stale`(age > `REFRESH × 3`) → 조회가 타임아웃으로 끝난 뒤 `remote_error`(age ≤ 문턱인 동안) → 다음 조회가 매달리는 동안 다시 `stale` … 이 `REFRESH + 30` 초 주기로 번갈아 나온다. 둘 다 `unknown` 이라 strict 는 계속 503 이다. 매달린 `ltx` 는 동시에 하나뿐이고 남지 않는다. 랩 L8c·L8d(REFRESH 2초, 90초 단절)에서 재현함: 첫 `stale` 5.0–5.1초, `remote_error` 31초대·63–64초대, 복구 2–7초 뒤 `caught_up`(복구 순간 진행 중이던 조회가 남은 만큼 늦다. [`lab-2026-10-25-long-outage.md`](research/lab-2026-10-25-long-outage.md)).
 - **한 별칭의 조회가 매달리면 다른 별칭의 관측도 밀린다.** 매달린 시간이 `2 × REFRESH` 를 넘으면 정상 별칭도 `stale` 이다(기본 `REFRESH` 15초면 30 + 15 = 45 = 문턱이라 다른 조회 시간만큼만). 코드상 확인, 주입 시계로 단언(`test_monitor_one_hanging_alias_delays_the_others`). 별칭이 여럿인 컨테이너에서는 재지 않았다(§12).
+- **`stale` 사유는 지금 조회 중인 별칭을 밝힌다 (#72, 2026-10-25 확인).** `Monitor` 는 조회를 시작할 때 `(별칭, 시작 monotonic 초)` 를 잠금 아래 기록하고 그 별칭의 결과를 저장할 때 지운다(예외로 끝난 조회도 `refresh_failed` 결과를 저장하며 지운다). `stale` 이면 사유 끝이 `the refresh thread has been checking alias 'slow' for 31s`(다른 별칭) 또는 `... checking this alias for 31s`(자기 자신)이다. 경과 초는 라운드가 아니라 그 별칭의 조회 시작부터 잰다. 조회 중인 별칭이 없으면(스레드가 `REFRESH` 를 쉬는 중이거나 멈춤) 직전 라운드에서 가장 오래 걸린 조회(조회 시작부터 관측까지, 잠금 아래 기록)를 밝힌다: `the last refresh spent 30s on alias 'slow'`(자기 자신이면 `on this alias`). 매달린 별칭이 정상 별칭보다 뒤에 있으면 매달림이 끝나고 쉬는 `REFRESH` 동안 정상 별칭이 이 문장으로 `stale` 이다(리뷰 1 재현). 그 조회가 `REFRESH` 보다 짧으면 조회 하나로는 나이가 `REFRESH × 3` 을 넘은 까닭이 되지 못하므로 기존 문장 `the refresh thread may be stuck` 이다. 표시 해제는 `try/finally` 라 `Exception` 밖의 예외로 스레드가 죽어도 남지 않는다. 상태·사유 코드·문턱·JSON 키는 그대로다. 별칭 이름은 응답의 `databases` 키로 이미 나가므로 노출 범위가 늘지 않는다. 단언: `test_stale_reason_names_the_alias_being_checked`·`test_stale_reason_while_resting_after_a_later_alias_hung`·`test_checking_mark_is_cleared_after_a_failed_refresh`.
 
 **DB 본 파일 상태 (#40)** — WAL·로컬 메타·복제본은 DB 본 파일과 따로 남는다. DB 만 지워지거나(이름 변경·잘못된 정리) 0바이트가 되어도 `-wal` 과 메타가 남으면 TXID 와 WAL 위치가 맞아 `caught_up/in_sync` 였다(#40 재현: `replicate -once` 뒤 DB 만 옮김 → `in_sync`, DB 를 0바이트로 → `in_sync`. `-wal` 도 없으면 `no_wal_evidence`). 그 WAL 이 붙을 DB 가 없으면 정상이라 할 수 없다.
 - 경로 규칙(D-15) 통과 뒤 실제 DB 경로를 `os.lstat` 한 번으로 본다. 열지 않으므로 DB·`-wal`·`-shm` 을 만들거나 바꾸지 않는다(링크를 따라가지 않는다. 마지막 요소의 링크는 경로 규칙이 이미 거부한다). 없음(`FileNotFoundError`) → `db_missing`, 0바이트 정규 파일 → `db_empty`, 정규 파일 아님(디렉터리·FIFO 등) → `db_not_regular`, 그 밖의 `OSError` → `db_stat_failed`(원문은 로그로만).

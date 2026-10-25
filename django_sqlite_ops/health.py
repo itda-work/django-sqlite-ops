@@ -488,10 +488,45 @@ def _fields(sample: Sample | None, now: float) -> dict[str, Any]:
     }
 
 
+def _stale_cause(
+    alias: str | None,
+    checking: tuple[str, float] | None,
+    slowest: tuple[str, float] | None,
+    now: float,
+    refresh: float,
+) -> str:
+    """``stale`` 사유의 뒷부분. 갱신 스레드가 지금 조회 중인 별칭과 그 경과 초를 밝힌다(#72).
+
+    조회 중이 아니면(스레드가 ``REFRESH`` 를 쉬는 중이거나 멈춤) 직전 라운드에서 가장 오래 걸린
+    조회가 ``REFRESH`` 이상일 때만 그 별칭과 초를 밝힌다. 그보다 짧은 조회 하나로는 나이가
+    ``REFRESH × 3`` 을 넘은 까닭이 되지 못하므로 기존 문장을 쓴다.
+    """
+
+    def name(other: str) -> str:
+        return "this alias" if other == alias else f"alias {other!r}"
+
+    if checking is not None:
+        busy, started = checking
+        return f"the refresh thread has been checking {name(busy)} for {max(now - started, 0):.0f}s"
+    if slowest is not None and slowest[1] >= refresh:
+        return f"the last refresh spent {slowest[1]:.0f}s on {name(slowest[0])}"
+    return "the refresh thread may be stuck"
+
+
 def _verdict(
-    sample: Sample | None, now: float, refresh: float, grace: float
+    sample: Sample | None,
+    now: float,
+    refresh: float,
+    grace: float,
+    alias: str | None = None,
+    checking: tuple[str, float] | None = None,
+    slowest: tuple[str, float] | None = None,
 ) -> tuple[str, str, str]:
-    """``(상태, 사유 코드, 사유)``. 사유는 고정 문장에 경로·TXID·초만 넣는다(비밀값 없음)."""
+    """``(상태, 사유 코드, 사유)``. 사유는 고정 문장에 경로·TXID·초·별칭 이름만 넣는다(비밀값 없음).
+
+    ``checking`` 은 갱신 스레드가 지금 조회 중인 ``(별칭, 시작 monotonic 초)``, ``slowest`` 는 직전
+    갱신 라운드에서 가장 오래 걸린 조회의 ``(별칭, 걸린 초)`` 다(없으면 ``None``).
+    """
     if sample is None:
         return UNKNOWN, "not_checked", "not checked yet; the first refresh has not finished"
     age = now - sample.observed
@@ -501,7 +536,7 @@ def _verdict(
             "stale",
             (
                 f"the last check is {age:.0f}s old (more than {STALE_FACTOR} x REFRESH); "
-                "the refresh thread may be stuck"
+                + _stale_cause(alias, checking, slowest, now, refresh)
             ),
         )
     if sample.error is not None:
@@ -632,7 +667,14 @@ def _verdict(
 
 
 def alias_status(
-    sample: Sample | None, now: float, *, refresh: float, grace: float
+    sample: Sample | None,
+    now: float,
+    *,
+    refresh: float,
+    grace: float,
+    alias: str | None = None,
+    checking: tuple[str, float] | None = None,
+    slowest: tuple[str, float] | None = None,
 ) -> dict[str, Any]:
     """별칭 하나의 상태(응답의 ``databases[alias]``). ``now`` 는 monotonic 초다.
 
@@ -643,9 +685,11 @@ def alias_status(
     없으면: 파일 시각 역행 → ``unknown``, 파일 시각(보조)이 grace 이상 L0 보다 새로움 →
     ``backlog``, 그 밖 → ``unknown``(``caught_up`` 으로 단정하지 않는다). WAL 에 L0 뒤 커밋이
     grace 이상 남음 → ``backlog``. 그 밖은 ``caught_up``. 지속 시간은 monotonic 관측
-    시각(``observed``)끼리의 차이다.
+    시각(``observed``)끼리의 차이다. ``stale`` 사유에는 갱신 스레드가 지금 조회 중인 별칭
+    (``checking``)과 그 경과 초, 조회 중이 아니면 직전 라운드의 가장 느린 조회(``slowest``)를
+    덧붙인다(#72).
     """
-    status, code, reason = _verdict(sample, now, refresh, grace)
+    status, code, reason = _verdict(sample, now, refresh, grace, alias, checking, slowest)
     return {"status": status, "code": code, "reason": _one_line(reason), **_fields(sample, now)}
 
 
@@ -807,6 +851,10 @@ class Monitor:
     _thread: threading.Thread | None = field(default=None, init=False)
     _stop: threading.Event = field(default_factory=threading.Event, init=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, init=False)
+    # 갱신 스레드가 지금 조회 중인 (별칭, 시작 monotonic 초). stale 사유에 쓴다(#72).
+    _checking: tuple[str, float] | None = field(default=None, init=False)
+    # 직전 갱신 라운드에서 가장 오래 걸린 조회 (별칭, 걸린 초). 쉬는 동안의 stale 사유에 쓴다(#72).
+    _slowest: tuple[str, float] | None = field(default=None, init=False)
 
     # -- 갱신 --
 
@@ -887,31 +935,46 @@ class Monitor:
 
     def refresh_once(self) -> None:
         """모든 별칭을 한 번 갱신한다. 예외는 삼키고 그 별칭을 ``unknown`` 사유로 남긴다."""
+        slowest: tuple[str, float] | None = None
         for cfg in self.config.databases:
+            try:
+                started = self.monotonic()
+            except Exception:  # noqa: BLE001
+                started = time.monotonic()
             with self._lock:
                 prev = self.samples.get(cfg.alias)
+                self._checking = (cfg.alias, started)
             try:
-                sample = self._sample(cfg, prev)
-            except Exception as exc:  # noqa: BLE001 - 스레드가 죽지 않게 사유로 남긴다
                 try:
-                    self._log_once(cfg.alias, f"refresh failed: {type(exc).__name__}: {exc}")
-                except Exception:  # noqa: BLE001
-                    pass
-                try:
-                    observed, wall = self._now()
-                except Exception:  # noqa: BLE001
-                    observed, wall = time.monotonic(), time.time()
-                sample = Sample(
-                    observed,
-                    wall,
-                    error_code="refresh_failed",
-                    error=f"refresh failed ({type(exc).__name__}); details are in the "
-                    f"{LOGGER_NAME} log",
-                )
-            with self._lock:
-                self.samples[cfg.alias] = sample
+                    sample = self._sample(cfg, prev)
+                except Exception as exc:  # noqa: BLE001 - 스레드가 죽지 않게 사유로 남긴다
+                    try:
+                        self._log_once(cfg.alias, f"refresh failed: {type(exc).__name__}: {exc}")
+                    except Exception:  # noqa: BLE001
+                        pass
+                    try:
+                        observed, wall = self._now()
+                    except Exception:  # noqa: BLE001
+                        observed, wall = time.monotonic(), time.time()
+                    sample = Sample(
+                        observed,
+                        wall,
+                        error_code="refresh_failed",
+                        error=f"refresh failed ({type(exc).__name__}); details are in the "
+                        f"{LOGGER_NAME} log",
+                    )
+                with self._lock:
+                    self.samples[cfg.alias] = sample
+            finally:
+                # Exception 밖의 예외로 스레드가 죽어도 '조회 중' 표시를 남기지 않는다
+                with self._lock:
+                    self._checking = None
+            spent = sample.observed - started  # observed 는 조회가 끝난 뒤 찍힌다
+            if slowest is None or spent > slowest[1]:
+                slowest = (cfg.alias, spent)
         with self._lock:
             self.refreshes += 1
+            self._slowest = slowest
 
     def _run(self, stop: threading.Event) -> None:
         while not stop.is_set():
@@ -936,6 +999,8 @@ class Monitor:
             self._stop = threading.Event()
             self.samples = {}
             self._logged = {}
+            self._checking = None
+            self._slowest = None
             self._thread = None
             self._pid = pid
         if self._thread is not None and self._thread.is_alive():
@@ -958,12 +1023,17 @@ class Monitor:
         now = self.monotonic() if now is None else now
         with self._lock:
             samples = dict(self.samples)
+            checking = self._checking
+            slowest = self._slowest
         databases = {
             cfg.alias: alias_status(
                 samples.get(cfg.alias),
                 now,
                 refresh=self.config.refresh,
                 grace=self.config.backlog_grace,
+                alias=cfg.alias,
+                checking=checking,
+                slowest=slowest,
             )
             for cfg in self.config.databases
         }
