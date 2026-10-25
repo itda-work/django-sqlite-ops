@@ -483,7 +483,15 @@ class Fakes:
         return self.db, None
 
 
-def monitor(tmp_path, *, refresh=0.05, grace=60.0, clock=time.time, monotonic=time.monotonic, **kw):
+# stale(REFRESH×3) 이 아닌 사유를 보는 테스트는 REFRESH 를 넉넉히 둔다. 0.05초면 느린 러너에서
+# 갱신과 조회 사이가 0.15초를 넘어 stale 이 먼저 맞는다(#56). stale 은 주입 시계로 따로 본다.
+SLOW_REFRESH = 60.0
+FROZEN = 1000.0  # 스레드 테스트용 고정 monotonic: 갱신 주기는 짧게, 나이는 늘 0 으로 둔다
+
+
+def monitor(
+    tmp_path, *, refresh=SLOW_REFRESH, grace=60.0, clock=time.time, monotonic=time.monotonic, **kw
+):
     db = tmp_path / "app.sqlite3"
     if not db.exists():
         db.write_bytes(b"x" * 4096)  # DB 본 파일이 있어야 판정한다(#40). 열지는 않는다
@@ -520,7 +528,7 @@ def test_monitor_is_not_started_until_requested(tmp_path):
 
 
 def test_monitor_refreshes_periodically(tmp_path, caplog):
-    m, fakes = monitor(tmp_path)
+    m, fakes = monitor(tmp_path, refresh=0.05, monotonic=lambda: FROZEN)
     m.ensure_started()
     try:
         assert wait_for(lambda: m.refreshes >= 3)
@@ -539,7 +547,7 @@ def test_monitor_refreshes_periodically(tmp_path, caplog):
 
 
 def test_monitor_survives_exceptions(tmp_path):
-    m, fakes = monitor(tmp_path)
+    m, fakes = monitor(tmp_path, refresh=0.05, monotonic=lambda: FROZEN)
     fakes.fail = True
     m.ensure_started()
     try:
@@ -568,7 +576,9 @@ def test_monitor_survives_clock_and_path_exceptions(tmp_path):
 
 
 def test_monitor_restarts_after_pid_change(tmp_path, monkeypatch):
-    m, fakes = monitor(tmp_path)
+    # 새 스레드의 첫 갱신이 before 를 읽기 전에 끝날 수 있어 다음 갱신이 곧 와야 한다.
+    # report 를 보지 않으므로 짧은 REFRESH 여도 stale 위험은 없다
+    m, fakes = monitor(tmp_path, refresh=0.05)
     m.ensure_started()
     first, first_stop = m._thread, m._stop
     try:
@@ -639,7 +649,7 @@ def test_monitor_path_rules(tmp_path):
 
     fakes.db = str(real / "ok.sqlite3")
     m.config = HealthConfig(
-        (AliasConfig("default", "/etc/litestream.yml", str(link / "meta")),), 0.05, 60.0
+        (AliasConfig("default", "/etc/litestream.yml", str(link / "meta")),), SLOW_REFRESH, 60.0
     )
     m.refresh_once()
     reason = m.report()["databases"]["default"]["reason"]
@@ -719,11 +729,21 @@ from django.core.checks import run_checks
 run_checks()
 out["threads_after_setup"] = [t.name for t in threading.enumerate()]
 
+# 첫 요청은 스레드를 시작할 뿐 결과를 기다리지 않는다. 가짜 조회는 순식간이라 느린 러너에서는
+# 첫 report() 전에 첫 갱신이 끝날 수 있다(#56). 첫 응답을 받을 때까지 원격 조회를 붙잡아 둔다
+first_done = threading.Event()
+
+
+def fake_remote(c, p):
+    first_done.wait(20)
+    return RemoteTxid(fake["remote"])
+
+
 if fake is not None:
     cfg, errors = health.load_config()
     health._monitor = health.Monitor(
         cfg,
-        remote=lambda c, p: RemoteTxid(fake["remote"]),
+        remote=fake_remote,
         local=lambda p, m: fake["local"],
         wal=lambda p, m: WalEvidence(IN_SYNC, "every -wal commit is within the latest L0"),
     )
@@ -734,6 +754,7 @@ for query in ["", "?strict=1"]:
     r = client.get("/healthz" + query)
     responses.append({"code": r.status_code, "body": r.json(), "cc": r["Cache-Control"]})
 out["first"] = responses
+first_done.set()
 m = health._monitor
 if m is not None:
     deadline = time.monotonic() + 20
@@ -773,10 +794,12 @@ def run_view(databases, *, fake=None, **extra):
 
 
 def health_settings(config_path, **extra):
+    # 스레드는 시작하자마자 한 번 갱신하고 VIEW_SCRIPT 가 그 첫 관측을 기다린다. 두 번째 갱신은
+    # 필요 없으므로 REFRESH 를 넉넉히 둬 두 번째 요청이 stale 에 걸리지 않게 한다(#56).
     return {
         "HEALTH": {
             "DATABASES": {"default": {"litestream_config": str(config_path)}},
-            "REFRESH": 0.05,
+            "REFRESH": SLOW_REFRESH,
             **extra,
         }
     }
@@ -1086,7 +1109,7 @@ def test_remote_error_text_is_not_in_response_or_log(tmp_path, litestream_binary
                 "DATABASES": {
                     "default": {"litestream_config": str(config), "litestream": litestream_binary}
                 },
-                "REFRESH": 0.05,
+                "REFRESH": SLOW_REFRESH,
             }
         },
     )
