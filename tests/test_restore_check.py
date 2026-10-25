@@ -516,11 +516,13 @@ class Rows:
 class LateStart:
     """첫 ``interrupt()`` 뒤에야 ``execute`` 에 들어가 '문장 전 발동'을 강제한다(#60·#63)."""
 
-    def __init__(self, conn, *, after=None):
+    def __init__(self, conn, *, after=None, pause=0.0):
         self.conn = conn
         self.after = after
+        self.pause = pause  # 검사 뒤 문장마다 쉬는 시간(초). 남은 재시도가 있으면 그 사이에 찍힌다
         self.fired = threading.Event()
         self.interrupts = 0
+        self.interrupts_at_followup = None  # 검사 뒤 첫 문장이 들어온 시점의 interrupt() 호출 수
         self.ran = None  # 실제 검사 문장이 돈 시간(초). 발동을 기다린 시간은 뺀다
 
     def interrupt(self):
@@ -539,6 +541,10 @@ class LateStart:
             if self.after is not None:
                 self.after(self)
             return Rows(rows)
+        if self.ran is not None:
+            if self.interrupts_at_followup is None:
+                self.interrupts_at_followup = self.interrupts
+            time.sleep(self.pause)
         return self.conn.execute(sql)
 
     def close(self):
@@ -585,16 +591,31 @@ def test_corrupt_result_with_the_timer_fired_reports_both_and_keeps_the_structur
 ):
     """손상 결과와 타이머 발동이 겹치면 둘을 함께 적고, 남은 interrupt 가 구조 요약을 끊지 않는다.
 
-    검사 문장이 끝난 직후 ``interrupt()`` 를 한 번 더 불러 '종료 직전 재시도'를 흉내 낸다.
+    검사 문장이 끝난 직후 ``interrupt()`` 를 한 번 더 불러 '종료 직전 재시도'를 흉내 낸다. 구조 요약
+    문장마다 재시도 간격보다 길게 쉬어, 타이머 스레드가 그때까지 살아 있으면 호출이 찍히게 한다
+    (join 뒤에만 구조 요약을 연다는 불변식, #63 리뷰 1 P2-1).
     """
     db = make_corrupt_db(tmp_path / "corrupt.db")
+    opened = []
     real_connect = rc._connect_ro
-    monkeypatch.setattr(
-        rc,
-        "_connect_ro",
-        lambda path: LateStart(real_connect(path), after=lambda late: late.conn.interrupt()),
-    )
+
+    def connect(path):
+        late = LateStart(
+            real_connect(path),
+            after=lambda late: late.conn.interrupt(),
+            pause=3 * rc._INTERRUPT_RETRY,
+        )
+        opened.append(late)
+        return late
+
+    monkeypatch.setattr(rc, "_connect_ro", connect)
     passed, got = rc.check_integrity(db, "full", 0.005)
+    late = opened[0]
+    assert late.interrupts_at_followup is not None
+    assert late.interrupts == late.interrupts_at_followup, (
+        late.interrupts,
+        late.interrupts_at_followup,
+    )
     assert not passed
     assert [(i.key, i.level) for i in got] == [
         ("integrity", "error"),
