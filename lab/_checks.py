@@ -342,6 +342,11 @@ _FULL = re.compile(r"mailbox for (\S+) is full \(capacity \d+\); (\d+) message\(
 _ROOM = re.compile(r"mailbox for (\S+) has room again after dropping (\d+) message\(s\)")
 
 
+# nats-py 2.16.0 ``Client._read_loop`` 이 일반 예외에서 남기고 읽기 루프를 끝내는 줄. 랩 뷰는
+# 예외를 ``[종류: 메시지]`` 로 덧붙인다(notes/chanlab.py ``_Capture``).
+NATS_READ_ERROR = "nats: encountered error"
+
+
 def nats_drops(lines: list[str], channel: str) -> int:
     """``channel`` 의 mailbox 가 버린 메시지 수. 드롭 구간마다 마지막 누적 값을 더한다."""
     total = current = 0
@@ -376,6 +381,7 @@ def delivery_summary(spec: dict, trial: dict, near: float = 0.05) -> dict:
                     1 for t in w["cancel_times"] if trial["t0"] - near <= t <= trial["t1"] + near
                 ),
                 "errors": w["errors"],
+                "nats_errors": [m for m in w["nats_log"] if NATS_READ_ERROR in m],
             }
         )
     every = [i for w in trial["workers"] for i in w["ids"]]
@@ -401,6 +407,9 @@ def delivery_problems(spec: dict, trial: dict) -> list[str]:
     - ``record``: 판정 대상(D2 재현). 중복·모르는 id 만 본다.
 
     모든 경우에 송신 예외·수신 루프 예외가 없어야 하고, 워커 수가 ``spec["workers"]``(기본 2)다.
+    워커 ``nats_log`` 에 nats-py 읽기 루프 오류(``nats: encountered error``)가 없어야 한다 — 그 뒤로
+    그 연결은 아무것도 읽지 않는데(handoff-marco-nats-flush-cancel.md) ``lossy``·``record`` 는
+    손실로만 남기 때문이다. 메시지에 예외 이름을 드러낸다.
     """
     s = delivery_summary(spec, trial)
     n = spec["n"]
@@ -414,6 +423,8 @@ def delivery_problems(spec: dict, trial: dict) -> list[str]:
         tag = f"pid {w['pid']}"
         if w["errors"]:
             problems.append(f"{tag}: receive errors {w['errors'][:3]}")
+        if w["nats_errors"]:
+            problems.append(f"{tag}: nats-py read loop error {w['nats_errors'][:3]}")
         if w["unknown"]:
             problems.append(f"{tag}: unknown ids {w['unknown']}")
         if w["dup"]:

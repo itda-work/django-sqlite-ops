@@ -84,7 +84,16 @@ async def ready(layer, spec, key, channels, workers) -> dict:
         if time.monotonic() > end:
             if spec.get("may_not_ready"):
                 return {"ready": False, "ready_s": None, "probes_sent": sent}
-            raise TimeoutError(f"not ready: {[(p, s['probes']) for p, s in states.items()]}")
+            detail = {
+                pid: {
+                    "probes": st["probes"],
+                    "cancels": st["cancels"],
+                    "errors": st["errors"][-3:],
+                    "nats_log": st["nats_log"][-5:],
+                }
+                for pid, st in states.items()
+            }
+            raise TimeoutError(f"not ready after {sent} probes: {json.dumps(detail)}")
         await asyncio.sleep(0.05)
 
 
@@ -195,7 +204,10 @@ async def main(spec: dict) -> dict:
     layer = get_channel_layer()
     out = {"spec": spec, "trials": []}
     for index in range(spec.get("trials", 1)):
-        out["trials"].append(await trial(layer, spec, index))
+        try:
+            out["trials"].append(await trial(layer, spec, index))
+        except TimeoutError as exc:
+            raise TimeoutError(f"trial {index}: {exc}") from None
     if spec.get("close", True):
         t0 = time.monotonic()
         await layer.close()

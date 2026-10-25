@@ -534,8 +534,8 @@ SQLITE_OPS = {
   | 디스크 쓰기 / Litestream 영향 | 없음 | 없음(Redis 쪽) |
   | 1:1 지연 p50 (로컬 실측) | 0.3ms | (이번에는 재지 않음) |
 
-- 컨테이너에서 워커 사이 전달을 확인했다(랩 P2, 2026-10-26, channels-nats 0.10.0·nats-py 2.16.0, uvicorn 워커 2): 그룹·프로세스 전용 채널은 워커마다 200/200(1ms `wait_for` 취소 수천 번 포함, 워커 → 워커 포함), 일반 채널 큐 그룹은 합 200·중복 0. 계약상 허용 손실 두 가지도 재현했다 — 일반 채널 10ms 폴링의 취소 공백(184/200), 간격 없는 버스트의 mailbox `capacity`(100) 드롭(손실 = 드롭 수). D2 의 196/200 은 후자다([`lab-2026-10-26-multiproc-nats.md`](research/lab-2026-10-26-multiproc-nats.md)).
-- **알려진 결함**: 일반 채널을 구독 확인 왕복보다 짧게(1ms) `wait_for` 로 폴링하면 nats-py 읽기 루프가 `InvalidStateError` 로 끝나 그 연결은 그룹 메시지까지 받지 못한다(재현함). 랩이 strict xfail 로 고정하고, 외부 변경은 마르코 이관 문서([`handoff-marco-nats-flush-cancel.md`](research/handoff-marco-nats-flush-cancel.md))로 넘겼다.
+- 컨테이너에서 워커 사이 전달을 확인했다(랩 P2, 2026-10-26, channels-nats 0.10.0·nats-py 2.16.0, uvicorn 워커 2): 그룹·프로세스 전용 채널은 워커마다 200/200(1ms `wait_for` 취소 수천 번 포함, 워커 → 워커 포함), 일반 채널 큐 그룹은 합 200·중복 0. 계약상 허용 손실 두 가지도 재현했다 — 일반 채널 10ms 폴링의 취소 공백(184/200), 간격 없는 버스트의 mailbox `capacity`(100) 드롭(손실 = 드롭 수). D2 의 196/200(`~/Apps/django-lab/runs/radar-spike-sqlite-layer-20261007-161819/verify2.log:8`)도 후자로 본다. 근거는 0.10.0 에서 같은 모양(손실 시도마다 한 워커가 정확히 100건)을 재현한 것, 원 실행 판 `c728f35` 의 용량 로직이 같은 것(코드상 확인)이다. 원 실행 자체의 원인은 이 둘에서 나온 추론이다(조건이 다르다: spawn 프로세스, `sleep(1.5)`, uvicorn 아님)([`lab-2026-10-26-multiproc-nats.md`](research/lab-2026-10-26-multiproc-nats.md) §4).
+- **알려진 결함**: 구독 확인(`new_channel`·`group_add`·일반 채널 첫 `receive`)이 취소되거나 시간 초과되면 nats-py 읽기 루프가 `InvalidStateError` 로 끝나 그 연결은 그룹 메시지까지 받지 못한다. 그 뒤의 구독은 확인 없이 성공한다. 1ms `wait_for` 폴링은 재현함(매번), 10ms 폴링도 재현함(2026-10-26, P2 4회 중 1회). nats-py flush 타임아웃·`publish_deadline` 경로는 코드상 확인. 랩이 strict xfail 로 고정하고, 외부 변경은 마르코 이관 문서([`handoff-marco-nats-flush-cancel.md`](research/handoff-marco-nats-flush-cancel.md))로 넘겼다.
 - SQLite 기반 레이어(channels-lite)는 추천하지 않는다. 근거는 다음과 같다.
   - 폴링 간격과 유휴 CPU 를 맞바꿔야 한다. 0.1초 간격이면 p50 51ms·유휴 CPU 59ms/10초, 0.001초 간격이면 p50 2.3ms·유휴 CPU 1.9초/10초(코어의 약 19%)다.
   - 메시지마다 DB 쓰기가 2번 생긴다.

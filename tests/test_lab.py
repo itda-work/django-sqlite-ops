@@ -507,6 +507,26 @@ def test_p2_errors_and_unknown_ids_always_fail():
     assert any("unknown ids [7]" in p for p in problems)
 
 
+def test_p2_nats_read_loop_error_fails_every_expectation():
+    """nats-py 읽기 루프가 끝났다는 줄이 있으면 손실을 허용하는 판정도 실패한다(#66 리뷰 P3-3)."""
+    c = _checks()
+    ch = "lab.plain.k"
+    dead = "nats: encountered error [InvalidStateError: invalid state]"
+    for expect in ("each", "split", "lossy", "drops", "record"):
+        spec = {"n": 2, "expect": expect}
+        trial = _trial(_worker(1, ch, [0], nats_log=[dead]), _worker(2, ch, [1]))
+        problems = c.delivery_problems(spec, trial)
+        assert any("read loop error" in p and "InvalidStateError" in p for p in problems), (
+            expect,
+            problems,
+        )
+    # 다른 경고(용량 드롭)만으로는 이 판정이 나지 않는다
+    calm = _trial(_worker(1, ch, [0], nats_log=[_full(ch, 1)]), _worker(2, ch, [1]))
+    assert not any(
+        "read loop" in p for p in c.delivery_problems({"n": 2, "expect": "record"}, calm)
+    )
+
+
 def test_p2_split_queue_group_needs_union_once_and_both_workers():
     c = _checks()
     spec = {"n": 4, "expect": "split"}

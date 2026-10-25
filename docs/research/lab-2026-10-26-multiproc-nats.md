@@ -61,7 +61,7 @@ N = 200, 수신 워커 2개. 간격은 송신 사이 `asyncio.sleep`.
 - doctor: `OK default backend channels_nats.NatsChannelLayer` (exit 0).
 - 그룹·전용 채널은 1ms 취소를 수천 번 겪어도 손실이 없었다. 이미 있는 mailbox 를 읽는 `receive()` 는 구독 확인을 기다리지 않기 때문이다(§5 의 결함이 이쪽에서 나지 않는 이유, 코드상 확인).
 
-## 4. D2 196/200 판정 — **재현함: 수신 쪽 mailbox 용량(100) 드롭. 하네스(버스트 > capacity)의 결과다**
+## 4. D2 196/200 판정 — **같은 모양을 재현함: 수신 쪽 mailbox 용량(100) 드롭. 원 실행의 원인은 그것으로 추론한다(하네스의 버스트 > capacity)**
 
 D2 와 같은 꼴: 일반 채널 하나를 워커 둘이 `wait_for(receive, 0.5)` 로 읽고, 별도 프로세스가 200건을 간격 없이 보낸다(probe 로 준비 확인 뒤). 시도 20회. 수신 쪽 레이어만 `capacity` 를 바꾼 판(`cap1000`, 별도 인스턴스)과 비교한다.
 
@@ -71,7 +71,10 @@ D2 와 같은 꼴: 일반 채널 하나를 워커 둘이 `wait_for(receive, 0.5)
 | 보조 실행 4(꼬리 probe 전) | 9/20, 2–11건 | 0/20 |
 | 보조 실행 5 | 10/20, 1–16건 | (돌리지 않음) |
 
-- 손실이 난 시도 **32건 모두에서 한 워커가 정확히 100건**을 받았고 그 워커에 `mailbox … is full (capacity 100)` 경고가 있었다. 손실 id 는 버스트 끝쪽(184–199)이다. 원 D2 출력 `received=196 split=100/96`(같은 하네스·같은 커밋의 1차 실행은 `200/200 split=102/98`, `runs/radar-spike-sqlite-layer-20261007-161819/verify.log`)과 같은 모양이다.
+- 손실이 난 시도 **32건 모두에서 한 워커가 정확히 100건**을 받았고 그 워커에 `mailbox … is full (capacity 100)` 경고가 있었다. 손실 id 는 버스트 끝쪽(184–199)이다. 원 D2 출력과 같은 모양이다. 원 출력은 `~/Apps/django-lab/runs/radar-spike-sqlite-layer-20261007-161819/` 아래(이 저장소 밖)에 있다.
+  - 196: 2차 하네스(`# 2차(하네스 수정: D2 ChannelFull 집계, get timeout)`)의 `verify2.log:8` — `sent_ok=200 ChannelFull=0 received=196 dup=0 split=100/96`.
+  - 200: 1차 하네스의 `verify.log:7` — `total=200/200 dup=0 split=102/98`.
+  - 두 실행은 하네스가 다르고 channels-nats 커밋(`c728f35`)만 같다.
 - 모든 시도에서 송신 창 ±50ms 안의 취소는 **0회**였다. 버스트 동안은 메시지가 계속 와 0.5초 타임아웃이 나지 않는다.
 - 왜 버스트가 한 번에 쌓이나(코드상 확인): nats-py 의 구독 태스크는 대기열이 비지 않는 동안 콜백을 연달아 부르고, 레이어 콜백(`_enqueue`)은 기다리지 않는다. 그래서 한 읽기 버퍼에 든 메시지가 수신 태스크가 돌기 전에 mailbox 에 다 들어간다. 큐 그룹 분배가 100 을 넘은 쪽이 넘친 만큼 버린다.
 
@@ -83,7 +86,12 @@ D2 와 같은 꼴: 일반 채널 하나를 워커 둘이 `wait_for(receive, 0.5)
 | 중복 집계(두 수신자 교집합만) | 200 미만을 설명하지 못함(같은 수신자 안의 중복은 `received` 를 늘린다, 코드상 확인). 이 랩은 워커 안·사이 중복 모두 0 |
 | 준비 확인 없음(`sleep(1.5)`) | 주 원인 아님(추론): 한쪽이 구독 전이면 다른 쪽이 거의 다 받아 손실이 ~100 이어야 하는데 원 출력은 100/96 |
 
-결론: channels-nats 결함이 아니라 README 가 밝힌 '받는 쪽이 넘치는 메시지를 버린다'를 하네스의 버스트가 건드린 것이다. 운영 함정 하나가 나온다: **드롭 경고는 60초에 한 번으로 묶여, 첫 줄("1 message(s) dropped so far")만 보면 실제 손실(이 실측에서 최대 16, BURST 에서 100)을 과소평가한다.** 합계는 자리가 난 뒤 다음 메시지가 들어올 때 "has room again after dropping N" 으로 나온다.
+판정의 근거는 셋이고, 강도가 다르다.
+1. 0.10.0 에서 같은 모양을 재현함(위 표).
+2. 원 실행 판(`c728f35`)의 `_enqueue` 용량 로직이 0.10.0 과 같음(코드상 확인, `git -C ~/Apps/itda-work/channels-nats show c728f35:channels_nats/layer.py`).
+3. 원 실행 자체의 원인은 1·2 에서 나온 **추론**이다. 원 실행은 이 랩과 조건이 다르다: 별도 프로세스(spawn) 수신, `sleep(1.5)` 준비, uvicorn 아님, macOS 로컬 nats-server. 원 실행의 드롭 경고는 남아 있지 않다(그 실행의 `bench.err` 에 channels_nats 줄 없음).
+
+결론: channels-nats 결함이 아니라 README 가 밝힌 '받는 쪽이 넘치는 메시지를 버린다'를 하네스의 버스트가 건드린 것으로 본다. 운영 함정 하나가 나온다: **드롭 경고는 60초에 한 번으로 묶여, 첫 줄("1 message(s) dropped so far")만 보면 실제 손실(이 실측에서 최대 16, BURST 에서 100)을 과소평가한다.** 합계는 자리가 난 뒤 다음 메시지가 들어올 때 "has room again after dropping N" 으로 나온다.
 
 ## 5. 알려진 결함 — 일반 채널을 구독 확인 왕복보다 짧게 폴링하면 연결이 읽기를 멈춘다 (재현함)
 
@@ -98,8 +106,9 @@ D2 와 같은 꼴: 일반 채널 하나를 워커 둘이 `wait_for(receive, 0.5)
 
 - 원인(코드상 확인): 일반 채널 첫 `receive()` 가 구독 확인 `flush` 를 기다리는 동안 1ms 타임아웃이 그것을 취소한다. nats-py 2.16.0 의 `flush()` 는 PONG future 를 `_pongs` 에 넣고 기다리므로 취소된 future 가 거기 남는다. PONG 이 오면 `_process_pong` 이 그 future 에 `set_result` 하다 `InvalidStateError` 를 내고, `_read_loop` 는 `except Exception: _logger.error(...); break` 로 **읽기 루프를 끝낸다**(재접속·close 없음).
 - 관측: 서버(`connz`)에는 그 연결의 새 SUB 가 있고 `out_msgs` 가 늘지만, 워커의 nats-py 구독 태스크는 모두 빈 대기열에서 기다린다(`/lab/chan/tasks` 덤프). 쓰기는 되고 읽기는 죽은 연결이다.
+- 촉발 경로는 1ms 폴링(호출자 취소)만이 아니다. nats-py `flush()` 자신의 타임아웃(10초)과 레이어의 `publish_deadline`(10초)도 확인 대기의 future 를 취소된 채 남긴다(코드상 확인, 재현하지 않음). 읽기 루프가 죽은 뒤에는 `flush()` 가 PING 없이 돌아가므로 이후 `new_channel()`·`group_add()` 는 확인 없이 성공한다(코드상 확인). 자세한 것은 이관 문서.
 - 처음에는 1ms 폴링을 기본 레이어에서 돌려 그 뒤 모든 시나리오(BURST·NOCLOSE·D2-cap100·LIVE)가 probe 0건으로 실패했다. 결함을 별도 인스턴스에 가둔 것은 그래서다.
-- 10ms 폴링(P-cancel)에서는 나지 않았다(실측 RTT 약 0.25ms). 다만 부하로 확인 왕복이 타임아웃을 넘으면 같은 경로가 열린다(원리상, 미검증).
+- **10ms 폴링(P-cancel)에서도 재현됐다**(2026-10-26 수정 1 검증, 같은 하네스의 P2 4회 중 1회: 워커 40 에 `InvalidStateError`, 이어 같은 인스턴스의 P-cancel-after 에서 워커 40 probe 0/508). RTT 약 0.25ms 인 랩에서도 확인 왕복이 가끔 10ms 를 넘는다. 다른 1회(D2-cap1000, 0.5초 폴링)도 한 워커가 probe 0/247 로 같은 모양이었지만 그때는 로그를 남기지 않아 원인 미확인이다.
 - 미검증: 회복 여부와 시간(nats-py ping 간격 기본 120초로 멈춘 연결을 알아챌 것으로 추정, 재지 않음), 실제 Channels 컨슈머에서 구독 확인 중 취소(접속 직후 끊긴 websocket 의 `new_channel`·`group_add`)로 같은 일이 나는지.
 - 부수 관측(확인 필요): 10ms 폴링 수신을 `stop`(취소)한 뒤 한 워커 연결에 `channels.ch.lab.plain.pc10…` 구독이 서버에 남아 있었다(`connz`, 보조 실행). README 는 일반 채널을 취소하면 즉시 해지한다고 쓴다.
 

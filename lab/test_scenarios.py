@@ -303,7 +303,9 @@ def _p2_channels(stack: Stack, rec: dict) -> None:
     rec["channels"] = results
     rec["channel_problems"] = problems
     if problems:
-        rec["app_log_tail"] = stack.logs("app")[-4000:]
+        # 접근 로그가 많아 꼬리만으로는 원인 줄이 밀려난다. 접근 로그를 뺀 줄을 남긴다.
+        lines = [ln for ln in stack.logs("app").splitlines() if not ln.startswith("INFO:")]
+        rec["app_log_lines"] = lines[-80:]
     assert not problems, problems
 
 
