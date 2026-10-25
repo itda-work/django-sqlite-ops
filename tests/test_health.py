@@ -608,10 +608,10 @@ def test_monitor_one_hanging_alias_delays_the_others(tmp_path, refresh):
     assert m.report()["databases"]["slow"]["code"] == "remote_error"
 
 
-def hang_monitor(tmp_path, remote, refresh, mono):
+def hang_monitor(tmp_path, remote, refresh, mono, order=("fast", "slow")):
     db = tmp_path / "app.sqlite3"
     db.write_bytes(b"x" * 4096)
-    aliases = (AliasConfig("fast", "/etc/a.yml"), AliasConfig("slow", "/etc/b.yml"))
+    aliases = tuple(AliasConfig(alias, f"/etc/{alias}.yml") for alias in order)
     return Monitor(
         HealthConfig(aliases, refresh, 60.0),
         remote=remote,
@@ -686,6 +686,28 @@ def test_stale_reason_while_resting_after_a_later_alias_hung(tmp_path):
         "the last check is 31s old (more than 3 x REFRESH); "
         "the last refresh spent 30s on alias 'slow'"
     ), db["fast"]
+
+
+def test_stale_reason_names_the_slowest_alias_not_the_last(tmp_path):
+    """#72 리뷰 2: '가장 느린 조회'는 라운드의 최댓값이다. 매달린 ``slow`` 뒤의 ``fast`` 가 짧게
+    (1초 < REFRESH) 걸려도, 쉬는 동안의 사유는 마지막 별칭이 아니라 ``slow`` 를 지목한다."""
+    mono = [0.0]
+
+    def remote(cfg, path):
+        if cfg.alias == "fast":
+            mono[0] += 1.0
+        elif m.refreshes == 1:
+            mono[0] += litestream.DEFAULT_LTX_TIMEOUT
+            return RemoteError("litestream ltx timed out after 30s")
+        return SAME
+
+    m = hang_monitor(tmp_path, remote, 2.0, mono, order=("slow", "fast"))
+    m.refresh_once()
+    mono[0] += 2.0
+    m.refresh_once()  # slow 3→33 매달림, fast 33→34
+    fast = m.report(now=mono[0] + 100.0)["databases"]["fast"]
+    assert fast["code"] == "stale"
+    assert fast["reason"].endswith("; the last refresh spent 30s on alias 'slow'"), fast
 
 
 def test_checking_mark_is_cleared_after_a_failed_refresh(tmp_path):
