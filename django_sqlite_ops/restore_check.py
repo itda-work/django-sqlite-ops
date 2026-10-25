@@ -212,6 +212,15 @@ def check_integrity(
             else:
                 message = f"{pragma} failed after {took}: {failure}"
             return False, [_item(alias, "integrity", "error", mode, None, message)]
+        if fired.is_set() and rows == [("ok",)]:
+            # 시한이 문장 시작 전에 지나면 interrupt() 는 no-op 이라 검사가 끝까지 돈다(SQLite
+            # c3ref/interrupt, #60 재현함). 결과가 ok 여도 예산을 넘겼으니 시간 초과로 본다(§6-2).
+            message = (
+                f"timeout: {pragma} did not finish within --integrity-timeout {timeout:g}s "
+                f"(the timer fired but the check was not interrupted; "
+                f"it ran to completion in {took})"
+            )
+            return False, [_item(alias, "integrity", "error", mode, None, message)]
         if rows != [("ok",)]:
             shown = " | ".join(str(r[0]) for r in rows[:_MAX_PROBLEMS])
             more = f" (+{len(rows) - _MAX_PROBLEMS} more)" if len(rows) > _MAX_PROBLEMS else ""
