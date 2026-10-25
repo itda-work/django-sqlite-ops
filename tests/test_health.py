@@ -568,6 +568,46 @@ def test_monitor_survives_exceptions(tmp_path):
         m.stop(5)
 
 
+@pytest.mark.parametrize("refresh", [2.0, 15.0])  # 회귀 랩 L8 의 REFRESH, 기본 REFRESH
+def test_monitor_one_hanging_alias_delays_the_others(tmp_path, refresh):
+    """#65: 갱신 스레드는 별칭을 순서대로 조회한다(별칭마다 스레드가 따로 있지 않다). 한 별칭의
+    원격 조회가 ``ltx`` 타임아웃(30초)까지 매달리면 정상 별칭의 다음 관측도 그만큼 밀려, 그 나이가
+    ``30 + REFRESH`` + (다른 조회 시간)까지 자란다. ``3 × REFRESH`` 를 넘으면 정상 별칭도 ``stale``
+    이다: REFRESH 2초면 매번, 기본 15초면 45초 경계를 다른 조회 시간만큼 넘는 동안."""
+    db = tmp_path / "app.sqlite3"
+    db.write_bytes(b"x" * 4096)
+    mono = [0.0]
+
+    def remote(cfg, path):
+        if cfg.alias == "slow":
+            mono[0] += litestream.DEFAULT_LTX_TIMEOUT  # 타임아웃까지 매달린 뒤 실패
+            return RemoteError("litestream ltx timed out after 30s")
+        return SAME
+
+    aliases = (AliasConfig("slow", "/etc/a.yml"), AliasConfig("fast", "/etc/b.yml"))
+    m = Monitor(
+        HealthConfig(aliases, refresh, 60.0),
+        remote=remote,
+        local=lambda path, meta: 5,
+        files=lambda path, meta: IDLE,
+        wal=lambda path, meta: W_SYNC,
+        path_of=lambda alias: (str(db), None),
+        monotonic=lambda: mono[0],
+    )
+    m.refresh_once()  # slow 30초 매달림 → fast 는 30초에 관측
+    assert m.samples["fast"].observed == 30.0
+    # 스레드가 REFRESH 를 쉬고, 다음 갱신의 slow 조회가 다시 30초 매달려 끝난 순간(fast 조회 전)
+    mono[0] += refresh + litestream.DEFAULT_LTX_TIMEOUT
+    fast = m.report()["databases"]["fast"]
+    assert fast["age"] == 30.0 + refresh
+    assert (fast["code"] == "stale") is (30.0 + refresh > 3 * refresh), fast
+    mono[0] += 0.5  # fast 의 조회(version 확인 + ltx)가 아직 진행 중
+    assert m.report()["databases"]["fast"]["code"] == "stale"
+    m.refresh_once()
+    assert m.report()["databases"]["fast"]["code"] == "in_sync"
+    assert m.report()["databases"]["slow"]["code"] == "remote_error"
+
+
 def test_monitor_survives_clock_and_path_exceptions(tmp_path):
     m, fakes = monitor(tmp_path)
 

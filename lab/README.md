@@ -6,7 +6,7 @@ Docker 로 Litestream·boot·헬스의 실패 경계(L1–L8, [DESIGN §10](../d
 
 ```bash
 scripts/lab.sh run all        # L1–L8, P1·P2 (약 8분). 끝나면 성공·실패와 관계없이 down -v
-scripts/lab.sh run L6         # pytest -k 로 좁힌다 (L1..L8, P1, P2)
+scripts/lab.sh run L6         # pytest -k 로 좁힌다 (L1..L8, L8c 처럼 하나만, P1, P2)
 scripts/lab.sh bench          # PRAGMA 벤치 + 포화 측정 (약 50분). pytest 인자를 넘길 수 있다(-k saturation)
 scripts/lab.sh soak           # fd·RSS 장시간 실행, CONN_MAX_AGE None·0 각 30분 (약 70분, #33)
 scripts/lab.sh cache [mech]   # cache_size 최소 재현(mech: 원인 가설)을 랩 이미지의 Python·SQLite 로 (약 19분 / 6분, #27)
@@ -19,7 +19,7 @@ scripts/lab.sh down           # 이 랩의 자원만 지우고 남은 것을 보
 `.github/workflows/lab.yml` 은 `workflow_dispatch` 전용 잡이다(#25). 기본 CI(push/PR)에는 들어가지 않는다.
 
 ```bash
-gh workflow run lab.yml -f scenarios=all    # 또는 P1, P2, L1..L8 (pytest -k 로 좁힌다)
+gh workflow run lab.yml -f scenarios=all    # 또는 P1, P2, L1..L8, L8c, L8d (pytest -k 로 좁힌다)
 gh run watch                                # 진행 보기
 gh run download <run-id>                    # artifact lab-<선택>-<run-id> = lab/.out/ 전체
 ```
@@ -86,8 +86,10 @@ P2 는 채널 레이어를 런타임에 쓰지 않는다(channels-nats 를 설�
 | L7 | 복제본의 모든 LTX 객체 가운데 64바이트를 뒤집음(filer API) | 새 컨테이너 exit 4 / 메타 삭제 볼륨 + `--on-unknown restore` exit 4, 로컬 파일 해시 무변경, 격리 없음 |
 | L8a | 쓰기를 계속하며 `s3` 20초 끔(업로드·헬스 조회 모두) | 경과 시간 기준: 랩의 허용 시간(가정) `REFRESH × 3` + 진행 중 조회 여유(`REFRESH` 로 가정) + 표본 간격 + 1초 안에 `unknown`(`stale`/`remote_error`)로 바뀌고 단절이 끝날 때까지 유지. 전환 전 `caught_up` 은 age ≤ `REFRESH × 3`, `stale` 은 age > 그 값(응답 age 의 반올림 0.0005 허용, `_checks.full_outage_problems`). 복구 뒤 `caught_up`, 쓰기 오류 0 |
 | L8b | 헬스 조회는 `s3h` 로 두고 업로드 경로 `s3` 만 20초 끔 | `backlog`(`local_ahead`) → 복구 뒤 `caught_up` |
+| L8c | 쓰기를 계속하며 `s3` 를 90초 끔(조회 타임아웃 30초의 3배, 연결 거부) | 랩의 허용 시간(가정, `_checks.long_outage_bounds`): 10초 안에 `stale`, 첫 `remote_error` 는 29–36초, 그 뒤 `remote_error`(약 6초)와 `stale`(약 26초)이 32±2초 주기로 번갈아(90초에 2구간 이상) 단절 내내 `unknown`. strict 는 단절 내내 503·복구 뒤 200. 앱 컨테이너의 `litestream ltx`(`lab_tools/procs.py` 로 `/proc` 를 3초마다)는 1개 이하·좀비 없음·한 PID 가 40초 넘게 보이지 않음·복구 뒤 단절 중 PID 없음. 쓰기 오류 0, 복구 뒤 120초 안 `caught_up`, 복제본 행 수 = 최종 행 수. Litestream WARN/ERROR 줄 수·대표 줄을 기록 |
+| L8d | 같은 90초를 무응답으로: `s3` 에 `timeout` toxic(`timeout` 0 = 연결은 받고 데이터를 버림) | L8c 와 같다 |
 
-L8 은 `LAB_HEALTH_REFRESH=2`, `LAB_HEALTH_GRACE=10` 으로 줄여 돈다(기본 15·60초면 20초 끊김이 grace 안에 든다).
+L8 은 `LAB_HEALTH_REFRESH=2`, `LAB_HEALTH_GRACE=10` 으로 줄여 돈다(기본 15·60초면 20초 끊김이 grace 안에 든다). 헬스의 원격 조회 타임아웃은 `boot/litestream.py` 의 `DEFAULT_LTX_TIMEOUT`(30초)이고 `HEALTH` 설정으로 바꿀 수 없다(2026-10-25 확인). L8c·L8d 가 각각 약 2분 30초 걸린다.
 
 L6 의 훅은 `LAB_RENAME_DELAY` 가 있을 때만 `os.rename` 뒤에 한 줄(`[lab-hook] rename k: ...`)을 남기고 잠든다. `PYTHONPATH=/app/lab_hooks` 로만 켜고 패키지 코드는 그대로다.
 
@@ -170,7 +172,7 @@ lab/
 ├── profile-override.yaml   P1·P2: 문서 compose 위에 덮는 것
 ├── multiproc-override.yaml P2 추가분
 ├── _lab.py                 compose·toxiproxy·조사 도구
-├── _checks.py              L6·L8a 판정(순수 함수, tests/test_lab.py 가 Docker 없이 검사)
+├── _checks.py              L6·L8a·L8c·L8d 판정(순수 함수, tests/test_lab.py 가 Docker 없이 검사)
 ├── _benchstat.py           벤치 집계·재현 판정(순수 함수, 같은 테스트가 검사)
 ├── _soakstat.py            soak 분석(순수 함수, 같은 테스트가 검사)
 ├── conftest.py             RUN_LAB 게이트, 결과 기록
@@ -183,6 +185,6 @@ lab/
 ├── cache_report.py         그 원자료 → 결과 문서의 표
 └── app/                    랩 Django 프로젝트(문서 조각 밖의 것)
     ├── manage.py, proj/asgi.py(벤치 계측 래퍼), proj/*_tail.py, notes/(뷰·계측)
-    ├── lab_tools/          inspect_data.py, replica.py, s3_objects.py, loadgen.py
+    ├── lab_tools/          inspect_data.py, replica.py, s3_objects.py, loadgen.py, procs.py
     └── lab_hooks/          sitecustomize.py (L6)
 ```

@@ -452,6 +452,10 @@ SQLITE_OPS = {
 | WAL 에 L0 뒤 커밋이 있고 그보다 짧음 | `caught_up`(`pending_since` 표시) | `db_changed_within_grace` |
 | 그 밖(원격 == 로컬, WAL 커밋이 모두 L0 안) | `caught_up` | `in_sync` |
 
+**원격 조회가 매달릴 때 (#65, 2026-10-25 확인)** — 헬스의 원격 조회 타임아웃은 `boot/litestream.py` 의 `DEFAULT_LTX_TIMEOUT`(30초)이고 `HEALTH` 설정으로 바꿀 수 없다. 시간이 넘으면 프로세스 그룹을 SIGKILL 하고 거둔다(`_KILL_GRACE` 5초). 갱신 스레드는 하나이고 별칭을 순서대로 조회한 뒤 `REFRESH` 를 쉬며, 관측 시각은 조회가 끝난 뒤 찍힌다. 그래서:
+- S3 가 연결을 거부하든 응답하지 않든 `ltx` 는 30초 매달린다. 단절이 30초보다 길면 `stale`(age > `REFRESH × 3`) → 조회가 타임아웃으로 끝난 뒤 `remote_error`(age ≤ 문턱인 동안) → 다음 조회가 매달리는 동안 다시 `stale` … 이 `REFRESH + 30` 초 주기로 번갈아 나온다. 둘 다 `unknown` 이라 strict 는 계속 503 이다. 매달린 `ltx` 는 동시에 하나뿐이고 남지 않는다. 랩 L8c·L8d(REFRESH 2초, 90초 단절)에서 재현함: 첫 `stale` 5.1초, `remote_error` 31초대·63–64초대, 복구 1–3초 뒤 `caught_up`([`lab-2026-10-25-long-outage.md`](research/lab-2026-10-25-long-outage.md)).
+- **한 별칭의 조회가 매달리면 다른 별칭의 관측도 밀린다.** 매달린 시간이 `2 × REFRESH` 를 넘으면 정상 별칭도 `stale` 이다(기본 `REFRESH` 15초면 30 + 15 = 45 = 문턱이라 다른 조회 시간만큼만). 코드상 확인, 주입 시계로 단언(`test_monitor_one_hanging_alias_delays_the_others`). 별칭이 여럿인 컨테이너에서는 재지 않았다(§12).
+
 **DB 본 파일 상태 (#40)** — WAL·로컬 메타·복제본은 DB 본 파일과 따로 남는다. DB 만 지워지거나(이름 변경·잘못된 정리) 0바이트가 되어도 `-wal` 과 메타가 남으면 TXID 와 WAL 위치가 맞아 `caught_up/in_sync` 였다(#40 재현: `replicate -once` 뒤 DB 만 옮김 → `in_sync`, DB 를 0바이트로 → `in_sync`. `-wal` 도 없으면 `no_wal_evidence`). 그 WAL 이 붙을 DB 가 없으면 정상이라 할 수 없다.
 - 경로 규칙(D-15) 통과 뒤 실제 DB 경로를 `os.lstat` 한 번으로 본다. 열지 않으므로 DB·`-wal`·`-shm` 을 만들거나 바꾸지 않는다(링크를 따라가지 않는다. 마지막 요소의 링크는 경로 규칙이 이미 거부한다). 없음(`FileNotFoundError`) → `db_missing`, 0바이트 정규 파일 → `db_empty`, 정규 파일 아님(디렉터리·FIFO 등) → `db_not_regular`, 그 밖의 `OSError` → `db_stat_failed`(원문은 로그로만).
 - 판정 순서는 경로 오류 다음, `unknown_at_boot`·`remote_error` 앞이다. 사유는 고정 문장에 경로만 넣고, `db_missing`·`db_empty` 에는 boot 로그와 `--on-unknown restore` 를 보라는 대처를 붙인다.
@@ -564,7 +568,7 @@ SQLITE_OPS = {
 
 스파이크 랩(`docs/reference/compose.yaml`, `Dockerfile`, `entrypoint.sh`)을 바탕으로 `lab/` 에 다시 만든다. S3 대체는 SeaweedFS 다(MinIO 는 익명 pull 이 막혀 있었다). 장애 주입은 toxiproxy 로 한다.
 
-구현은 `lab/`(설명 `lab/README.md`), 실행은 `scripts/lab.sh run [L1..L8|P1|P2|all]`·`bench`. 기본 `pytest`·CI 에는 들어가지 않는다(`RUN_LAB=1` 일 때만 수집). 결과: [`docs/research/lab-2026-10-08.md`](research/lab-2026-10-08.md).
+구현은 `lab/`(설명 `lab/README.md`), 실행은 `scripts/lab.sh run [L1..L8|P1|P2|all]`·`bench`. 기본 `pytest`·CI 에는 들어가지 않는다(`RUN_LAB=1` 일 때만 수집). 결과: [`docs/research/lab-2026-10-08.md`](research/lab-2026-10-08.md), L8c·L8d 는 [`lab-2026-10-25-long-outage.md`](research/lab-2026-10-25-long-outage.md).
 
 | ID | 시나리오 | 기대 | 결과(2026-10-08) |
 |---|---|---|---|
@@ -576,6 +580,7 @@ SQLITE_OPS = {
 | L6 | `--on-unknown restore` 진행 중 kill → 재시작 | 반쯤 옮겨진 상태 없음, 재실행으로 완료 | 통과(rename 8곳 모두에서 kill — kill 시 rename 수 = k 확인, 재실행 완료, 템플릿의 DB·사이드카·메타 하위 8항목이 한 격리 디렉터리에 같은 해시, D-14 지점은 격리 2개) |
 | L7 | 복원 실패(S3 객체 손상) | exit 4, 로컬 무변경 | 통과(새 컨테이너·격리 경로 모두 exit 4, 로컬 해시 그대로) |
 | L8 | 헬스: S3 20초 끊김 | `backlog` → 복구 후 `caught_up` | 조건부: 업로드만 끊기면(L8b) `backlog` → `caught_up`. 조회까지 끊기면(L8a) 랩의 허용 시간 10초(가정: `REFRESH × 3` + 진행 중 조회 여유 `REFRESH` + 표본 간격 + 1초. 조회 시간에서 도출된 보장 상한은 아니다) 안에 `unknown`(`stale`)으로 바뀌어 유지 → `caught_up` — §7 표대로 원격 조회 실패는 `unknown` 이 먼저다 |
+| L8c·L8d | 헬스: S3 90초 끊김(조회 타임아웃 30초의 3배) — 연결 거부 / 무응답(`timeout` toxic) | `unknown` 유지(`stale` 과 `remote_error` 가 `REFRESH + 30` 초 주기로 번갈아), strict 503, 매달린 `ltx` 없음 → 복구 후 `caught_up` | 통과(2026-10-25, 두 실행 모두): 첫 `stale` 5.1초, `remote_error` 구간 31.3–31.6·63.0–64.0초 시작, `ltx` 동시 최대 1·복구 뒤 0, 쓰기 오류 0, 복구 1.1–3.2초 뒤 `caught_up`. 단절 중 Litestream 로그 WARN/ERROR 0줄([`lab-2026-10-25-long-outage.md`](research/lab-2026-10-25-long-outage.md)) |
 
 배포 프로필 종단 검증(P1·P2): 문서의 Dockerfile·compose·entrypoint·settings 를 그대로 띄워 첫 배포·`check --deploy`·`sqlite_doctor`·`docker stop`(uvicorn 워커 1·2: exit 0, 대표 실행 0.47·0.72초, 400/400 복제)·재부팅·빈 볼륨 소유자 복사를 확인했다.
 
@@ -598,7 +603,7 @@ SQLITE_OPS = {
 - PRAGMA 후보의 5% 크기 효과: #26 실행은 반복 간 흔들림(약 7%)이 커서 검출하지 못했다. `cache_size` 단독 악화의 원인은 최소 재현에서 확인했다(#27). 남은 것: 16 스레드에서 더 나빠지는 데 전역 mutex 경합이 얼마나 기여하는지, 16 스레드 pk 읽기의 악화, 혼합 부하에서 `cache_mmap`·`all4` 가 나빠진 두 칸, 랩에서 정렬 비율·`cache_mmap` 을 바꾼 확인(랩 인과), amd64·SQLite 3.37.2 에서의 재현([`cache-size-2026-10-12.md`](research/cache-size-2026-10-12.md)#미검증)
 - 실제 클라우드 S3·R2·Tigris (미검증. 비용이 들어 마스터 승인 필요)
 - 회귀 랩은 SeaweedFS 4.48 + toxiproxy 2.12.0 으로만 돌았다(colima linux/arm64 와 GitHub Actions ubuntu-latest linux/amd64, 둘 다 11/11 통과 — [`lab-2026-10-08.md`](research/lab-2026-10-08.md#amd64-실행-github-actions-25)). 다른 S3 구현은 미검증
-- S3 단절이 `ltx` 타임아웃(30초)보다 길 때 헬스가 `stale` 에서 `remote_error` 로 넘어가는지(L8a 는 20초라 보지 못함), 분 단위 단절에서 Litestream 의 로그 변화 (미검증)
+- 긴 S3 단절(#65, 2026-10-25): 90초 단절의 `stale` ↔ `remote_error` 전이와 Litestream 로그(WARN/ERROR 0줄)는 L8c·L8d 로 재현했다(colima arm64). 남은 것: 별칭이 여럿인 컨테이너에서 한 별칭의 매달림이 다른 별칭에 주는 영향(코드상 확인·주입 시계 단언만), 기본 `REFRESH` 15초에서의 실제 시계열, 수십 분 이상의 단절, amd64 러너 실행 (미검증)
 - `single-server-multiproc` 의 채널 레이어 런타임(channels-nats 메시지 전달)을 컨테이너에서 (미검증. 랩 P2 는 설정 검사·워커 수까지)
 - Windows 에서 boot CLI 의 파일 잠금과 디렉터리 rename 원자성 [확인 필요]. 그때까지 boot 는 `fcntl` 이 없으면 exit 64 로 거부한다
 - channels-nats D2 의 196/200 이 하네스 문제인지 [확인 필요]

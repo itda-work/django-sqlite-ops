@@ -6,13 +6,21 @@
 
 from __future__ import annotations
 
+import json
+import re
 import threading
 import time
+import urllib.error
+import urllib.request
 
 import pytest
 from _checks import (
+    error_episodes,
     full_outage_deadline,
     full_outage_problems,
+    long_outage_bounds,
+    long_outage_problems,
+    ltx_process_problems,
     quarantine_problems,
     stale_dirs,
     template_fingerprint,
@@ -547,3 +555,200 @@ def test_L8b_health_upload_outage(stack, run_id, rec):
     """업로드 경로만 20초 끊김(헬스 조회는 다른 프록시) → backlog → 복구 후 caught_up."""
     _l8(stack, run_id, rec, "l8b", "/app/lab_tools/litestream-health.yml")
     assert ("backlog", "local_ahead") in rec["outage_statuses"], rec["outage_statuses"]
+
+
+# --- L8c·L8d: 조회 타임아웃(30초)보다 긴 단절(#65) --------------------------------------------
+
+LONG_OUTAGE = 90  # 조회 타임아웃의 3배: remote_error 구간이 둘 이상 나온다
+
+
+def _health_strict(port: int) -> tuple[str, str, float | None, int]:
+    """``?strict=1`` 응답의 (status, code, age, HTTP 코드). 503 도 본문을 읽는다."""
+    try:
+        with urllib.request.urlopen(
+            f"http://127.0.0.1:{port}/internal/sqlite-health?strict=1", timeout=10
+        ) as resp:
+            http, body = resp.status, json.loads(resp.read())
+    except urllib.error.HTTPError as exc:
+        http, body = exc.code, json.loads(exc.read())
+    d = body["databases"]["default"]
+    return d["status"], d["code"], d["age"], http
+
+
+def _ltx_procs(stack: Stack) -> list[tuple[int, str]]:
+    res = stack.compose(
+        "exec", "-T", "labapp", "python", "/app/lab_tools/procs.py", check=False, timeout=30
+    )
+    if res.rc != 0:
+        raise RuntimeError(f"procs.py -> rc {res.rc}: {res.text[-500:]}")
+    found = json.loads(res.out.strip().splitlines()[-1])["ltx"]
+    return [(pid, state) for pid, state, _argv in found]
+
+
+class ProcSampler(threading.Thread):
+    """단절 동안 앱 컨테이너의 ``litestream ltx`` 프로세스를 표본으로 모은다(헬스 표본과 따로)."""
+
+    def __init__(self, stack: Stack, t0: float, interval: float = 3.0):
+        super().__init__(daemon=True)
+        self.stack, self.t0, self.interval = stack, t0, interval
+        self.samples: list = []
+        self.failures: list[str] = []
+        self.stop = threading.Event()
+
+    def run(self):
+        while not self.stop.is_set():
+            try:
+                procs = _ltx_procs(self.stack)
+                self.samples.append((round(time.monotonic() - self.t0, 1), procs))
+            except Exception as exc:  # noqa: BLE001 - 표본 실패는 기록하고 계속한다
+                self.failures.append(f"{type(exc).__name__}: {exc}"[:300])
+            self.stop.wait(self.interval)
+
+
+_LEVEL = re.compile(r"level=(WARN|ERROR)")
+_NOISE = re.compile(r"time=\S+ |\b[0-9a-f]{16}\b|\d+(\.\d+)?(ms|s)\b")
+
+
+def _log_summary(text: str) -> dict:
+    """Litestream WARN/ERROR 줄 수와 대표 줄(시각·TXID·지속 시간을 지운 모양별 첫 줄, 많은 순)."""
+    lines = [ln for ln in text.splitlines() if _LEVEL.search(ln)]
+    shapes: dict[str, list] = {}
+    for ln in lines:
+        key = _NOISE.sub("", ln)[:200]
+        shapes.setdefault(key, [0, ln[:300]])[0] += 1
+    top = sorted(shapes.values(), key=lambda v: -v[0])[:6]
+    health = [ln[:300] for ln in text.splitlines() if "health 'default'" in ln]
+    # 0줄이 '로그를 못 읽음'이 아님을 보이려고 모든 Litestream 줄(level=)의 수와 앞 몇 줄도 남긴다
+    levels = [ln for ln in text.splitlines() if "level=" in ln]
+    return {
+        "litestream_lines": len(levels),
+        "litestream_first": [ln[:300] for ln in levels[:5]],
+        "warn": sum("level=WARN" in ln for ln in lines),
+        "error": sum("level=ERROR" in ln for ln in lines),
+        "representative": [{"count": n, "line": ln} for n, ln in top],
+        "health_warnings": health[:5],
+    }
+
+
+def _l8_long(stack: Stack, run_id: str, rec: dict, label: str, cut, restore) -> None:
+    """조회 타임아웃보다 긴 단절. ``cut``·``restore`` 가 단절을 넣고 푼다."""
+    prefix = f"{label}-{run_id}"
+    v = Volumes.take()
+    e = env(v, prefix, "--init-new", LAB_HEALTH_REFRESH="2", LAB_HEALTH_GRACE="10")
+    port = stack.up_app(env=e)
+    write_rows(port, 20)
+    before = _wait_health(port, "caught_up", 60)[-1]
+    rec["before"] = before
+    rec["before_strict_http"] = _health_strict(port)[3]
+    writer = Writer(port)
+    writer.start()
+    logs_boot = stack.logs("labapp")
+    logs_before = len(logs_boot)
+    timeline = []
+    t0 = time.monotonic()
+    sampler = ProcSampler(stack, t0)
+    try:
+        cut()
+        t0 = time.monotonic()
+        sampler.t0 = t0
+        sampler.start()
+        while time.monotonic() - t0 < LONG_OUTAGE:
+            timeline.append((round(time.monotonic() - t0, 1), *_health_strict(port)))
+            time.sleep(1)
+    finally:
+        restore()
+        sampler.stop.set()
+    if sampler.ident is not None:
+        sampler.join()
+    t1 = time.monotonic()
+    logs_outage = stack.logs("labapp")
+    recovery = []
+    deadline = t1 + 300  # 관측용 상한. 판정은 아래 120초(랩 가정)
+    while time.monotonic() < deadline:
+        st = _health_strict(port)
+        recovery.append((round(time.monotonic() - t1, 1), *st))
+        if st[0] == "caught_up":
+            break
+        time.sleep(1)
+    recovered_after = round(time.monotonic() - t1, 1)
+    after_procs = []
+    for _ in range(3):
+        after_procs.append((round(time.monotonic() - t1, 1), _ltx_procs(stack)))
+        time.sleep(2)
+    writer.stop.set()
+    writer.join()
+    logs_all = stack.logs("labapp")
+    final = count(port)
+    stack.stop_app()
+
+    rec["outage_s"] = LONG_OUTAGE
+    rec["bounds"] = long_outage_bounds(2)
+    rec["outage_timeline"] = timeline
+    rec["remote_error_episodes"] = error_episodes(timeline)
+    rec["outage_statuses"] = sorted({(s, c) for _, s, c, _a, _h in timeline})
+    rec["outage_http"] = sorted({h for *_x, h in timeline})
+    rec["recovery_timeline"] = recovery
+    rec["recovered_after_s"] = recovered_after
+    rec["ltx_outage_samples"] = sampler.samples
+    rec["ltx_sampler_failures"] = sampler.failures
+    rec["ltx_after_samples"] = after_procs
+    rec["ltx_max_concurrent"] = max((len(p) for _t, p in sampler.samples), default=0)
+    rec["ltx_distinct_pids"] = len({pid for _t, p in sampler.samples for pid, _s in p})
+    rec["writes_ok_errors"] = (writer.ok, writer.errors)
+    rec["log_before_outage"] = _log_summary(logs_boot)
+    rec["log_outage"] = _log_summary(logs_outage[logs_before:])
+    rec["log_after_recovery"] = _log_summary(logs_all[len(logs_outage) :])
+    rec["replica_after_stop"] = wait_replica_rows(stack, prefix, final)
+    rec["final_rows"] = final
+
+    problems = long_outage_problems(timeline, refresh=2, outage=LONG_OUTAGE)
+    problems += ltx_process_problems(sampler.samples, after_procs)
+    if sampler.failures:
+        problems.append(f"ltx sampler failures: {sampler.failures[:3]}")
+    if not sampler.samples:
+        problems.append("no ltx process samples")
+    if recovery[-1][1] != "caught_up":
+        problems.append(f"not caught_up {recovered_after}s after recovery: {recovery[-5:]}")
+    elif recovered_after > 120:
+        problems.append(f"caught_up only {recovered_after}s after recovery (> 120s)")
+    if recovery[-1][1] == "caught_up" and recovery[-1][4] != 200:
+        problems.append(f"strict HTTP {recovery[-1][4]} after recovery")
+    if writer.errors:
+        problems.append(f"{writer.errors} write errors")
+    rec["problems"] = problems
+    assert not problems, problems
+
+
+def test_L8c_health_long_refused_outage(stack, run_id, rec):
+    """S3 를 조회 타임아웃(30초)보다 길게(90초) 끊음 — 연결 거부(toxiproxy 끔).
+
+    기대(_checks.long_outage_bounds, 랩 가정): 10초 안에 ``stale``, 29~36초에 첫 ``remote_error``,
+    그 뒤 ``remote_error``(약 6초)와 ``stale``(약 26초)이 약 32초 주기로 번갈아 나온다. 단절 내내
+    strict 503. 매달린 ``ltx`` 는 1개 이하이고 복구 뒤 남지 않는다. 복구 후 ``caught_up``.
+    """
+    _l8_long(
+        stack,
+        run_id,
+        rec,
+        "l8c",
+        cut=lambda: stack.proxy_enabled("s3", False),
+        restore=lambda: stack.proxy_enabled("s3", True),
+    )
+
+
+def test_L8d_health_long_blackhole_outage(stack, run_id, rec):
+    """같은 90초 단절을 무응답으로: toxiproxy ``timeout`` toxic.
+
+    ``timeout`` 0 은 연결을 받고 데이터를 버린다(닫지 않는다).
+
+    기대는 L8c 와 같다. 복구는 toxic 을 지운다.
+    """
+    toxic = {"name": "blackhole", "type": "timeout", "attributes": {"timeout": 0}}
+    _l8_long(
+        stack,
+        run_id,
+        rec,
+        "l8d",
+        cut=lambda: stack.add_toxic("s3", toxic),
+        restore=stack.reset_proxies,
+    )
