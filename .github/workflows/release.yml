@@ -1,0 +1,60 @@
+name: Release
+
+# 태그(v*) push → 버전·CHANGELOG·분류 검사 → 빌드 → PyPI(trusted publishing) → GitHub 릴리스 (#77, D-28).
+# PyPI 쪽 설정: pypi.org > Account settings > Publishing > pending publisher 를 추가한다.
+#   owner: itda-work / repository: django-sqlite-ops / workflow: release.yml / environment: pypi
+# GitHub 쪽: 저장소 Settings > Environments 에 `pypi` 를 만든다(필요하면 보호 규칙).
+# API 토큰은 어디에도 저장하지 않는다(OIDC). 한 번 올린 버전은 PyPI 에서 다시 쓸 수 없다.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      prerelease: ${{ steps.check.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Check the tag, version, CHANGELOG and classifiers agree
+        id: check
+        run: python3 scripts/release_check.py "$GITHUB_REF_NAME" --github-output "$GITHUB_OUTPUT"
+
+      - run: uv build
+      - run: uvx twine check --strict dist/*
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # PyPI trusted publishing (OIDC)
+      contents: write # GitHub 릴리스
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+      - name: GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true
+          # PEP 440 의 a·b·rc·dev 면 사전 릴리스다(release_check.py 가 판정)
+          prerelease: ${{ needs.build.outputs.prerelease == 'true' }}

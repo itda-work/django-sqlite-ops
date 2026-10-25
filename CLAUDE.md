@@ -12,7 +12,7 @@
 
 ## 상태
 - v0.1 범위(`docs/DESIGN.md` §3-1, #1~#10)는 구현·병합됐다. 남은 것은 2단계(§3-2)와 §12 의 미검증 항목이다.
-- 저장소는 public 이다(D-9). **PyPI 배포와 외부 홍보는 보류한다**(D-4). 공개 저장소이므로 비밀값·내부 자격증명을 커밋하지 않는다.
+- 저장소는 public 이다(D-9). PyPI 에는 **실험적 사전 릴리스로만** 배포한다(D-28, 2026-10-26 — 태그 `v*` push 의 `release.yml` trusted publishing, 태그 push 는 마스터 확인 뒤). **외부 홍보는 계속 보류한다**(D-4·D-28). 공개 저장소이므로 비밀값·내부 자격증명을 커밋하지 않는다.
 
 ## 작업 방식
 - **이슈 먼저.** 구현 전에 GitHub 이슈가 있어야 한다. 진행 상황(착수, 리뷰 결과, 반영·기각 사유, 막힘, 완료)은 그 이슈의 코멘트로 남긴다. 브랜치는 `issue-<N>-<slug>`, PR 본문에 `Closes #N` 을 쓴다.
@@ -55,6 +55,7 @@
 - `macos` 잡(`macos-latest`, py3.14, Django 6.1)이 전체 테스트를 돈다. `REQUIRE_CASE_INSENSITIVE_FS=1` 이라 대소문자 무시 볼륨 전용 테스트(`ci_lab`)가 skip 되면 실패한다(#50). Linux 잡에서는 그 테스트가 skip 된다.
 - act 는 Linux 컨테이너만 돌린다. `macos` 잡은 `ci-local.sh` 에서 'unsupported platform' 으로 건너뛴다. 로컬 macOS 에서는 `REQUIRE_CASE_INSENSITIVE_FS=1 uv run pytest -rs` 로 대신한다.
 - 회귀 랩은 `.github/workflows/lab.yml`(`workflow_dispatch` 전용, ubuntu-latest amd64)로 따로 돈다: `gh workflow run lab.yml -f scenarios=all`. 기본 CI(push/PR) 밖이고, act 는 Docker 소켓을 넘기지 않으므로 `ci-local.sh` 대상이 아니다. 결과(`lab/.out/`)는 artifact 로 올라간다. 벤치는 돌리지 않는다.
+- 릴리스는 `.github/workflows/release.yml` 이 한다(D-28, #77): 태그 `v*` push → `scripts/release_check.py`(태그·pyproject version·CHANGELOG 절·사전 릴리스의 `3 - Alpha` 분류) → `uv build` → `twine check --strict` → PyPI trusted publishing(environment `pypi`, 토큰 없음) → GitHub 릴리스(PEP 440 사전 릴리스면 prerelease). 태그 push 는 마스터 확인 뒤에만 한다. 한 번 올린 버전은 다시 쓸 수 없으니 먼저 `python3 scripts/release_check.py v<버전>` 을 돌린다.
 
 ## 함정 (실측에서 나온 것)
 - Litestream endpoint 에 `http://` 가 빠지면 HTTPS 로 접속해 restore·`ltx` 가 무한 대기한다(`ltx` 는 평범한 HTTP 서버로 재현함). 모든 Litestream 호출에 타임아웃을 둔다.
