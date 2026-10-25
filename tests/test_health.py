@@ -608,6 +608,64 @@ def test_monitor_one_hanging_alias_delays_the_others(tmp_path, refresh):
     assert m.report()["databases"]["slow"]["code"] == "remote_error"
 
 
+def test_stale_reason_names_the_alias_being_checked(tmp_path):
+    """#72: 한 별칭의 원격 조회가 매달려 정상 별칭이 ``stale`` 이 되면, 사유에 갱신 스레드가 지금
+    조회 중인 별칭과 그 경과 초가 나온다. 조회 중이 아니면 기존 문장 그대로다. 판정은 같다."""
+    db = tmp_path / "app.sqlite3"
+    db.write_bytes(b"x" * 4096)
+    mono = [0.0]
+    seen = []
+
+    def remote(cfg, path):
+        if cfg.alias == "slow" and m.refreshes == 1:
+            mono[0] += 100.0  # 두 번째 갱신에서 slow 가 100초째 매달린 순간에 보고를 본다
+            seen.append(m.report()["databases"])
+            return RemoteError("litestream ltx timed out after 30s")
+        return SAME
+
+    aliases = (AliasConfig("slow", "/etc/a.yml"), AliasConfig("fast", "/etc/b.yml"))
+    m = Monitor(
+        HealthConfig(aliases, 2.0, 60.0),
+        remote=remote,
+        local=lambda path, meta: 5,
+        files=lambda path, meta: IDLE,
+        wal=lambda path, meta: W_SYNC,
+        path_of=lambda alias: (str(db), None),
+        monotonic=lambda: mono[0],
+    )
+    m.refresh_once()
+    mono[0] += 2.0
+    m.refresh_once()
+    (during,) = seen
+    for alias, target in (("fast", "alias 'slow'"), ("slow", "this alias")):
+        assert during[alias]["code"] == "stale" and during[alias]["status"] == "unknown"
+        assert during[alias]["reason"] == (
+            f"the last check is {during[alias]['age']:.0f}s old (more than 3 x REFRESH); "
+            f"the refresh thread has been checking {target} for 100s"
+        ), during[alias]
+    # 조회가 끝난 뒤에는 '조회 중' 표시가 남지 않는다: 늦게 본 보고는 기존 문장이다
+    mono[0] += 100.0
+    fast = m.report()["databases"]["fast"]
+    assert fast["code"] == "stale"
+    assert fast["reason"].endswith("; the refresh thread may be stuck"), fast
+
+
+def test_checking_mark_is_cleared_after_a_failed_refresh(tmp_path):
+    """#72: 조회가 예외로 끝나도 '조회 중' 표시를 지운다(남으면 이후 stale 사유가 거짓이 된다)."""
+    m, fakes = monitor(tmp_path, monotonic=lambda: 7.0)
+    marks = []
+
+    def broken(alias):
+        marks.append(m._checking)
+        raise OSError("weird")
+
+    m.path_of = broken
+    m.refresh_once()
+    assert marks == [("default", 7.0)]  # 조회 중에는 표시가 있었다
+    assert m._checking is None
+    assert m.report()["databases"]["default"]["code"] == "refresh_failed"
+
+
 def test_monitor_survives_clock_and_path_exceptions(tmp_path):
     m, fakes = monitor(tmp_path)
 
