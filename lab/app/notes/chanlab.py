@@ -11,8 +11,12 @@ uvicorn 워커마다 수신 루프 하나를 띄우고(``listen``), 받은 것�
   마다 취소)
 - ``capacity``: 주면 그 값으로 만든 별도 레이어 인스턴스를 쓴다(D2 재현의 ``cap1000``). 문서
   설정의 레이어(``get_channel_layer()``)는 그대로다.
+- ``layer``: 이름을 주면 그 이름의 별도 레이어 인스턴스(자기 NATS 연결)를 쓴다. 같은 이름의
+  수신끼리 그 인스턴스를 나눈다. 알려진 결함(1ms 폴링이 연결의 읽기 루프를 끝냄,
+  ``docs/research/handoff-marco-nats-flush-cancel.md``)을 다른 시나리오와 떼어 재는 데 쓴다.
 
-``channels_nats`` 로거의 경고(용량 드롭 등)를 프로세스 안에 모아 ``state`` 로 돌려준다.
+``channels_nats``·``nats`` 로거의 경고·오류(용량 드롭, nats-py 읽기 루프 예외 등)를 프로세스
+안에 모아 ``state`` 로 돌려준다. 예외가 붙은 기록은 ``[예외 종류: 메시지]`` 를 덧붙인다.
 channels 는 함수 안에서 불러온다: P1 이미지에는 없다.
 """
 
@@ -30,39 +34,56 @@ PLAIN_PREFIX = "lab.plain."
 MAX_CANCEL_TIMES = 5000
 
 _listeners: dict[str, "_Listener"] = {}
-_layers: dict[int, object] = {}
+_layers: dict[tuple, object] = {}
 _log: list[tuple[float, str]] = []
 
 
 class _Capture(logging.Handler):
     def emit(self, record):
-        _log.append((time.monotonic(), record.getMessage()))
+        message = record.getMessage()
+        if record.exc_info and record.exc_info[1] is not None:
+            exc = record.exc_info[1]
+            message += f" [{type(exc).__name__}: {exc}]"
+        _log.append((time.monotonic(), message))
 
 
 def _capture_logs() -> None:
-    logger = logging.getLogger("channels_nats")
-    if not any(isinstance(h, _Capture) for h in logger.handlers):
-        logger.addHandler(_Capture(logging.WARNING))
+    for name in ("channels_nats", "nats"):
+        logger = logging.getLogger(name)
+        if not any(isinstance(h, _Capture) for h in logger.handlers):
+            logger.addHandler(_Capture(logging.WARNING))
 
 
-def _layer(capacity: int | None):
+def _layer(capacity: int | None, name: str | None = None):
     from channels.layers import get_channel_layer
 
-    if capacity is None:
+    if capacity is None and name is None:
         return get_channel_layer()
-    if capacity not in _layers:
+    key = (capacity, name)
+    if key not in _layers:
         from channels_nats import NatsChannelLayer
 
-        config = settings.CHANNEL_LAYERS["default"]["CONFIG"]
-        _layers[capacity] = NatsChannelLayer(**{**config, "capacity": capacity})
-    return _layers[capacity]
+        config = dict(settings.CHANNEL_LAYERS["default"]["CONFIG"])
+        if capacity is not None:
+            config["capacity"] = capacity
+        _layers[key] = NatsChannelLayer(**config)
+    return _layers[key]
 
 
 class _Listener:
-    def __init__(self, key: str, kind: str, mode: str, timeout: float, capacity: int | None):
+    def __init__(
+        self,
+        key: str,
+        kind: str,
+        mode: str,
+        timeout: float,
+        capacity: int | None,
+        layer: str | None = None,
+    ):
         self.key, self.kind, self.mode, self.timeout = key, kind, mode, timeout
-        self.layer = _layer(capacity)
+        self.layer = _layer(capacity, layer)
         self.capacity = capacity
+        self.layer_name = layer
         self.channel = None
         self.ids: list[int] = []
         self.probes = 0
@@ -120,6 +141,7 @@ class _Listener:
             "kind": self.kind,
             "mode": self.mode,
             "capacity": self.capacity,
+            "layer": self.layer_name,
             "channel": self.channel,
             "ids": self.ids,
             "probes": self.probes,
@@ -150,6 +172,7 @@ async def listen(request):
             request.GET.get("mode", "steady"),
             float(request.GET.get("timeout", "0.5")),
             int(capacity) if capacity else None,
+            request.GET.get("layer") or None,
         )
         _listeners[key] = listener
         await listener.start()

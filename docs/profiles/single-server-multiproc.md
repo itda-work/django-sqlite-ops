@@ -133,7 +133,7 @@ exec python -m django_sqlite_ops.boot \
 
 ### `compose.yaml` (예)
 
-> **종단 검증함**(회귀 랩 P2): 이 파일 그대로에 이미지 이름·라벨·호스트 포트를 덮고 `WEB_WORKERS=2`·nats 이미지 태그 고정으로 띄웠다. 앱이 워커 2개(서로 다른 PID)로 응답하고, `sqlite_doctor` 가 exit 0·`channels_nats.NatsChannelLayer` OK 였다. 채널 레이어를 런타임에 쓰는 검증(channels-nats 설치·메시지 전달)은 하지 않았다. 두 `settings.py` 조각과 `entrypoint.sh` 의 검증 범위는 [`single-server` §3](single-server.md#3-설정-조각) 표와 같다.
+> **종단 검증함**(회귀 랩 P2): 이 파일 그대로에 이미지 이름·라벨·호스트 포트를 덮고 `WEB_WORKERS=2`·nats 이미지 태그 고정으로 띄웠다. 앱이 워커 2개(서로 다른 PID)로 응답하고, `sqlite_doctor` 가 exit 0·`channels_nats.NatsChannelLayer` OK 였다. **정정(2026-10-26)**: 2026-10-08 의 이 검증은 nats 컨테이너 없이 돌았다 — 랩이 앱을 `--no-deps` 로 띄워 `depends_on` 이 무시됐고, channels-nats 를 설치하지 않아 아무것도 실패하지 않았다(#66 에서 재현). 2026-10-26 부터는 nats 를 먼저 띄우고 channels-nats 0.10.0(`[nats]` extra)을 넣은 이미지로 워커 사이 전달을 확인한다: 그룹·전용 채널 워커마다 200/200, 일반 채널 큐 그룹 합 200·중복 0, 수신 루프를 남긴 채 stop exit 0·0.74초([`lab-2026-10-26-multiproc-nats.md`](../research/lab-2026-10-26-multiproc-nats.md)). 두 `settings.py` 조각과 `entrypoint.sh` 의 검증 범위는 [`single-server` §3](single-server.md#3-설정-조각) 표와 같다.
 
 ```yaml
 services:
@@ -172,6 +172,7 @@ volumes:
 | 1:1 지연 p50 (로컬 실측) | 0.3ms | (이번에는 재지 않음) |
 
 - 실측 출처: `docs/research/sqlite-django-package-review-v0.md`(0/5, p50 0.3ms). channels-nats 의 버퍼 위치·드롭 층·취소 공백은 [channels-nats README 'Channels 규약과 다른 점'](https://github.com/itda-work/channels-nats#channels-규약과-다른-점) 에 있다.
+- 워커 사이 손실은 계약대로 두 곳에서만 재현됐다(랩 P2, 2026-10-26): 일반 채널을 `wait_for` 로 폴링할 때 두 폴링 사이(10ms 폴링 184/200), 받는 쪽 mailbox 가 `capacity`(기본 100)를 넘칠 때(간격 없는 200건 버스트). 그룹·프로세스 전용 채널은 1ms 취소를 수천 번 겪어도 200/200 이었다.
 - 일반 컨슈머는 연결할 때 구독하므로 '수신자 전 메시지' 차이를 겪지 않는다. 임의 이름 채널에 먼저 `send` 하고 나중에 `receive` 하는 코드, `ChannelFull` 을 잡던 코드는 channels-nats 에서 동작이 다르다.
 - channels-nats README 의 위상 절은 지금 "새 프로젝트이고 특별한 이유가 없으면 channels_redis 를 먼저 검토"라고 쓴다. 이 저장소의 추천(D-2)과 맞추는 문구 조정은 OSS PO 가 진행한다(D-3). 이 저장소에서 그 문서를 고치지 않는다.
 
@@ -204,6 +205,8 @@ SQLite 기반 채널 레이어(channels-lite)는 **추천하지 않는다**. 폴
 - **`SQLITE_OPS["PROFILE"]` 을 실제 배포 형태와 맞춘다.** 프로필을 `single-server` 로 둔 채 워커를 늘리면 위 경고가 나오지 않는다.
 - **channels-nats 는 수신자가 생기기 전의 메시지를 버린다.** `ChannelFull` 도 나지 않는다(§3 의미론 표). 이 차이에 기대는 코드는 channels_redis 가 맞다.
 - **브로커를 앱과 같은 `-exec` 에 넣지 않는다**(§2).
+- **한 번에 `capacity`(기본 100)보다 많이 몰아 보내면 받는 쪽이 버린다.** 경고는 60초에 한 번이라 첫 줄("1 message(s) dropped so far")만 보면 손실을 과소평가한다. 합계는 "has room again after dropping N" 줄이다(재현함, #66).
+- **일반 채널을 짧은 `wait_for`(실측 1ms)로 폴링하지 않는다.** 구독 확인이 취소되면 nats-py 2.16.0 의 읽기 루프가 끝나 그 워커의 레이어 연결이 아무것도 받지 못한다(로그 `nats: encountered error … InvalidStateError`, 재현함, #66). 10ms 에서는 나지 않았다. 상류 처리는 [이관 문서](../research/handoff-marco-nats-flush-cancel.md).
 - **컨테이너를 늘려 확장하지 않는다.** 워커 수로 늘린다(§3 compose).
 - **열린 파일 한도는 워커마다 따로다.** 컨테이너에 준 `nofile` 을 워커 프로세스가 각각 물려받는다. 설정·확인·계산은 [fd 한도 가이드](fd-limits.md).
 - **VFS 읽기 복제본은 예정(2단계)이다**([DESIGN §3-2](../DESIGN.md)).

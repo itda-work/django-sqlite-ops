@@ -219,8 +219,14 @@ CHANNEL_SPECS = [
      "expect": "each"},
     {"id": "S-worker", "kind": "specific", "sender": "worker", "pace": 0.002, "expect": "each"},
     {"id": "P-steady", "kind": "plain", "pace": 0.002, "expect": "split"},
-    {"id": "P-cancel", "kind": "plain", "mode": "cancel", "timeout": 0.001, "pace": 0.005,
-     "expect": "lossy"},
+    # 일반 채널 취소 공백(계약상 손실 허용). 10ms 는 구독 확인 왕복(실측 ~0.25ms RTT)보다 길다.
+    # 1ms 는 그 확인을 취소해 연결을 망가뜨리는 알려진 결함이라 따로 둔다
+    # (test_P2_nats_flush_cancel_known_defect). 그래도 드물게 왕복이 10ms 를 넘을 수 있어 별도
+    # 레이어 인스턴스(layer)로 떼고, 바로 뒤 같은 인스턴스로 그룹 수신이 정상인지 본다.
+    {"id": "P-cancel", "kind": "plain", "mode": "cancel", "timeout": 0.01, "pace": 0.005,
+     "expect": "lossy", "layer": "pcancel10"},
+    {"id": "P-cancel-after", "kind": "group", "pace": 0.002, "expect": "each",
+     "layer": "pcancel10"},
     {"id": "BURST", "kind": "group", "pace": 0, "expect": "drops"},
     {"id": "NOCLOSE", "kind": "group", "pace": 0.002, "expect": "each", "close": False},
     # D2(docs/research/sqlite-django-package-review-v0.md)와 같은 꼴: 일반 채널 경쟁 수신 둘,
@@ -249,6 +255,20 @@ def _compact(spec: dict, trial: dict) -> dict:
     }
 
 
+def _run_channel_spec(stack: Stack, spec: dict) -> tuple[dict | None, float, str | None]:
+    """앱 컨테이너 안에서 lab_tools/chanlab_run.py 를 돌린다. (결과, 초, 실패 사유)."""
+    t0 = time.monotonic()
+    res = stack.compose(
+        "exec", "-T", "app", "timeout", "300", "python", "/app/lab_tools/chanlab_run.py",
+        json.dumps(spec), check=False, timeout=360,
+    )  # fmt: skip
+    took = round(time.monotonic() - t0, 2)
+    log(f"P2 channels {spec['id']}: rc {res.rc} in {took}s")
+    if res.rc != 0:
+        return None, took, f"runner rc {res.rc}: {res.text[-1500:]}"
+    return json.loads(res.out.strip().splitlines()[-1]), took, None
+
+
 def _p2_channels(stack: Stack, rec: dict) -> None:
     versions = stack.compose(
         "exec", "-T", "app", "python", "-c",
@@ -261,17 +281,10 @@ def _p2_channels(stack: Stack, rec: dict) -> None:
     raw, results, problems = {}, {}, {}
     for spec in CHANNEL_SPECS:
         spec = {"n": 200, **spec}
-        t0 = time.monotonic()
-        res = stack.compose(
-            "exec", "-T", "app", "timeout", "300", "python", "/app/lab_tools/chanlab_run.py",
-            json.dumps(spec), check=False, timeout=360,
-        )  # fmt: skip
-        took = round(time.monotonic() - t0, 2)
-        log(f"P2 channels {spec['id']}: rc {res.rc} in {took}s")
-        if res.rc != 0:
-            problems[spec["id"]] = [f"runner rc {res.rc}: {res.text[-1500:]}"]
+        out, took, error = _run_channel_spec(stack, spec)
+        if error:
+            problems[spec["id"]] = [error]
             continue
-        out = json.loads(res.out.strip().splitlines()[-1])
         raw[spec["id"]] = out
         trials = out["trials"]
         results[spec["id"]] = {
@@ -310,6 +323,70 @@ def test_P2_multiproc_compose(run_id, rec):
         rec["shutdown_channel_lines"] = key_lines(
             stack.logs("app"), "channels_nats", "Traceback", "Task was destroyed", "Error"
         )
+    finally:
+        stack.down()
+
+
+class NatsFlushCancelDefect(Exception):
+    """알려진 결함이 그대로 재현됐다(docs/research/handoff-marco-nats-flush-cancel.md)."""
+
+
+@pytest.mark.profile
+@pytest.mark.xfail(
+    strict=True,
+    raises=NatsFlushCancelDefect,
+    reason="nats-py 2.16.0: 취소된 flush 의 PONG 이 _read_loop 를 끝낸다 "
+    "(docs/research/handoff-marco-nats-flush-cancel.md). 고쳐지면 XPASS 로 실패해 알려 준다",
+)
+def test_P2_nats_flush_cancel_known_defect(run_id, rec):
+    """일반 채널을 1ms ``wait_for`` 로 폴링한 뒤에도 그 연결이 메시지를 받는가(#66).
+
+    기대(계약): 일반 채널 폴링은 두 폴링 사이의 메시지만 잃는다. 같은 레이어의 다른 수신은 그대로다.
+    실제(재현함): 첫 ``receive()`` 의 구독 확인 flush 가 취소되고, 그 PONG 에서 nats-py 읽기 루프가
+    ``InvalidStateError`` 로 끝나 그 연결로는 아무것도 받지 못한다. 결함을 별도 레이어 인스턴스
+    (``layer``)에 가두고, 문서 설정의 기본 레이어는 그 뒤에도 정상인지 먼저 단언한다.
+    """
+    stack = Stack("p2", env={"WEB_WORKERS": "2"})
+    layer = "flushcancel"
+    try:
+        stack.up_infra()
+        stack.compose("up", "-d", "nats")
+        stack.up_app("app", env=env(None, f"p2d-{run_id}", "--init-new"))
+        specs = [
+            {"id": "P-cancel-1ms", "kind": "plain", "mode": "cancel", "timeout": 0.001,
+             "pace": 0.005, "layer": layer, "may_not_ready": True, "ready_deadline": 10},
+            {"id": "after-1ms", "kind": "group", "pace": 0.002, "expect": "each", "layer": layer,
+             "may_not_ready": True, "ready_deadline": 10},
+            {"id": "default-after", "kind": "group", "pace": 0.002, "expect": "each"},
+        ]  # fmt: skip
+        trials = {}
+        for spec in specs:
+            spec = {"n": 200, **spec}
+            out, _took, error = _run_channel_spec(stack, spec)
+            assert error is None, error
+            trials[spec["id"]] = (spec, out["trials"][0])
+        polled, after, default = (
+            trials[k][1] for k in ("P-cancel-1ms", "after-1ms", "default-after")
+        )
+        invalid = [
+            m for w in polled["workers"] + after["workers"] for m in w["nats_log"]
+            if "InvalidStateError" in m
+        ]  # fmt: skip
+        rec["polled"] = {"ready": polled["ready"], "probes_sent": polled["probes_sent"],
+                         "cancels": [w["cancels"] for w in polled["workers"]]}  # fmt: skip
+        rec["after"] = {"ready": after["ready"], "probes_sent": after["probes_sent"]}
+        rec["invalid_state_lines"] = invalid[:4]
+        rec["default_after"] = _compact(trials["default-after"][0], default)
+
+        # 격리: 문서 설정의 기본 레이어(다른 연결)는 결함 뒤에도 정상이어야 한다.
+        assert delivery_problems(trials["default-after"][0], default) == []
+        if not after["ready"] and invalid:
+            raise NatsFlushCancelDefect(
+                f"connection stopped reading after 1ms polling; {len(invalid)} InvalidStateError"
+            )
+        # 결함이 사라졌다면 같은 연결의 그룹 수신이 계약대로여야 한다(→ XPASS 로 알린다).
+        assert after["ready"], f"not ready but no InvalidStateError logged: {rec['after']}"
+        assert delivery_problems(trials["after-1ms"][0], after) == []
     finally:
         stack.down()
 

@@ -10,6 +10,8 @@
    보낸다(``sender: worker``, 수신 워커가 아닌 쪽).
 4. 수신이 멈출 때까지 기다리고, 꼬리 probe(용량 드롭 합계 로그용)를 보내 다시 기다린 뒤
    ``stop``(``keep`` 이면 남겨 둔다).
+   ``may_not_ready`` 면 준비 기한(``ready_deadline``)을 넘겨도 실패하지 않고 ``ready: false`` 로
+   남긴다(본 메시지는 보내지 않는다).
 5. ``close`` 면 ``await layer.close()`` 시간을 잰다. 아니면 닫지 않고 ``asyncio.run`` 을 끝낸다.
 
 판정은 하지 않는다(``lab/_checks.py`` 의 ``delivery_problems``).
@@ -69,17 +71,19 @@ async def each_worker(method: str, view: str, workers: int, deadline: float, **p
 
 
 async def ready(layer, spec, key, channels, workers) -> dict:
-    """probe 를 보내며 모든 워커가 probe 를 받을 때까지 기다린다."""
+    """probe 를 보내며 모든 워커가 probe 를 받을 때까지 기다린다(``ready_deadline``, 기본 30초)."""
     t0 = time.monotonic()
     sent = 0
-    end = t0 + 30
+    end = t0 + spec.get("ready_deadline", 30)
     while True:
         await probe(layer, spec, key, channels)
         sent += 1
         states = await each_worker("GET", "state", workers, 30, key=key)
         if all(s["probes"] > 0 for s in states.values()):
-            return {"ready_s": round(time.monotonic() - t0, 3), "probes_sent": sent}
+            return {"ready": True, "ready_s": round(time.monotonic() - t0, 3), "probes_sent": sent}
         if time.monotonic() > end:
+            if spec.get("may_not_ready"):
+                return {"ready": False, "ready_s": None, "probes_sent": sent}
             raise TimeoutError(f"not ready: {[(p, s['probes']) for p, s in states.items()]}")
         await asyncio.sleep(0.05)
 
@@ -162,9 +166,16 @@ async def trial(layer, spec, index: int) -> dict:
     params = {"key": key, "kind": spec["kind"], "mode": spec.get("mode", "steady")}
     params["timeout"] = spec.get("timeout")
     params["capacity"] = spec.get("capacity")
+    params["layer"] = spec.get("layer")
     started = await each_worker("POST", "listen", workers, 60, **params)
     channels = {pid: s["channel"] for pid, s in started.items()}
     readiness = await ready(layer, spec, key, channels, workers)
+    if not readiness["ready"]:
+        # 준비되지 않은 채 끝나도 되는 시나리오(알려진 결함). 본 메시지는 보내지 않는다.
+        states = await each_worker("POST", "stop", workers, 60, key=key)
+        now = time.monotonic()
+        return {"key": key, **readiness, "t0": now, "t1": now, "errors": [], "senders": [],
+                "workers": list(states.values())}  # fmt: skip
     if spec.get("sender", "process") == "worker":
         sent = await send_from_worker(spec, key, channels)
     else:

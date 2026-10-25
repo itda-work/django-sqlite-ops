@@ -854,7 +854,8 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 - 프로세스 트리는 `boot`(잠금) → exec → `litestream replicate -exec "sh -c 'migrate && exec uvicorn ...'"` 다. litestream 이 PID 1 이다.
 - 한 번만 쓰는 boot 옵션(`--init-new`·`--adopt-existing`·`--on-unknown restore`)은 이미지에 굳히지 않고 `BOOT_FLAGS` 환경 변수로 넘긴 뒤 비운다.
 - 열린 파일 한도(`nofile`)의 확인·설정(Docker `--ulimit`, compose `ulimits`, systemd `LimitNOFILE=`)·계산법은 두 프로필 공통 문서 [docs/profiles/fd-limits.md](docs/profiles/fd-limits.md) 에 있다. 프로필 compose 예에는 `ulimits` 를 넣지 않았다(이유는 그 문서 §6).
-- `settings.py`·`urls.py` 조각은 테스트가 실행하고 `check --deploy` 를 통과하는지 본다. `litestream.yml` 은 실제 litestream 0.5.17 이 읽는지, `entrypoint.sh` 는 문법을 본다. Dockerfile·compose 는 회귀 랩이 문서 블록을 그대로 꺼내 빌드하고 띄워 종단 검증했다(첫 배포, `check --deploy`, `sqlite_doctor`, `docker stop` 시 exit 0·복제 400/400, 빈 볼륨 소유자 복사, 워커 2개 — [결과](docs/research/lab-2026-10-08.md)). multiproc 의 채널 레이어 런타임(channels-nats 메시지 전달)은 랩에서 재지 않았다.
+- `settings.py`·`urls.py` 조각은 테스트가 실행하고 `check --deploy` 를 통과하는지 본다. `litestream.yml` 은 실제 litestream 0.5.17 이 읽는지, `entrypoint.sh` 는 문법을 본다. Dockerfile·compose 는 회귀 랩이 문서 블록을 그대로 꺼내 빌드하고 띄워 종단 검증했다(첫 배포, `check --deploy`, `sqlite_doctor`, `docker stop` 시 exit 0·복제 400/400, 빈 볼륨 소유자 복사, 워커 2개 — [결과](docs/research/lab-2026-10-08.md)). multiproc 은 channels-nats(`[nats]` extra)를 넣어 워커 사이 전달도 랩에서 확인했다(2026-10-26, 아래). 2026-10-08 의 multiproc 검증은 랩이 nats 컨테이너를 띄우지 않은 채 돈 것이었다.
+- **multiproc 채널 전달(랩 P2, 2026-10-26, channels-nats 0.10.0, uvicorn 워커 2)**: 그룹·프로세스 전용 채널은 워커마다 200/200(워커 → 워커 포함), 일반 채널 큐 그룹은 합 200·중복 0. 수신 루프를 남긴 채 `docker stop` 이 exit 0·0.74초로 끝났다. 손실은 계약대로 두 곳에서만 났다: 일반 채널을 `wait_for` 로 폴링할 때 두 폴링 사이(10ms 폴링에서 16/200), 받는 쪽 mailbox 가 `capacity`(기본 100)를 넘칠 때(간격 없는 버스트 200건). 보내는 쪽에는 어느 쪽도 예외가 없다. 아래 '채널 레이어' 함정 두 줄을 본다([결과](docs/research/lab-2026-10-26-multiproc-nats.md)).
 
 ## 문제 해결
 
@@ -919,6 +920,8 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 | 워커를 늘렸더니 `group_send` 가 다른 워커의 클라이언트에 닿지 않는다 | `InMemoryChannelLayer` 는 프로세스 안에서만 전한다. doctor 는 프로필이 `single-server-multiproc` 일 때만 경고한다 | [`single-server-multiproc`](docs/profiles/single-server-multiproc.md) 과 channels-nats 를 쓴다. `SQLITE_OPS["PROFILE"]` 을 배포 형태와 맞춘다 | 코드상 확인(`doctor.py`) |
 | channels-lite aio 레이어에서 한 메시지가 두 수신자에게 배달된다 | 선점 성공을 누적 `total_changes` 로 판정한다 | `SQLITE_OPS["PATCH_CHANNELS_LITE_AIO"] = True`([channels-lite 패치](#channels-lite-패치)) | 재현함(#8) |
 | 새 채널 DB 에 여러 프로세스가 처음 붙을 때 `database is locked` | 여러 연결이 동시에 처음 `journal_mode=WAL` 로 바꾸면 일부가 실패한다(원인 미확정) | `migrate` 직후 채널 DB 를 미리 WAL 로 바꿔 둔다 | 재현함(#8) |
+| 버스트로 보낸 메시지 일부가 사라지는데 경고는 "1 message(s) dropped so far" 한 줄뿐이다 | channels-nats 는 받는 쪽 mailbox 가 `capacity`(기본 100)를 넘치면 버린다(`ChannelFull` 없음). 경고는 60초에 한 번으로 묶이고 합계는 자리가 난 뒤 다음 메시지가 올 때 "has room again after dropping N" 으로 나온다 — 첫 줄만 보면 과소평가한다(실측 1줄 / 실제 1–16건) | 합계 줄을 본다. 한 번에 몰아 보내는 양이 `capacity` 를 넘으면 `capacity` 를 올리거나 나눠 보낸다. channels-nats D2 실측의 196/200 이 이것이다 | 재현함(#66) |
+| 한 워커가 채널 메시지를 하나도 받지 못한다. 로그에 `nats: encountered error … InvalidStateError` | 일반 채널을 구독 확인 왕복보다 짧은 `wait_for`(실측 1ms)로 폴링하면 nats-py 2.16.0 의 읽기 루프가 끝나 그 연결이 그룹 메시지까지 받지 못한다(알려진 결함, 회복 시간 미검증) | 일반 채널을 짧은 타임아웃으로 폴링하지 않는다(10ms 에서는 재현 안 됨). 걸린 워커는 재시작한다. 상류 처리는 [이관 문서](docs/research/handoff-marco-nats-flush-cancel.md) | 재현함(#66) |
 | HTTP 는 되는데 웹소켓 연결이 안 된다 | `uvicorn` 만 설치하면 웹소켓 구현이 없다 | `uvicorn[standard]` 를 설치한다([single-server §3](docs/profiles/single-server.md#dockerfile)) | 출처(uvicorn 0.54.0 메타데이터) |
 
 ## 개발

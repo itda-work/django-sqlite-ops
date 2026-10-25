@@ -67,7 +67,10 @@
 - Linux 에서 litestream-vfs 확장을 로드하면 그 뒤의 일반 connect 가 실패한다. 우회책 `sqlite3_reset_auto_extension()` 은 **모든** 자동 확장을 해제하므로 옵션으로만 둔다. 상류 수정 #1506 은 2026-10-08 에 머지됐지만 v0.5.17 이후라 아직 릴리스되지 않았다(2026-10-13 확인). 다음 릴리스가 나오면 재검증한다.
 - SeaweedFS 는 버킷마다 볼륨을 잡는다. 랩에서는 버킷 하나를 두고 prefix 로 나누며, `-volume.max` 를 올린다.
 - macOS 에는 `timeout` 명령이 없다.
-- aio 계열 채널 레이어는 `await layer.close()` 가 없으면 프로세스가 끝나지 않을 수 있다.
+- aio 계열 채널 레이어는 `await layer.close()` 가 없으면 프로세스가 끝나지 않을 수 있다. channels-nats 0.10.0 은 `close()` 없이도 `asyncio.run` 이 끝나면 프로세스가 끝났다(#66).
+- 랩은 앱을 `compose up --no-deps` 로 띄운다. 문서 compose 의 `depends_on`(P2 의 nats)은 시나리오가 따로 띄워야 한다. #66 전의 P2 는 nats 없이 돌았다.
+- channels-nats 의 용량 드롭 경고는 60초에 한 번이고, 합계("has room again after dropping N")는 자리가 난 뒤 다음 메시지가 들어올 때만 나온다. 버스트 뒤 손실을 로그로 셀 때는 메시지를 하나 더 보낸다(#66).
+- 일반 채널을 1ms `wait_for` 로 폴링하면 nats-py 2.16.0 읽기 루프가 끝나 그 연결이 아무것도 받지 못한다(`InvalidStateError`, #66 재현함). 랩에서 이런 시나리오는 별도 레이어 인스턴스로 가둔다. 같은 레이어를 쓰는 뒤 시나리오가 모두 실패한다.
 - S3 가 연결을 **거부**해도 `litestream ltx` 는 바로 실패하지 않고 재시도하며 매달린다(0.5.17, toxiproxy 로 재현함 — boot 는 `--ltx-timeout` 30초 뒤 `remote_error`). 그래서 S3 전체 단절 중 헬스는 `backlog` 가 아니라 `unknown` 이다: 30초를 넘는 단절에서는 `stale` 과 `remote_error` 가 `REFRESH + 30` 초 주기로 번갈아 나온다(#65 L8c·L8d). `backlog` 는 업로드만 끊기고 조회가 될 때 나온다(#10 L8a·L8b). 갱신 스레드는 하나라 한 별칭의 매달림이 다른 별칭도 `stale` 로 만들 수 있다(매달림 > `2 × REFRESH`). 그 `stale` 사유에 조회 중인 별칭과 경과 초가, 쉬는 중이면 직전 라운드의 가장 느린 조회가 나온다(#72).
 - compose 는 어느 서비스도 쓰지 않거나 비활성 프로필 서비스만 쓰는 볼륨을 모델에서 빼고, `down -v` 도 그 볼륨을 지우지 않는다(Compose 5.5.1, 재현함). 랩은 모든 볼륨을 붙인 `volume-holder` 서비스와 `--profile app down -v` 로 지운다. 정리 뒤 `docker volume ls --filter label=io.itda.dso-lab=1` 로 확인한다.
 - `uv build --out-dir D` 는 D 에 `.gitignore` 도 남긴다. `rmdir` 이 실패한다.

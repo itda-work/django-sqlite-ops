@@ -534,6 +534,8 @@ SQLITE_OPS = {
   | 디스크 쓰기 / Litestream 영향 | 없음 | 없음(Redis 쪽) |
   | 1:1 지연 p50 (로컬 실측) | 0.3ms | (이번에는 재지 않음) |
 
+- 컨테이너에서 워커 사이 전달을 확인했다(랩 P2, 2026-10-26, channels-nats 0.10.0·nats-py 2.16.0, uvicorn 워커 2): 그룹·프로세스 전용 채널은 워커마다 200/200(1ms `wait_for` 취소 수천 번 포함, 워커 → 워커 포함), 일반 채널 큐 그룹은 합 200·중복 0. 계약상 허용 손실 두 가지도 재현했다 — 일반 채널 10ms 폴링의 취소 공백(184/200), 간격 없는 버스트의 mailbox `capacity`(100) 드롭(손실 = 드롭 수). D2 의 196/200 은 후자다([`lab-2026-10-26-multiproc-nats.md`](research/lab-2026-10-26-multiproc-nats.md)).
+- **알려진 결함**: 일반 채널을 구독 확인 왕복보다 짧게(1ms) `wait_for` 로 폴링하면 nats-py 읽기 루프가 `InvalidStateError` 로 끝나 그 연결은 그룹 메시지까지 받지 못한다(재현함). 랩이 strict xfail 로 고정하고, 외부 변경은 마르코 이관 문서([`handoff-marco-nats-flush-cancel.md`](research/handoff-marco-nats-flush-cancel.md))로 넘겼다.
 - SQLite 기반 레이어(channels-lite)는 추천하지 않는다. 근거는 다음과 같다.
   - 폴링 간격과 유휴 CPU 를 맞바꿔야 한다. 0.1초 간격이면 p50 51ms·유휴 CPU 59ms/10초, 0.001초 간격이면 p50 2.3ms·유휴 CPU 1.9초/10초(코어의 약 19%)다.
   - 메시지마다 DB 쓰기가 2번 생긴다.
@@ -569,7 +571,7 @@ SQLITE_OPS = {
 
 스파이크 랩(`docs/reference/compose.yaml`, `Dockerfile`, `entrypoint.sh`)을 바탕으로 `lab/` 에 다시 만든다. S3 대체는 SeaweedFS 다(MinIO 는 익명 pull 이 막혀 있었다). 장애 주입은 toxiproxy 로 한다.
 
-구현은 `lab/`(설명 `lab/README.md`), 실행은 `scripts/lab.sh run [L1..L8|P1|P2|all]`·`bench`. 기본 `pytest`·CI 에는 들어가지 않는다(`RUN_LAB=1` 일 때만 수집). 결과: [`docs/research/lab-2026-10-08.md`](research/lab-2026-10-08.md), L8c·L8d 는 [`lab-2026-10-25-long-outage.md`](research/lab-2026-10-25-long-outage.md), L4 양방향 무응답은 [`lab-2026-10-25-l4-two-way.md`](research/lab-2026-10-25-l4-two-way.md).
+구현은 `lab/`(설명 `lab/README.md`), 실행은 `scripts/lab.sh run [L1..L8|P1|P2|all]`·`bench`. 기본 `pytest`·CI 에는 들어가지 않는다(`RUN_LAB=1` 일 때만 수집). 결과: [`docs/research/lab-2026-10-08.md`](research/lab-2026-10-08.md), P2 채널 전달은 [`lab-2026-10-26-multiproc-nats.md`](research/lab-2026-10-26-multiproc-nats.md), L8c·L8d 는 [`lab-2026-10-25-long-outage.md`](research/lab-2026-10-25-long-outage.md), L4 양방향 무응답은 [`lab-2026-10-25-l4-two-way.md`](research/lab-2026-10-25-l4-two-way.md).
 
 | ID | 시나리오 | 기대 | 결과(2026-10-08) |
 |---|---|---|---|
@@ -583,7 +585,7 @@ SQLITE_OPS = {
 | L8 | 헬스: S3 20초 끊김 | `backlog` → 복구 후 `caught_up` | 조건부: 업로드만 끊기면(L8b) `backlog` → `caught_up`. 조회까지 끊기면(L8a) 랩의 허용 시간 10초(가정: `REFRESH × 3` + 진행 중 조회 여유 `REFRESH` + 표본 간격 + 1초. 조회 시간에서 도출된 보장 상한은 아니다) 안에 `unknown`(`stale`)으로 바뀌어 유지 → `caught_up` — §7 표대로 원격 조회 실패는 `unknown` 이 먼저다 |
 | L8c·L8d | 헬스: S3 90초 끊김(조회 타임아웃 30초의 3배) — 연결 거부 / 양방향 무응답(`timeout` toxic, `downstream`+`upstream`) | `unknown` 유지(`stale` 과 `remote_error` 가 `REFRESH + 30` 초 주기로 번갈아), strict 503, 매달린 `ltx` 없음 → 복구 후 `caught_up` | 통과(2026-10-25, colima arm64 에서 L8c 3회·양방향 L8d 2회, GitHub Actions amd64 run 40196113088 에서 1회씩): 첫 `stale` 5.0–5.1초, `remote_error` 구간 31.3–31.6·63.0–64.0초 시작, `ltx` 동시 최대 1·서로 다른 PID 3·복구 뒤 0, 쓰기 오류 0, 복구 2.0–7.1초 뒤 `caught_up`. 단절 중 Litestream 로그 0줄(WARN/ERROR 포함). 처음 두 L8d 실행은 toxic 이 `downstream` 하나라 응답 유실만이었다([`lab-2026-10-25-long-outage.md`](research/lab-2026-10-25-long-outage.md)) |
 
-배포 프로필 종단 검증(P1·P2): 문서의 Dockerfile·compose·entrypoint·settings 를 그대로 띄워 첫 배포·`check --deploy`·`sqlite_doctor`·`docker stop`(uvicorn 워커 1·2: exit 0, 대표 실행 0.47·0.72초, 400/400 복제)·재부팅·빈 볼륨 소유자 복사를 확인했다.
+배포 프로필 종단 검증(P1·P2): 문서의 Dockerfile·compose·entrypoint·settings 를 그대로 띄워 첫 배포·`check --deploy`·`sqlite_doctor`·`docker stop`(uvicorn 워커 1·2: exit 0, 대표 실행 0.47·0.72초, 400/400 복제)·재부팅·빈 볼륨 소유자 복사를 확인했다. 2026-10-08 의 P2 는 **nats 없이** 돌았다(랩이 앱을 `--no-deps` 로 띄워 `depends_on` 이 무시됨, 2026-10-26 재현). #66 부터 P2 는 nats 를 먼저 띄우고 channels-nats(`[nats]` extra, 0.10.0 고정)를 넣은 이미지로 워커 사이 전달·손실·중복·종료를 단언한다: 수신 루프를 남긴 채 stop exit 0·0.74초. 1ms 폴링 결함은 `test_P2_nats_flush_cancel_known_defect`(strict xfail)([`lab-2026-10-26-multiproc-nats.md`](research/lab-2026-10-26-multiproc-nats.md)).
 
 - **PRAGMA 벤치**: §6-0 의 후보(`temp_store`, `mmap_size`, `cache_size`, `journal_size_limit`)를 켠 경우와 끈 경우의 처리량·p99·WAL 크기를 잰다. 차이가 재현될 때만 기본값으로 올린다. 2026-10-08 결과(반복 5): 넷 중 개선이 반복해서 재현된 것은 없고, `cache_size=-65536` 단독은 반복해서 나빠졌다. 기본값은 바꾸지 않는다([`lab-2026-10-08.md`](research/lab-2026-10-08.md#pragma-벤치)). 그 원인(#27)은 최소 재현에서 재현하고(기준 고정 뒤 재실행으로 확인) 소스로 확인했다: 캐시 상한을 올리면 상한에 닿기 전에는 페이지 버퍼를 재활용하지 않으므로, 많은 페이지를 같은 연결에서 다시 읽지 않는 요청은 할당·해제만 늘어난다. 같은 페이지를 다시 읽는 요청에서는 반대로 좋아진다([`cache-size-2026-10-12.md`](research/cache-size-2026-10-12.md)). 재측정(#26: `CONN_MAX_AGE` 0·None, WAL 이 자라는 쓰기 단계, 서버 시간·포화 곡선)에서도 재현된 차이는 없었다. 이 계측 조건에서 처리량이 포화했고 부하 발생기에는 여유가 있었다. 앱 CPU/GIL 병목이 의심되지만 원인은 미검증이다([`bench-2026-10-08.md`](research/bench-2026-10-08.md)).
 - 랩 자원은 compose 프로젝트명(`dso-lab*`)과 라벨(`io.itda.dso-lab=1`)로 구분하고, 끝나면 반드시 `down -v` 한다(실패해도 `trap`). 같은 호스트에 다른 프로젝트 컨테이너가 있다.
@@ -605,9 +607,8 @@ SQLITE_OPS = {
 - 실제 클라우드 S3·R2·Tigris (미검증. 비용이 들어 마스터 승인 필요)
 - 회귀 랩은 SeaweedFS 4.48 + toxiproxy 2.12.0 으로만 돌았다(colima linux/arm64 와 GitHub Actions ubuntu-latest linux/amd64, 둘 다 11/11 통과 — [`lab-2026-10-08.md`](research/lab-2026-10-08.md#amd64-실행-github-actions-25)). 다른 S3 구현은 미검증
 - 긴 S3 단절(#65, 2026-10-25): 90초 단절의 `stale` ↔ `remote_error` 전이와 Litestream 로그(WARN/ERROR 0줄)는 L8c·L8d 로 재현했다(colima arm64). GitHub Actions amd64 러너(run 40196113088, 2026-10-25, 양방향 L8d 포함 4 passed)에서도 같았다. 남은 것: 별칭이 여럿인 컨테이너에서 한 별칭의 매달림이 다른 별칭에 주는 영향(코드상 확인·주입 시계 단언만), 기본 `REFRESH` 15초에서의 실제 시계열, 수십 분 이상의 단절 (미검증)
-- `single-server-multiproc` 의 채널 레이어 런타임(channels-nats 메시지 전달)을 컨테이너에서 (미검증. 랩 P2 는 설정 검사·워커 수까지)
+- `single-server-multiproc` 채널 레이어(#66, 2026-10-26): 워커 2개 사이 전달은 랩 P2 로 확인했다(colima arm64). 남은 것: GitHub Actions amd64 에서의 P2, 워커 3개 이상·큰 메시지·브로커 재시작 중 전달, 1ms 폴링 결함의 회복 시간과 실제 컨슈머 경로(구독 확인 중 취소), 일반 채널 취소 뒤 서버에 남은 구독 1회 관측 (미검증)
 - Windows 에서 boot CLI 의 파일 잠금과 디렉터리 rename 원자성 [확인 필요]. 그때까지 boot 는 `fcntl` 이 없으면 exit 64 로 거부한다
-- channels-nats D2 의 196/200 이 하네스 문제인지 [확인 필요]
 - "같은 이력" 증명 방법(자동 판정의 전제) [확인 필요]
 - `--restore-test`(§6-2) 의 두 전제는 #54 에서 재현했다(2026-10-15): `restore -o` 는 `DB_PATH` 쪽을 읽지도 쓰지도 않고, `interrupt()` 는 707MB full 검사를 1ms 안에 멈춘다. 남은 것: 페이지 캐시가 차가운 상태·수십 GB DB·Linux 에서의 `interrupt()` 지연, S3 복제본에서의 불변 계약(file 복제본으로만 확인), litestream VFS 별칭에 로컬 캐시 경로가 있는지(있다면 보호 대상에 넣어야 한다 — 지금은 `vfs` 를 로컬 경로 없음으로 통과시킨다) (미검증)
 - Litestream 상류(2026-10-13 확인): #1506(VFS 확장 로드)은 2026-10-08 머지됐으나 v0.5.17 이후라 미릴리스 — 다음 릴리스에서 Linux 확장 로드 뒤 일반 connect 실패가 사라지는지 재검증한다. #1271(writable VFS 손상)은 열림, 수정 PR #1363 도 열림(§3-3 유지)

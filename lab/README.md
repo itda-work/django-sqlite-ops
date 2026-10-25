@@ -5,7 +5,7 @@ Docker 로 Litestream·boot·헬스의 실패 경계(L1–L8, [DESIGN §10](../d
 기본 `pytest` 와 CI 에는 들어가지 않는다. `RUN_LAB=1` 일 때만 수집되고(`lab/conftest.py`), 실행 입구는 `scripts/lab.sh` 하나다.
 
 ```bash
-scripts/lab.sh run all        # L1–L8, P1·P2 (약 8분). 끝나면 성공·실패와 관계없이 down -v
+scripts/lab.sh run all        # L1–L8, P1·P2 (약 8분 + P2 채널 시나리오 약 3분, #66). 끝나면 성공·실패와 관계없이 down -v
 scripts/lab.sh run L6         # pytest -k 로 좁힌다 (L1..L8, L8c 처럼 하나만, P1, P2)
 scripts/lab.sh bench          # PRAGMA 벤치 + 포화 측정 (약 50분). pytest 인자를 넘길 수 있다(-k saturation)
 scripts/lab.sh soak           # fd·RSS 장시간 실행, CONN_MAX_AGE None·0 각 30분 (약 70분, #33)
@@ -39,7 +39,7 @@ ubuntu-latest(amd64)에서 `scripts/lab.sh run <선택>` 을 그대로 돌리고
 - 정리는 `docker compose -p <우리 프로젝트> ... --profile app down -v --remove-orphans` 만 쓴다. prune·전체 대상 `rm` 은 쓰지 않는다. 컨테이너 하나를 죽일 때도 `docker compose kill` 이다.
 - 호스트 포트는 `127.0.0.1` 의 임의 포트로만 연다(toxiproxy API, 앱 8000).
 - **볼륨 함정(재현함, Compose 5.5.1)**: compose 는 어느 서비스도 쓰지 않거나 비활성 프로필 서비스만 쓰는 볼륨을 모델에서 빼고, `down -v` 도 그 볼륨을 지우지 않는다(`config --volumes` 에 없음). 그래서 풀 볼륨 `v01..v40` 을 모두 붙인 `volume-holder` 서비스(시작하지 않음)를 두고 `--profile app` 으로 내린다.
-- 이미지 `dso-lab-app:<git sha>` 는 다음 실행의 캐시로 남는다. 지우려면 이름으로 `docker image rm dso-lab-app:<태그>`.
+- 이미지 `dso-lab-app:<git sha>`·`dso-lab-app-nats:<git sha>` 는 다음 실행의 캐시로 남는다. 지우려면 이름으로 `docker image rm dso-lab-app:<태그> dso-lab-app-nats:<태그>`.
 
 ## 구성
 
@@ -52,7 +52,7 @@ ubuntu-latest(amd64)에서 `scripts/lab.sh run <선택>` 을 그대로 돌리고
 | `tool` | 같은 이미지 | 볼륨 없이 복제본을 `/tmp` 로 복원해 TXID·행 수·`integrity_check` 를 낸다 |
 | `loadgen` | 같은 이미지 | 벤치 부하 발생기(`lab_tools/loadgen.py`) |
 | P1 `app` | 같은 이미지 | **single-server 문서의 compose.yaml 그대로** + `profile-override.yaml` |
-| P2 `app`·`nats` | 같은 이미지, `nats:2.15.0@sha256:cd3fcd4e…` | **multiproc 문서의 compose.yaml 그대로** + 두 override |
+| P2 `app`·`nats` | `dso-lab-app-nats:<태그>`(위 이미지 + channels-nats, #66), `nats:2.15.0@sha256:cd3fcd4e…` | **multiproc 문서의 compose.yaml 그대로** + 두 override |
 
 앱 이미지의 베이스는 문서 Dockerfile 의 `python:3.13-slim` 그대로다(digest 고정 안 함 — 문서를 바꾸지 않기 위해서). 실행 때 받은 digest 는 결과 문서에 적는다.
 
@@ -63,20 +63,23 @@ ubuntu-latest(amd64)에서 `scripts/lab.sh run <선택>` 을 그대로 돌리고
 | 조각 | 문서 | 랩 |
 |---|---|---|
 | Dockerfile | `COPY requirements.txt .` | `COPY requirements.txt django_sqlite_ops-0.0.0-py3-none-any.whl ./` — 작업 트리에서 `uv build` 한 wheel 을 설치 전에 넣는다. **다른 줄은 같다** |
+| P2 이미지(#66) | multiproc §3 "`requirements.txt` 에 채널 레이어 패키지를 더한다. `[nats]` extra 로 넣어도 된다" | 위 이미지 위에 층 하나(`lab/nats.Dockerfile`): `requirements-nats.txt` = `django-sqlite-ops[nats] @ file:///app/<wheel>` + `channels-nats==0.10.0`(extra 가 판을 고정하지 않아 랩이 `build_context.CHANNELS_NATS` 로 고정). 문서 Dockerfile 은 그대로 |
 | `requirements.txt` | `django-sqlite-ops @ https://github.com/.../main.zip` | `django-sqlite-ops @ file:///app/<wheel>` |
 | `litestream.yml` | `bucket: my-app-backups`, `path: app`, `endpoint: http://s3.internal:8333` | `bucket: dso-lab`, `path: ${LAB_PREFIX}`(Litestream 이 환경 변수를 펼친다), `endpoint: http://toxiproxy:18333` |
 | `settings.py`·`urls.py` | 조각 | 조각 그대로 + `lab/app/proj/*_tail.py`(SECRET_KEY·ALLOWED_HOSTS, `notes` 앱, 헬스 주기·grace·조회 설정, 벤치용 PRAGMA, 랩 뷰) |
 | `entrypoint.sh` | 그대로 | 그대로(multiproc 판은 `/app/entrypoint-multiproc.sh` 로 넣고 P2 가 entrypoint 로 쓴다) |
-| compose (P1·P2) | 그대로 | override: 이미지 이름, 라벨, 포트 `127.0.0.1::8000`(문서의 `8000:8000` 은 다른 서비스와 겹칠 수 있다), `LAB_PREFIX`·`BOOT_FLAGS` 주입. P2 는 `WEB_WORKERS=2`, nats 이미지 고정 |
+| compose (P1·P2) | 그대로 | override: 이미지 이름, 라벨, 포트 `127.0.0.1::8000`(문서의 `8000:8000` 은 다른 서비스와 겹칠 수 있다), `LAB_PREFIX`·`BOOT_FLAGS` 주입. P2 는 `WEB_WORKERS=2`, nats 이미지 고정, 이미지 `dso-lab-app-nats` |
+| 기동 순서 (P2) | `depends_on: [nats]` | 앱은 `up --no-deps` 로 띄우므로 시나리오가 `up -d nats` 를 먼저 한다(문서 §4 '브로커를 먼저 띄운다'). **#66 전의 P2 는 nats 없이 돌았다**(2026-10-26 재현) |
 
-P2 는 채널 레이어를 런타임에 쓰지 않는다(channels-nats 를 설치하지 않음). 설정을 읽는 `check --deploy`·`sqlite_doctor` 만 확인한다.
+P2 는 channels-nats 를 넣은 이미지로 워커 사이 채널 전달을 런타임에 확인한다(#66). 수신은 uvicorn 워커의 비동기 뷰(`notes/chanlab.py`, `/lab/chan/listen·state·stop·send`), 시나리오 실행은 앱 컨테이너 안 별도 프로세스(`lab_tools/chanlab_run.py`), 판정은 `_checks.delivery_problems`(순수 함수)다. `/lab/chan/tasks` 는 워커 이벤트 루프의 asyncio 태스크 스택을 돌려주는 진단 뷰다(시나리오는 부르지 않는다. 알려진 결함의 원인을 이것으로 좁혔다).
 
 ## 시나리오
 
 | ID | 하는 일 | 확인 |
 |---|---|---|
 | P1 | single-server 문서 compose 로 빈 볼륨 소유자 → `check --deploy` → `--init-new` 첫 부팅 → doctor → 400건 쓰고 바로 `docker stop` → 같은 볼륨 재부팅 | 소유자 10001, `sqlite_ops.*` 없음, doctor exit 0, exit 0·복제 400/400, `match` |
-| P2 | 위와 같고 uvicorn 워커 2 | 위 + 응답한 PID 2개, doctor 의 channels 줄 |
+| P2 | 위와 같고 uvicorn 워커 2, nats 먼저. doctor 뒤 채널 시나리오(아래), 마지막 `LIVE` 수신 루프를 남긴 채 `docker stop` | 위 + 응답한 PID 2개, doctor 의 channels 줄, channels-nats 0.10.0, 채널 시나리오 문제 0, stop 30초 grace 안(exit 0) |
+| P2 결함 | `test_P2_nats_flush_cancel_known_defect`, **strict xfail**: 별도 레이어 인스턴스로 일반 채널을 1ms `wait_for` 폴링 → 같은 인스턴스로 그룹 수신 → 기본 레이어로 그룹 수신 | 기본 레이어는 200/200(격리 단언). 같은 인스턴스가 준비되지 않고 `InvalidStateError` 가 로그에 있으면 `NatsFlushCancelDefect`(xfail). 결함이 고쳐지면 XPASS 로 실패한다([이관](../docs/research/handoff-marco-nats-flush-cancel.md)) |
 | L1 | 볼륨 A 로 200건 → 볼륨 없는 새 컨테이너 | `fresh` → 복원, 200건, 이어 쓴 것도 복제 |
 | L2 | A 50건 → B 가 복원해 150건 → A 로 재부팅 | exit 2 `remote_ahead`, 복제본 TXID·150건 그대로, A 무변경 |
 | L3 | 정상 종료 뒤 로컬 메타 디렉터리만 삭제 | exit 2 `no_local_meta`, DB 무변경 |
@@ -88,6 +91,21 @@ P2 는 채널 레이어를 런타임에 쓰지 않는다(channels-nats 를 설�
 | L8b | 헬스 조회는 `s3h` 로 두고 업로드 경로 `s3` 만 20초 끔 | `backlog`(`local_ahead`) → 복구 뒤 `caught_up` |
 | L8c | 쓰기를 계속하며 `s3` 를 90초 끔(조회 타임아웃 30초의 3배, 연결 거부) | 랩의 허용 시간(가정, `_checks.long_outage_bounds`): 10초 안에 `stale`, 첫 `remote_error` 는 29–36초, 그 뒤 `remote_error`(약 6초)와 `stale`(약 26초)이 32±2초 주기로 번갈아(90초에 2구간 이상) 단절 내내 `unknown`. strict 는 단절 내내 503·복구 뒤 200. 앱 컨테이너의 `litestream ltx`(`lab_tools/procs.py` 로 `/proc` 를 3초마다)는 1개 이하·좀비 없음·한 PID 가 40초 넘게 보이지 않음·복구 뒤 단절 중 PID 없음, 그리고 검출기가 동작한다는 하한(단절 중 `ltx` 를 본 표본 ≥ 3, 서로 다른 PID ≥ 2). 시각 판정의 표본 여유는 실제 최대 헬스 표본 간격이고, 그 간격이 1.5초를 넘으면 '표본이 거칠다'로 판정 실패와 따로 알린다. 쓰기 오류 0, 복구 뒤 120초 안 `caught_up`, 복제본 행 수 = 최종 행 수. Litestream WARN/ERROR 줄 수·대표 줄을 기록 |
 | L8d | 같은 90초를 양방향 무응답으로: `s3` 에 `timeout` toxic(`timeout` 0 = 연결은 받고 데이터를 버림)을 `stream` `downstream`·`upstream` 둘 다(기본값은 `downstream` 뿐이라 하나만 넣으면 요청은 S3 에 닿는다 — toxiproxy 2.12.0 README) | L8c 와 같다 |
+
+P2 채널 시나리오(`CHANNEL_SPECS`, N=200, 수신 워커 2). 준비 확인: 두 워커가 probe 를 1건 이상 받을 때까지 보낸 뒤 본 메시지를 보낸다. 수신이 멈추면 꼬리 probe 를 한 번 더 보내 다시 기다린다(용량 드롭 합계 "has room again after dropping N" 은 다음 메시지가 들어올 때만 나온다).
+
+| ID | 채널·수신 / 송신 | 단언(`expect`) |
+|---|---|---|
+| G-steady·G-cancel·G-worker | 그룹, 계속 / `wait_for` 1ms / 송신이 워커 | `each`: 워커마다 0..199 를 한 번씩 순서대로 |
+| S-steady·S-cancel·S-worker | 프로세스 전용 채널 1:1(워커 → 다른 워커 포함) | `each` + 송신 PID ≠ 수신 PID |
+| P-steady | 일반 채널 큐 그룹 | `split`: 합이 한 번씩, 두 워커 모두 > 0 |
+| P-cancel → P-cancel-after | 일반 채널 10ms 폴링(별도 레이어 인스턴스 `pcancel10`) → 같은 인스턴스로 그룹 | `lossy`(손실 허용, 중복·용량 드롭 0) → `each` |
+| BURST | 그룹, 간격 0 | `drops`: 워커마다 손실 = 로그의 드롭 수 |
+| NOCLOSE | 그룹, 송신 프로세스가 `close()` 없이 끝남 | `each`, 실행기 rc 0 |
+| D2-cap100·D2-cap1000 | D2 와 같은 꼴(일반 채널, 0.5초 폴링, 버스트 200) × `LAB_D2_TRIALS`(20), 수신 `capacity` 100 / 1000 | `record`: 중복·모르는 id 0 만. 손실은 기록 |
+| LIVE | 그룹, 수신을 남겨 둔다 | `each`, 이어서 `docker stop` |
+
+모든 시나리오는 송신·수신 예외 0 이어야 한다. 원자료는 `lab/.out/chan-<시각>.json`.
 
 L8 은 `LAB_HEALTH_REFRESH=2`, `LAB_HEALTH_GRACE=10` 으로 줄여 돈다(기본 15·60초면 20초 끊김이 grace 안에 든다). 헬스의 원격 조회 타임아웃은 `boot/litestream.py` 의 `DEFAULT_LTX_TIMEOUT`(30초)이고 `HEALTH` 설정으로 바꿀 수 없다(2026-10-25 확인). L8c·L8d 가 각각 약 2분 30초 걸린다.
 
@@ -171,8 +189,9 @@ lab/
 ├── lab-compose.yaml        기반 스택·시나리오 서비스·볼륨 풀
 ├── profile-override.yaml   P1·P2: 문서 compose 위에 덮는 것
 ├── multiproc-override.yaml P2 추가분
+├── nats.Dockerfile         P2 이미지 층([nats] extra, #66)
 ├── _lab.py                 compose·toxiproxy·조사 도구
-├── _checks.py              L6·L8a·L8c·L8d 판정(순수 함수, tests/test_lab.py 가 Docker 없이 검사)
+├── _checks.py              L6·L8a·L8c·L8d·P2 채널 판정(순수 함수, tests/test_lab.py 가 Docker 없이 검사)
 ├── _benchstat.py           벤치 집계·재현 판정(순수 함수, 같은 테스트가 검사)
 ├── _soakstat.py            soak 분석(순수 함수, 같은 테스트가 검사)
 ├── conftest.py             RUN_LAB 게이트, 결과 기록
@@ -184,7 +203,7 @@ lab/
 ├── _cachestat.py           그 집계·판정(순수 함수, 같은 테스트가 검사)
 ├── cache_report.py         그 원자료 → 결과 문서의 표
 └── app/                    랩 Django 프로젝트(문서 조각 밖의 것)
-    ├── manage.py, proj/asgi.py(벤치 계측 래퍼), proj/*_tail.py, notes/(뷰·계측)
-    ├── lab_tools/          inspect_data.py, replica.py, s3_objects.py, loadgen.py, procs.py
+    ├── manage.py, proj/asgi.py(벤치 계측 래퍼), proj/*_tail.py, notes/(뷰·계측, chanlab.py = P2 채널 수신)
+    ├── lab_tools/          inspect_data.py, replica.py, s3_objects.py, loadgen.py, procs.py, chanlab_run.py
     └── lab_hooks/          sitecustomize.py (L6)
 ```

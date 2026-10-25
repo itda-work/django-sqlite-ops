@@ -10,6 +10,8 @@ on:
   workflow_dispatch:
     inputs:
       scenarios:
+        # P2 는 -k P2 라 채널 전달(test_P2_multiproc_compose)과 알려진 결함의 strict xfail
+        # (test_P2_nats_flush_cancel_known_defect)을 함께 고른다(#66). 둘 다 약 4분.
         description: "scripts/lab.sh run 의 선택(all 또는 pytest -k 로 좁힐 시나리오)"
         type: choice
         default: all
