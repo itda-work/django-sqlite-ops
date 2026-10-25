@@ -14,6 +14,7 @@ import sqlite3
 import stat
 import subprocess
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -456,6 +457,41 @@ def test_integrity_other_error_after_the_timer_fired_reports_both(tmp_path, monk
     assert "--integrity-timeout 0.01s timer had also fired" in message
 
 
+def test_integrity_timer_fired_before_the_check_started_is_timeout(tmp_path, monkeypatch):
+    """시한이 문장 시작 전에 지나도 ``timeout`` 이다(#60).
+
+    실행 중인 문장이 없을 때의 ``sqlite3_interrupt()`` 는 no-op 이라 검사는 끝까지 돈다
+    (SQLite 문서 c3ref/interrupt). 타이머 발동 뒤에야 ``execute`` 에 들어가게 해 그 순서를 강제한다.
+    """
+    db = make_db(tmp_path / "ok.db", wal=False)
+
+    class Late:
+        def __init__(self, conn):
+            self.conn = conn
+            self.fired = threading.Event()
+
+        def interrupt(self):
+            self.conn.interrupt()
+            self.fired.set()
+
+        def execute(self, sql):
+            assert self.fired.wait(30)
+            return self.conn.execute(sql)
+
+        def close(self):
+            self.conn.close()
+
+    real_connect = rc._connect_ro
+    monkeypatch.setattr(rc, "_connect_ro", lambda path: Late(real_connect(path)))
+    passed, got = rc.check_integrity(db, "full", 0.01)
+    assert not passed
+    assert [(i.key, i.level) for i in got] == [("integrity", "error")]
+    message = got[0].message
+    assert message.startswith("timeout: integrity_check did not finish within --integrity-timeout")
+    assert "interrupted after" not in message
+    assert "was not interrupted" in message
+
+
 def test_integrity_timeout_interrupts_the_check(tmp_path):
     """제한을 넘긴 full 검사가 ``interrupt()`` 로 실제로 끝난다(#54 실측: 1ms 미만 지연)."""
     db = make_big_db(tmp_path / "big.db")
@@ -466,15 +502,21 @@ def test_integrity_timeout_interrupts_the_check(tmp_path):
     full = time.monotonic() - start
     assert passed
     limit = min(0.005, full / 10)
-    start = time.monotonic()
-    passed, got = rc.check_integrity(db, "full", limit)
-    elapsed = time.monotonic() - start
+    # 부하로 타이머가 문장 시작 전에 발동하면 interrupt() 는 no-op 이고 검사는 끝까지 돈다(#60).
+    # 그 경로는 'was not interrupted' 로 구분되므로, 실제로 끊긴 경우를 볼 때까지 몇 번 더 잰다.
+    for _ in range(5):
+        start = time.monotonic()
+        passed, got = rc.check_integrity(db, "full", limit)
+        elapsed = time.monotonic() - start
+        if "was not interrupted" not in got[0].message:
+            break
     assert not passed, (full, limit, elapsed)
     assert [(i.key, i.level) for i in got] == [("integrity", "error")]
-    # 'timeout' 은 타이머가 발동했고 예외가 interrupted 일 때만 나온다(F8): 검사가 끝나기 전에
-    # interrupt() 로 끊겼다는 증거다. 걸린 시간은 스레드 스케줄링 지연만큼 여유를 둔다(macOS
+    # 'interrupted after' 는 타이머가 발동했고 예외가 interrupted 일 때만 나온다(F8): 검사가 끝나기
+    # 전에 interrupt() 로 끊겼다는 증거다. 걸린 시간은 스레드 스케줄링 지연만큼 여유를 둔다(macOS
     # 러너에서 데운 full 검사가 50ms 라 full/2 기준은 0.2ms 차이로 흔들렸다).
     assert got[0].message.startswith("timeout: integrity_check did not finish")
+    assert "interrupted after" in got[0].message, got[0].message
     assert elapsed < limit + 0.5, (elapsed, limit, full)
 
 
