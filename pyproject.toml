@@ -5,7 +5,8 @@ build-backend = "hatchling.build"
 [project]
 name = "django-sqlite-ops"
 version = "0.0.0"
-description = "Operations toolkit for running SQLite as a production database in Django"
+description = "[Experimental] Operations toolkit for running SQLite as a production database in Django"
+classifiers = ["Development Status :: 3 - Alpha"]
 readme = "README.md"
 requires-python = ">=3.13"
 dependencies = ["Django>=5.2"]
