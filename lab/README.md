@@ -99,7 +99,7 @@ P2 채널 시나리오(`CHANNEL_SPECS`, N=200, 수신 워커 2). 준비 확인: 
 | G-steady·G-cancel·G-worker | 그룹, 계속 / `wait_for` 1ms / 송신이 워커 | `each`: 워커마다 0..199 를 한 번씩 순서대로 |
 | S-steady·S-cancel·S-worker | 프로세스 전용 채널 1:1(워커 → 다른 워커 포함) | `each` + 송신 PID ≠ 수신 PID |
 | P-steady | 일반 채널 큐 그룹 | `split`: 합이 한 번씩, 두 워커 모두 > 0 |
-| P-cancel → P-cancel-after | 일반 채널 10ms 폴링(별도 레이어 인스턴스 `pcancel10`) → 같은 인스턴스로 그룹 | `lossy`(손실 허용, 중복·용량 드롭 0, 알려진 결함은 기록) → `each`. P-cancel 에서 결함이 났으면 P-cancel-after 는 건너뛰고 그렇게 기록한다 |
+| P-cancel → P-cancel-after | 일반 채널 10ms 폴링(별도 레이어 인스턴스 `pcancel10`) → 같은 인스턴스로 그룹 | `lossy`(손실 허용, 중복·용량 드롭 0, 알려진 결함은 기록) → `each`. P-cancel 에서 결함이 났으면 P-cancel-after 는 건너뛰고 결과와 러너 로그(`skipped (known defect in P-cancel)`)에 남긴다 |
 | BURST | 그룹, 간격 0 | `drops`: 워커마다 손실 = 로그의 드롭 수 |
 | NOCLOSE | 그룹, 송신 프로세스가 `close()` 없이 끝남 | `each`, 실행기 rc 0 |
 | D2-cap100·D2-cap1000 | D2 와 같은 꼴(일반 채널, 0.5초 폴링, 버스트 200) × `LAB_D2_TRIALS`(20), 수신 `capacity` 100 / 1000. 시도마다 새 레이어 인스턴스(`d2cap100-<번호>` 등) | `record`: 중복·모르는 id 0 만. 손실·알려진 결함은 기록 |
@@ -108,7 +108,9 @@ P2 채널 시나리오(`CHANNEL_SPECS`, N=200, 수신 워커 2). 준비 확인: 
 모든 시나리오는 송신·수신 예외 0 이어야 하고, 워커 로그에 nats-py 읽기 루프 오류(`nats: encountered error`)가 없어야 한다. 원자료는 `lab/.out/chan-<시각>.json`.
 
 예외는 `defect_ok` 를 단 시나리오(P-cancel·D2 두 판, 모두 별도 레이어 인스턴스) 하나다(#66 재개 2). 알려진 결함([이관 문서](../docs/research/handoff-marco-nats-flush-cancel.md): 구독 확인이 취소되면 nats-py 읽기 루프가 `InvalidStateError` 로 끝남)은 판정을 좁게 잡는다.
-- 결함으로 세는 경우: 한 워커의 읽기 루프 오류 줄이 **모두** `InvalidStateError` 일 때만이다. stop 1초 뒤 다시 물어 늦게 온 줄(`late_nats_log`)도 본다. 그 시도의 준비 실패(`may_not_ready`)도 결함이 있을 때만 넘긴다.
+- 결함으로 세는 경우: 한 워커의 읽기 루프 오류 줄이 **모두** `InvalidStateError` 이고, 그 워커가 쓴 레이어 인스턴스의 읽기 루프가 실제로 끝났을 때(`read_loop_alive` 가 False)만이다. stop 1초 뒤 다시 물어 늦게 온 줄(`late_nats_log`)과 읽기 루프 상태를 본다. nats 로그는 워커 프로세스 전역이라 다른 인스턴스의 늦은 줄이 섞일 수 있어 읽기 루프 상태로 묶는다(#66 리뷰 P3-2).
+- 면제는 워커 단위다. 한 워커의 결함은 다른 워커의 오류를 넘기지 않는다. 다만 준비 실패(`may_not_ready`)는 시도 단위로, 결함 워커가 하나라도 있는 시도면 넘긴다(일반 채널 큐 그룹은 한 워커가 죽으면 준비가 어차피 실패해 워커별로 가를 수 없다).
+- `defect_ok` 는 `layer` 를 단 스펙에만 둘 수 있다(`_checks.channel_spec_problems`, P2 첫머리에서 검사).
 - 결함이 난 시도도 실패인 것: 중복·모르는 id·용량 드롭·합 > N·송수신 예외, 다른 예외로 끝난 읽기 루프, 결함 없는 준비 실패.
 - 기록: 결과의 `channel_known_defects`(시나리오별 시도 수, 결함이 난 시도·워커 PID). 워커별 `read_loop_alive`(nats-py `_reading_task` 상태, 진단용)도 남는다.
 - 기본 레이어를 쓰는 시나리오(LIVE 등)에는 예외가 없다.

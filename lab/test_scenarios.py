@@ -17,6 +17,7 @@ import urllib.request
 import pytest
 from _checks import (
     COARSE_SAMPLE_GAP,
+    channel_spec_problems,
     delivery_problems,
     delivery_summary,
     error_episodes,
@@ -28,6 +29,7 @@ from _checks import (
     ltx_process_problems,
     max_sample_gap,
     quarantine_problems,
+    skip_after,
     stale_dirs,
     template_fingerprint,
 )
@@ -222,9 +224,10 @@ CHANNEL_SPECS = [
     {"id": "P-steady", "kind": "plain", "pace": 0.002, "expect": "split"},
     # 일반 채널 취소 공백(계약상 손실 허용). 1ms 는 구독 확인을 거의 늘 취소해 연결을 망가뜨리는
     # 알려진 결함이라 strict xfail 로 따로 둔다(test_P2_nats_flush_cancel_known_defect). 10ms 에서도
-    # 그 결함이 가끔 난다(#66 수정 1, P2 4회 중 1회). 그래서 별도 레이어 인스턴스(layer)에 가두고,
-    # 결함(InvalidStateError 로 끝난 읽기 루프)은 defect_ok 로 기록만 한다. 같은 인스턴스를 쓰는
-    # P-cancel-after 는 앞 시도에 결함이 없었을 때만 돌려 each 로 단언한다(after).
+    # 그 결함이 가끔 난다(#66, 발생률은 docs/research/lab-2026-10-26-multiproc-nats.md §5). 그래서
+    # 별도 레이어 인스턴스(layer)에 가두고, 결함(InvalidStateError 로 끝난 읽기 루프)은 defect_ok 로
+    # 기록만 한다. 같은 인스턴스를 쓰는 P-cancel-after 는 앞 시도에 결함이 없었을 때만 돌려 each 로
+    # 단언한다(after).
     {"id": "P-cancel", "kind": "plain", "mode": "cancel", "timeout": 0.01, "pace": 0.005,
      "expect": "lossy", "layer": "pcancel10", "defect_ok": True, "may_not_ready": True,
      "ready_deadline": 15},
@@ -279,6 +282,7 @@ def _run_channel_spec(stack: Stack, spec: dict) -> tuple[dict | None, float, str
 
 
 def _p2_channels(stack: Stack, rec: dict) -> None:
+    assert not (bad := channel_spec_problems(CHANNEL_SPECS)), bad
     versions = stack.compose(
         "exec", "-T", "app", "python", "-c",
         "import importlib.metadata as m, json; print(json.dumps({p: m.version(p) for p in "
@@ -290,9 +294,10 @@ def _p2_channels(stack: Stack, rec: dict) -> None:
     raw, results, problems, defects = {}, {}, {}, {}
     for spec in CHANNEL_SPECS:
         spec = {"n": 200, **spec}
-        if defects.get(spec.get("after")):
+        if skipped := skip_after(spec, defects):
             # 같은 레이어 인스턴스의 앞 시나리오에서 알려진 결함이 났다. 그 연결은 받지 못한다.
-            results[spec["id"]] = {"skipped": f"known defect in {spec['after']}"}
+            log(f"P2 channels {spec['id']}: skipped ({skipped})")
+            results[spec["id"]] = {"skipped": skipped}
             continue
         out, took, error = _run_channel_spec(stack, spec)
         if error:
