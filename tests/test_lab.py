@@ -1784,8 +1784,8 @@ def test_dbconfig_report_csv_and_tables():
     assert set(rows[0]) == set(r.CSV_FIELDS)
     out = r.tables(data)
     assert (
-        "| `rmw` | +50.0, +50.0 | +0.0, +0.0 | 예 | 아니오 | 재현 (기본 [5, 5], 권장 [0, 0]) |"
-        in out
-    )
+        "| `rmw` | +50.0, +50.0 | +0.0, +0.0 | +0.0, +0.0 | 예·아니오·아니오 | "
+        "재현 (기본 [5, 5], 권장 [0, 0]) |"
+    ) in out
     # locked 밖의 예외도 숨기지 않는다
     assert "x.DoesNotExist: y': 4" in out

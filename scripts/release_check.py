@@ -78,6 +78,9 @@ def blob_images(markdown: str) -> list[str]:
     """PyPI·GitHub 에서 깨질 이미지 대상(GitHub blob 페이지 URL)을 나온 순서대로 돌려준다.
 
     상대 이미지 경로는 fancy-pypi-readme 치환이 ``blob/main`` URL 로 바꾸므로 여기에 걸린다.
+    잡지 않는 것: 참조식 이미지(``![a][ref]`` + ``[ref]: …/blob/…``), ``www.github.com`` 호스트.
+    지금 README 에는 그런 꼴이 없다(README 이미지 경로는 ``tests/test_release_check.py`` 가
+    따로 본다).
     """
     found = []
     for pattern in _IMAGE_TARGETS:

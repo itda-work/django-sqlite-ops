@@ -249,6 +249,11 @@ def test_readme_images_are_raw_urls_of_tracked_files():
     readme = (ROOT / "README.md").read_text(encoding="utf-8")
     images = [m[1] for pattern in release_check._IMAGE_TARGETS for m in pattern.finditer(readme)]
     raw = "https://raw.githubusercontent.com/itda-work/django-sqlite-ops/main/"
+    # 이미지를 모두 지워도 통과하지 않게 README 차트를 기대값으로 둔다(#83 리뷰 P3-4)
+    assert sorted(images) == [
+        raw + "docs/assets/conn-max-age.svg",
+        raw + "docs/assets/dbconfig.svg",
+    ]
     for target in images:
         assert target.startswith(raw), target
         assert (ROOT / target.removeprefix(raw)).is_file(), target

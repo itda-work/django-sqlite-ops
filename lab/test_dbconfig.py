@@ -167,6 +167,8 @@ def test_litestream_sets_wal(stack, run_id, rec):
     rec["transaction_mode"] = stats["transaction_mode"]
     log(f"dbconfig litestream + django-default: {rec}")
     assert stats["transaction_mode"] is None, stats
+    # 이 테스트의 주장: Litestream 이 붙으면 Django 기본 설정도 WAL 로 돈다(#83 리뷰 P3-3)
+    assert rec["journal_mode"] == "wal", stats
 
 
 @pytest.mark.dbconfig

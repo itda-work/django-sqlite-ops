@@ -6,18 +6,24 @@ Django 에서 SQLite 를 운영 DB 로 안전하게 쓰게 하는 **운영 도�
 
 ## 왜 쓰는가
 
-Django 의 기본 SQLite 설정은 동시 쓰기를 고려하지 않는다. 이 패키지는 실측으로 확인한 권장 설정을 한 줄로 넣고, 운영에서 조용히 망가지는 설정과 상태를 막는다. 아래는 모두 회귀 랩(Docker, colima arm64)에서 잰 값이다. 이득이 재현되지 않은 것(PRAGMA `mmap_size`·`cache_size`·`journal_size_limit`)은 기본값에 넣지 않았다([#26](docs/research/bench-2026-10-08.md), [#27](docs/research/cache-size-2026-10-12.md)).
+이 패키지는 실측으로 확인한 권장 설정을 한 줄로 넣고, 운영에서 조용히 망가지는 설정과 상태를 막는다. 아래는 모두 회귀 랩(Docker, colima arm64)에서 잰 값이다. 좋아진 것과 나빠진 것을 함께 적는다. 이득이 재현되지 않은 것(PRAGMA `mmap_size`·`cache_size`·`journal_size_limit`)은 기본값에 넣지 않았다([#26](docs/research/bench-2026-10-08.md), [#27](docs/research/cache-size-2026-10-12.md)).
 
-**1. 동시 쓰기에서 `database is locked` 가 사라진다** ([측정](docs/research/bench-2026-10-26-default-vs-recommended.md), 2026-10-26)
+**1. 읽고-고쳐-쓰기 트랜잭션에서 `database is locked` 가 사라진다** ([측정](docs/research/bench-2026-10-26-default-vs-recommended.md), 2026-10-26)
 
 ![Django 기본 설정 대 권장 설정의 처리량·p99·locked 오류](https://raw.githubusercontent.com/itda-work/django-sqlite-ops/main/docs/assets/dbconfig.svg)
 
-- 측정 조건: Django 기본 설정(rollback journal, DEFERRED)과 `sqlite_database()`(WAL, `IMMEDIATE`, `synchronous=NORMAL`)를 같은 앱·같은 부하(동시 16)로 5회씩 번갈아 돌렸다. Litestream 은 붙이지 않았다.
+- 측정 조건: Django 기본 설정(rollback journal, DEFERRED)과 `sqlite_database()`(WAL, `IMMEDIATE`, `synchronous=NORMAL`)를 같은 앱·같은 부하(동시 16, uvicorn 워커 1·4)로 5회씩 번갈아 돌렸다. Litestream 은 붙이지 않았다. 아래 범위는 반복별 짝 차이의 최소–최대다.
 - `transaction.atomic()` 안에서 읽고 고쳐 쓰는 요청은 Django 기본에서 **42.9–47.9% 가 `database is locked`(HTTP 500)** 로 실패했다. 권장 설정은 10번의 실행 모두에서 0건이었다.
-- 50행 INSERT 가 70% 인 부하에서 처리량은 워커 1 에서 +64–133%, 워커 4 에서 +116–885% 였다. p99 는 −48–93% 였다.
-- 다 좋아지지는 않았다.
-  - 워커 1 의 읽기 위주 부하에서는 처리량 차이가 재현되지 않았다(p99 는 −57–75%).
-  - 워커 1 의 읽고-고쳐-쓰기 요청은 권장 설정의 p99 가 더 높았다(+36–144%). 기본 설정이라면 실패했을 요청이 실패하지 않고 쓰기 잠금을 기다리기 때문이다.
+- 단독 INSERT(autocommit)만 있는 부하는 **두 설정 모두 locked 0** 이었다. locked 는 읽고-고쳐-쓰기 트랜잭션에서만 났다.
+- 50행 INSERT 가 70% 인 부하에서 권장 설정의 처리량과 p99:
+  - 워커 1: 처리량 +64.2–133.0%, p99 −47.7 – −61.6%.
+  - 워커 4: 처리량 +115.8–884.6%, p99 −77.3 – −92.9%.
+- 읽기 위주 부하(읽기 70%·정렬 10%·1행 INSERT 20%)에서 권장 설정의 p99 는 워커 1 에서 −56.6 – −74.6%, 워커 4 에서 −82.6 – −86.3% 였다. 처리량은 워커 4 에서 +61.0–90.8% 였다.
+- 다 좋아지지는 않았다(모두 5회 반복에서 재현된 것, 또는 재현되지 않은 것).
+  - 읽기 위주 부하의 **p50 은 권장 설정이 높았다**: 워커 1 +19.7–64.7%, 워커 4 +48.2–62.3%(재현).
+  - 워커 1 의 읽기 위주 부하에서는 처리량 차이가 재현되지 않았다(−12.5 – +15.9%).
+  - 읽고-고쳐-쓰기 단계(읽기 50% + 읽고-고쳐-쓰기 50%)의 p99 는 워커 1 에서 **권장 설정이 높았다**(+36.3–143.6%, 재현). 워커 4 는 재현 안 됨(−33.8 – +3.1%).
+  - 요청 단위로는 두 워커 모두 **권장 설정의 읽고-고쳐-쓰기 요청이 더 오래 걸렸다**(성공한 요청의 p99: 워커 1 65.6–106.6 → 148.9–227.5 ms, 워커 4 137.6–212.8 → 231.9–336.3 ms). 기본 설정에서 실패했을 요청이 실패 대신 쓰기 잠금을 기다린 것으로 보인다(추정). 권장 설정이 그 단계를 더 큰 DB 에서 시작한 영향도 섞여 있다([한계](docs/research/bench-2026-10-26-default-vs-recommended.md#한계)).
 
 **2. ASGI 에서 `CONN_MAX_AGE=None` 을 막는다** ([#26](docs/research/bench-2026-10-08.md#결과-연결-재사용), 2026-10-08 · [#33](docs/research/fd-soak-2026-10-09.md), 2026-10-09)
 
@@ -25,7 +31,7 @@ Django 의 기본 SQLite 설정은 동시 쓰기를 고려하지 않는다. 이 
 
 - uvicorn 의 동기 뷰에서 `CONN_MAX_AGE=None` 은 연결을 재사용하지 않는다(DB 요청마다 새 연결 약 1개). 대신 닫지 않고 쌓는다.
 - 열린 DB 파일 fd 가 기본 한도 1,024 바로 아래(810–982)까지 올라갔다. 그때 `unable to open database file` 500 이 났다.
-- 한도를 올리면 오류는 없어진다. 그래도 fd 는 16.75배, RSS 는 5.62배 많이 쓰고 이득은 없다.
+- 한도를 올리면 이 부하(동시 16, 30분)에서는 오류가 없었다. 그래도 `CONN_MAX_AGE=0` 보다 fd 를 16.75배, RSS 를 5.62배 많이 썼고 연결 재사용 이득은 없었다.
 - [시스템 체크](#시스템-체크) `sqlite_ops.W005` 가 이 설정을 알린다.
 
 **3. 위험한 부팅을 거부하고, 안전할 때만 복원한다** ([회귀 랩](docs/research/lab-2026-10-08.md), 2026-10-08 · [L8c·L8d](docs/research/lab-2026-10-25-long-outage.md), 2026-10-25)

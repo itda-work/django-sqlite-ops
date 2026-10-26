@@ -39,6 +39,8 @@ CSV_FIELDS = (
     "journal_mode",
     "transaction_mode",
 )
+# 짝 비교·판정을 내는 지표(측정 전에 정한 규칙, ``_benchstat.reproduced``)
+PAIRED = ("rps", "p50_ms", "p99_ms")
 LABEL = {"django-default": "Django 기본", "recommended": "권장"}
 
 
@@ -121,12 +123,12 @@ def tables(data: dict) -> str:
                 out.append(f"| `{phase}` | {LABEL[config]} | " + " | ".join(cells) + " |")
         out += [
             "",
-            "| 단계 | req/s 차이 % | p99 차이 % | req/s 재현 | p99 재현 | locked 판정 |",
+            "| 단계 | req/s 차이 % | p50 차이 % | p99 차이 % | 재현 req/s·p50·p99 | locked 판정 |",
             "|---|---|---|---|---|---|",
         ]
         for phase in data["phases"]:
             cols = []
-            for name in ("rps", "p99_ms"):
+            for name in PAIRED:
                 d = paired_deltas(runs, cma, "recommended", phase, name)
                 cols.append((", ".join(f"{x:+.1f}" for x in d), reproduced(d, reps)))
             locked = {
@@ -138,9 +140,9 @@ def tables(data: dict) -> str:
                 for config in data["configs"]
             }
             verdict = locked_verdict(locked["django-default"], locked["recommended"], reps)
+            judged = "·".join("예" if ok else "아니오" for _, ok in cols)
             out.append(
-                f"| `{phase}` | {cols[0][0]} | {cols[1][0]} | "
-                f"{'예' if cols[0][1] else '아니오'} | {'예' if cols[1][1] else '아니오'} | "
+                f"| `{phase}` | " + " | ".join(text for text, _ in cols) + f" | {judged} | "
                 f"{verdict} (기본 {locked['django-default']}, 권장 {locked['recommended']}) |"
             )
         out.append("")
