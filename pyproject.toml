@@ -1,13 +1,14 @@
 [build-system]
 # License-Expression·License-File 은 core metadata 2.4 다(hatchling 1.26.0 부터 지원)
-requires = ["hatchling>=1.26"]
+# hatch-fancy-pypi-readme: PyPI 설명의 상대 링크를 절대 URL 로 바꾼다(아래 metadata.hooks)
+requires = ["hatchling>=1.26", "hatch-fancy-pypi-readme"]
 build-backend = "hatchling.build"
 
 [project]
 name = "django-sqlite-ops"
 version = "0.1.0a1"
 description = "[Experimental] Operations toolkit for running SQLite as a production database in Django"
-readme = "README.md"
+dynamic = ["readme"]
 license = "MIT"
 license-files = ["LICENSE"]
 requires-python = ">=3.13"
@@ -38,6 +39,20 @@ Changelog = "https://github.com/itda-work/django-sqlite-ops/blob/main/CHANGELOG.
 [project.optional-dependencies]
 nats = ["channels-nats"]
 channels-lite = ["channels-lite"]
+
+# PyPI 설명은 README 그대로이되, 상대 파일 링크(`](docs/...)`)를 GitHub 절대 URL 로 바꾼다.
+# PyPI 는 상대 링크를 저장소로 풀지 않고, 한 번 올린 버전의 설명은 다시 쓸 수 없다(#77).
+# 앵커(#...)와 http(s):·mailto: 는 그대로 둔다. GitHub 에서 보는 README.md 는 바뀌지 않는다.
+# 빌드된 METADATA 에 상대 링크가 남지 않았는지는 release_check.py --dist 가 검사한다
+[tool.hatch.metadata.hooks.fancy-pypi-readme]
+content-type = "text/markdown"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.fragments]]
+path = "README.md"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '\]\((?!https?:|#|mailto:)([^)\s]+)\)'
+replacement = '](https://github.com/itda-work/django-sqlite-ops/blob/main/\1)'
 
 [tool.hatch.build.targets.wheel]
 packages = ["django_sqlite_ops"]

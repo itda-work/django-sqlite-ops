@@ -2,7 +2,7 @@
 
 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/) 형식을 따르고, 버전은 [PEP 440](https://peps.python.org/pep-0440/) 으로 매긴다. 릴리스할 때 `[Unreleased]` 의 항목을 새 버전 절로 옮긴다(`scripts/release_check.py` 가 확인한다).
 
-> ⚠️ **실험적 프로젝트다.** 1.0 전에는 API·동작·지원 범위가 예고 없이 바뀔 수 있다. 사전 릴리스(`a`·`b`·`rc`)는 `pip install --pre` 로만 설치된다. 운영 환경에서는 버전을 고정한다.
+> ⚠️ **실험적 프로젝트다.** 1.0 전에는 API·동작·지원 범위가 예고 없이 바뀔 수 있다. 사전 릴리스(`a`·`b`·`rc`)는 버전을 명시해 설치한다(`pip install "django-sqlite-ops==0.1.0a1"`). `--pre` 는 모든 의존성의 사전 릴리스까지 허용하므로 쓰지 않는다. 운영 환경에서는 버전을 고정한다.
 
 ## [Unreleased]
 

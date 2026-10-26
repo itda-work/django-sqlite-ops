@@ -6,7 +6,7 @@ Django 에서 SQLite 를 운영 DB 로 안전하게 쓰게 하는 **운영 도�
 
 ## 현재 상태
 
-PyPI 에 **실험적 사전 릴리스**로 배포한다([D-28](docs/DECISIONS.md), 2026-10-26 결정). 첫 버전은 `0.1.0a1` 이고 사전 릴리스라 `--pre` 없이는 설치되지 않는다. 바뀐 점은 [CHANGELOG](CHANGELOG.md) 에 적는다. 외부 홍보는 하지 않는다. 패키지 이름 `django-sqlite-ops` 는 확정이다(D-28 이 D-6 을 갱신).
+PyPI 에 **실험적 사전 릴리스**로 배포한다([D-28](docs/DECISIONS.md), 2026-10-26 결정). 첫 버전은 `0.1.0a1` 이다. 사전 릴리스는 버전을 명시해 설치한다(아래 [설치](#설치)). 바뀐 점은 [CHANGELOG](CHANGELOG.md) 에 적는다. 외부 홍보는 하지 않는다. 패키지 이름 `django-sqlite-ops` 는 확정이다(D-28 이 D-6 을 갱신).
 
 | 기능 | 상태 | 이슈·근거 |
 |---|---|---|
@@ -25,20 +25,22 @@ PyPI 에 **실험적 사전 릴리스**로 배포한다([D-28](docs/DECISIONS.md
 
 요구 버전: Python 3.13+, Django 5.2+, SQLite 3.37+. boot CLI 는 POSIX(Linux·macOS)와 PATH 의 `litestream` 0.5.17 이 필요하다([boot CLI](#boot-cli)).
 
-PyPI 에서 설치한다. 사전 릴리스(`0.1.0a1`)라 사전 릴리스 허용을 켜야 하고, 실험적 프로젝트이므로 버전을 고정한다.
+PyPI 에서 설치한다. 사전 릴리스는 버전을 명시해 설치한다. 실험적 프로젝트이므로 그 버전으로 고정해 둔다.
 
 ```bash
-pip install --pre "django-sqlite-ops==0.1.0a1"
+pip install "django-sqlite-ops==0.1.0a1"
 # 또는
-uv add --prerelease=allow "django-sqlite-ops==0.1.0a1"
+uv add "django-sqlite-ops==0.1.0a1"
 ```
 
 필수 의존성은 Django 하나다. 채널 레이어는 extra 로 고른다: `[nats]`(channels-nats), `[channels-lite]`(channels-lite 만. aio 레이어에 필요한 의존성은 [channels-lite 패치 '함정'](#channels-lite-패치)).
 
 ```bash
-pip install --pre "django-sqlite-ops[nats]==0.1.0a1"
-uv add --prerelease=allow "django-sqlite-ops[channels-lite]==0.1.0a1"
+pip install "django-sqlite-ops[nats]==0.1.0a1"
+uv add "django-sqlite-ops[channels-lite]==0.1.0a1"
 ```
+
+`pip install --pre` 나 `uv add --prerelease=allow` 는 쓰지 않는다. 이 패키지뿐 아니라 Django 를 비롯한 **모든 의존성**의 사전 릴리스까지 허용한다(`uv add --prerelease=allow` 는 `uv.lock` 에 `prerelease-mode = "allow"` 로 남아 이후의 해석에도 적용된다). 버전을 지정자에 명시하면 그 사전 릴리스만 받아들여진다. 정식 릴리스가 나온 뒤에는 명시하지 않으면 사전 릴리스를 고르지 않는다.
 
 릴리스되지 않은 `main` 을 쓰려면 GitHub 에서 받는다: `pip install git+https://github.com/itda-work/django-sqlite-ops`.
 
@@ -948,4 +950,4 @@ scripts/lab.sh bench                # PRAGMA 벤치 (lab/README.md)
 gh workflow run lab.yml -f scenarios=all   # 회귀 랩을 GitHub 러너(amd64)에서 수동 실행. 결과는 artifact (벤치 제외)
 ```
 
-릴리스: `CHANGELOG.md` 의 `[Unreleased]` 를 새 버전 절로 옮기고 `pyproject.toml` 의 version 을 올린 뒤 `python3 scripts/release_check.py v<버전>` 이 통과하면 태그 `v<버전>` 을 push 한다. `.github/workflows/release.yml` 이 같은 검사 뒤 PyPI(trusted publishing)와 GitHub 릴리스에 올린다.
+릴리스: `CHANGELOG.md` 의 `[Unreleased]` 를 새 버전 절로 옮기고 `pyproject.toml` 의 version 을 올린 뒤 `python3 scripts/release_check.py v<버전>` 이 통과하면 태그 `v<버전>` 을 push 한다. `.github/workflows/release.yml` 이 같은 검사 뒤 PyPI(trusted publishing)와 GitHub 릴리스에 올린다. 산출물은 `uv build --out-dir <디렉터리>` 뒤 `python3 scripts/release_check.py v<버전> --dist <디렉터리>` 로 미리 볼 수 있다(빌드된 Version, PyPI 설명의 상대 링크).
