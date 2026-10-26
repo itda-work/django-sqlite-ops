@@ -71,6 +71,13 @@ def test_build_context_differs_from_docs_only_by_substitutions(tmp_path):
     assert os.access(build / "entrypoint.sh", os.X_OK)
     lite = (build / "litestream.yml").read_text(encoding="utf-8")
     assert "endpoint: http://toxiproxy:18333" in lite and "path: ${LAB_PREFIX}" in lite
+    # P2(#66): 문서 Dockerfile 은 그대로, 그 이미지 위에 [nats] extra 를 판 고정으로 얹는다
+    nats_req = (build / "requirements-nats.txt").read_text(encoding="utf-8").splitlines()
+    assert nats_req == [
+        f"django-sqlite-ops[nats] @ file:///app/{wheel.name}",
+        f"channels-nats=={bc.CHANNELS_NATS}",
+    ]
+    assert (build / "nats.Dockerfile").read_text(encoding="utf-8").count("FROM ${BASE}") == 1
 
 
 # --- 랩 판정 함수(lab/_checks.py) — Docker 없이 -------------------------------------------
@@ -426,6 +433,262 @@ def test_l8_ltx_pid_span_pair():
 
 
 # --- PRAGMA 벤치 집계(#26, lab/_benchstat.py) ------------------------------------------------
+
+
+# --- P2 채널 레이어 전달(#66) ----------------------------------------------------------------
+
+CH_A, CH_B = "specific.a!x", "specific.b!y"
+
+
+def _worker(pid, channel, ids, nats_log=(), cancel_times=(), errors=(), alive=None):
+    return {
+        "pid": pid,
+        "channel": channel,
+        "ids": list(ids),
+        "nats_log": list(nats_log),
+        "cancels": len(cancel_times),
+        "cancel_times": list(cancel_times),
+        "errors": list(errors),
+        "read_loop_alive": alive,
+    }
+
+
+def _trial(*workers, errors=(), jobs=None, t0=10.0, t1=11.0):
+    t = {"workers": list(workers), "errors": list(errors), "senders": [1], "t0": t0, "t1": t1}
+    if jobs is not None:
+        t["jobs"] = jobs
+    return t
+
+
+def _full(channel, dropped):
+    return f"channels_nats: mailbox for {channel} is full (capacity 100); {dropped} message(s) dropped so far"  # noqa: E501
+
+
+def _room(channel, dropped):
+    return (
+        f"channels_nats: mailbox for {channel} has room again after dropping {dropped} message(s)"  # noqa: E501
+    )
+
+
+def test_p2_nats_drops_sums_episodes_per_channel():
+    c = _checks()
+    lines = [_full(CH_A, 1), _full(CH_B, 1), _full(CH_A, 7), _room(CH_A, 9), _full(CH_A, 2)]
+    # 구간 1 은 "room again" 의 9, 구간 2 는 끝까지 차 있어 마지막 누적 2. 다른 채널은 따로.
+    assert c.nats_drops(lines, CH_A) == 11
+    assert c.nats_drops(lines, CH_B) == 1
+    assert c.nats_drops([], CH_A) == 0
+
+
+def test_p2_each_requires_every_id_once_in_order():
+    c = _checks()
+    spec = {"n": 5, "expect": "each"}
+    ok = _trial(_worker(1, CH_A, range(5)), _worker(2, CH_B, range(5)))
+    assert c.delivery_problems(spec, ok) == []
+    lost = _trial(_worker(1, CH_A, [0, 1, 2, 4]), _worker(2, CH_B, range(5)))
+    assert any("received 4/5, lost 1" in p for p in c.delivery_problems(spec, lost))
+    dup = _trial(_worker(1, CH_A, [0, 1, 1, 2, 3, 4]), _worker(2, CH_B, range(5)))
+    assert any("duplicate" in p for p in c.delivery_problems(spec, dup))
+    order = _trial(_worker(1, CH_A, [1, 0, 2, 3, 4]), _worker(2, CH_B, range(5)))
+    assert any("out of order" in p for p in c.delivery_problems(spec, order))
+    one = _trial(_worker(1, CH_A, range(5)))
+    assert any("1 workers reported" in p for p in c.delivery_problems(spec, one))
+
+
+def test_p2_errors_and_unknown_ids_always_fail():
+    c = _checks()
+    spec = {"n": 3, "expect": "record"}
+    bad = _trial(
+        _worker(1, "lab.plain.k", [0, 7], errors=["FlushTimeoutError: x"]),
+        _worker(2, "lab.plain.k", [1]),
+        errors=["0 NoServersError: y"],
+    )
+    problems = c.delivery_problems(spec, bad)
+    assert any("send errors" in p for p in problems)
+    assert any("receive errors" in p for p in problems)
+    assert any("unknown ids [7]" in p for p in problems)
+
+
+def test_p2_nats_read_loop_error_fails_every_expectation():
+    """nats-py 읽기 루프가 끝났다는 줄이 있으면 손실을 허용하는 판정도 실패한다(#66 리뷰 P3-3)."""
+    c = _checks()
+    ch = "lab.plain.k"
+    dead = "nats: encountered error [InvalidStateError: invalid state]"
+    for expect in ("each", "split", "lossy", "drops", "record"):
+        spec = {"n": 2, "expect": expect}
+        trial = _trial(_worker(1, ch, [0], nats_log=[dead]), _worker(2, ch, [1]))
+        problems = c.delivery_problems(spec, trial)
+        assert any("read loop error" in p and "InvalidStateError" in p for p in problems), (
+            expect,
+            problems,
+        )
+    # 다른 경고(용량 드롭)만으로는 이 판정이 나지 않는다
+    calm = _trial(_worker(1, ch, [0], nats_log=[_full(ch, 1)]), _worker(2, ch, [1]))
+    assert not any(
+        "read loop" in p for p in c.delivery_problems({"n": 2, "expect": "record"}, calm)
+    )
+
+
+DEAD = "nats: encountered error [InvalidStateError: invalid state]"
+
+
+def test_p2_known_defect_is_excused_only_with_defect_ok():
+    """defect_ok 시나리오만 InvalidStateError 로 끝난 읽기 루프를 결함으로 세고 넘긴다(#66)."""
+    c = _checks()
+    ch = "lab.plain.k"
+    for expect in ("lossy", "record"):
+        trial = _trial(_worker(1, ch, [0], nats_log=[DEAD], alive=False), _worker(2, ch, [1]))
+        ok = {"n": 4, "expect": expect, "defect_ok": True}
+        assert c.known_defect_pids(ok, trial) == [1]
+        assert c.delivery_problems(ok, trial) == []
+        # 같은 시도라도 defect_ok 가 없으면 실패다(기본 레이어 시나리오)
+        plain = {"n": 4, "expect": expect}
+        assert c.known_defect_pids(plain, trial) == []
+        assert any("read loop error" in p for p in c.delivery_problems(plain, trial))
+    # stop 뒤에 늦게 온 줄도 센다
+    late = _trial(_worker(1, ch, [], alive=False), _worker(2, ch, [1]))
+    late["workers"][0]["late_nats_log"] = [DEAD]
+    assert c.known_defect_pids({"n": 2, "expect": "lossy", "defect_ok": True}, late) == [1]
+
+
+def test_p2_known_defect_needs_a_dead_read_loop():
+    """결함 줄이 있어도 그 워커의 레이어 인스턴스 읽기 루프가 살아 있으면 면제하지 않는다(#66 P3-2).
+
+    nats 로그는 워커 프로세스 전역이라 다른 인스턴스의 늦은 줄이 시간 창에 섞일 수 있다.
+    """
+    c = _checks()
+    ch = "lab.plain.k"
+    spec = {"n": 4, "expect": "lossy", "defect_ok": True}
+    for alive in (True, None):
+        trial = _trial(_worker(1, ch, [0], nats_log=[DEAD], alive=alive), _worker(2, ch, [1]))
+        assert c.known_defect_pids(spec, trial) == []
+        assert any("read loop error" in p for p in c.delivery_problems(spec, trial))
+    stuck = {**_trial(_worker(1, ch, [], nats_log=[DEAD], alive=True), _worker(2, ch, [])),
+             "ready": False, "probes_sent": 9}  # fmt: skip
+    assert any("not ready after 9" in p for p in c.delivery_problems(spec, stuck))
+    # 거꾸로 읽기 루프가 끝났어도 결함 줄이 없으면 원인을 모르므로 면제하지 않는다
+    stuck["workers"][0].update(nats_log=[], read_loop_alive=False)
+    assert c.known_defect_pids(spec, stuck) == []
+    assert any("not ready after 9" in p for p in c.delivery_problems(spec, stuck))
+
+
+def test_p2_known_defect_keeps_the_rest_of_the_contract():
+    """결함이 난 시도도 중복·용량 드롭·합 > n·다른 예외·결함 없는 준비 실패는 실패다."""
+    c = _checks()
+    ch = "lab.plain.k"
+    spec = {"n": 4, "expect": "lossy", "defect_ok": True}
+    dup = _trial(_worker(1, ch, [0, 0], nats_log=[DEAD], alive=False), _worker(2, ch, [1]))
+    assert any("duplicate" in p for p in c.delivery_problems(spec, dup))
+    dropped = _trial(
+        _worker(1, ch, [0], nats_log=[DEAD, _full(ch, 2)], alive=False), _worker(2, ch, [])
+    )
+    assert any("mailbox drop" in p for p in c.delivery_problems(spec, dropped))
+    # 다른 예외로 끝난 읽기 루프는 결함이 아니다 — 줄 하나라도 섞이면 실패
+    other = "nats: encountered error [ValueError: bad]"
+    for log in ([other], [DEAD, other]):
+        trial = _trial(_worker(1, ch, [0], nats_log=log, alive=False), _worker(2, ch, [1]))
+        assert c.known_defect_pids(spec, trial) == []
+        assert any("read loop error" in p for p in c.delivery_problems(spec, trial))
+    # 한 워커의 결함 면제는 다른 워커의 다른 예외로 끝난 읽기 루프에 닿지 않는다(#66 P3-1)
+    mixed = _trial(_worker(1, ch, [0], nats_log=[DEAD], alive=False),
+                   _worker(2, ch, [1], nats_log=[other], alive=False))  # fmt: skip
+    assert c.known_defect_pids(spec, mixed) == [1]
+    problems = c.delivery_problems(spec, mixed)
+    assert any(p.startswith("pid 2: nats-py read loop error") for p in problems), problems
+    assert not any(p.startswith("pid 1:") for p in problems), problems
+    flush = ["FlushTimeoutError: x"]
+    recv = _trial(_worker(1, ch, [0], nats_log=[DEAD], errors=flush, alive=False),
+                  _worker(2, ch, [1]))  # fmt: skip
+    assert any("receive errors" in p for p in c.delivery_problems(spec, recv))
+    # 준비 실패: 결함이 있으면 기록만, 없으면 실패
+    stuck = {**_trial(_worker(1, ch, []), _worker(2, ch, [])), "ready": False, "probes_sent": 9}
+    assert any("not ready after 9" in p for p in c.delivery_problems(spec, stuck))
+    stuck["workers"][0]["nats_log"] = [DEAD]
+    stuck["workers"][0]["read_loop_alive"] = False
+    assert c.delivery_problems(spec, stuck) == []
+    stuck["workers"][0]["nats_log"] = [other]
+    assert any("not ready" in p for p in c.delivery_problems(spec, stuck))
+
+
+def test_p2_defect_ok_needs_its_own_layer():
+    """defect_ok 면제는 별도 레이어 인스턴스에만 둔다(기본 레이어에 닿지 않게, #66 P3-1)."""
+    c = _checks()
+    specs = [
+        {"id": "OK", "defect_ok": True, "layer": "x"},
+        {"id": "PLAIN"},
+        {"id": "BAD", "defect_ok": True},
+        {"id": "EMPTY", "defect_ok": True, "layer": ""},
+    ]
+    assert c.channel_spec_problems(specs) == [
+        "BAD: defect_ok needs its own layer",
+        "EMPTY: defect_ok needs its own layer",
+    ]
+
+
+def test_p2_skip_after_only_on_a_known_defect_in_the_named_spec():
+    """P-cancel-after 는 P-cancel 에서 알려진 결함이 났을 때만 건너뛴다(#66 P3-3)."""
+    c = _checks()
+    spec = {"id": "P-cancel-after", "after": "P-cancel"}
+    hit = [{"trial": 0, "pids": [40]}]
+    assert c.skip_after(spec, {"P-cancel": hit}) == "known defect in P-cancel"
+    assert c.skip_after(spec, {}) is None
+    assert c.skip_after(spec, {"P-cancel": []}) is None
+    assert c.skip_after(spec, {"D2-cap100": hit}) is None
+    assert c.skip_after({"id": "LIVE"}, {"P-cancel": hit}) is None
+
+
+def test_p2_split_queue_group_needs_union_once_and_both_workers():
+    c = _checks()
+    spec = {"n": 4, "expect": "split"}
+    ch = "lab.plain.k"
+    assert c.delivery_problems(spec, _trial(_worker(1, ch, [0, 2]), _worker(2, ch, [1, 3]))) == []
+    both = _trial(_worker(1, ch, [0, 1, 2]), _worker(2, ch, [2, 3]))
+    assert any("more than one worker" in p for p in c.delivery_problems(spec, both))
+    starved = _trial(_worker(1, ch, range(4)), _worker(2, ch, []))
+    assert any("no share" in p for p in c.delivery_problems(spec, starved))
+    lost = _trial(_worker(1, ch, [0]), _worker(2, ch, [3]))
+    assert any("lost 2" in p for p in c.delivery_problems(spec, lost))
+
+
+def test_p2_lossy_allows_loss_but_not_drops_or_duplicates():
+    c = _checks()
+    spec = {"n": 10, "expect": "lossy"}
+    ch = "lab.plain.k"
+    assert c.delivery_problems(spec, _trial(_worker(1, ch, [0, 4]), _worker(2, ch, [5]))) == []
+    dropped = _trial(_worker(1, ch, [0], nats_log=[_full(ch, 3)]), _worker(2, ch, []))
+    assert any("mailbox drop" in p for p in c.delivery_problems(spec, dropped))
+
+
+def test_p2_drops_loss_must_equal_logged_drops():
+    c = _checks()
+    spec = {"n": 4, "expect": "drops"}
+    ok = _trial(
+        _worker(1, CH_A, [0, 1], nats_log=[_full(CH_A, 1), _room(CH_A, 2)]),
+        _worker(2, CH_B, range(4)),
+    )
+    assert c.delivery_problems(spec, ok) == []
+    silent = _trial(_worker(1, CH_A, [0, 1]), _worker(2, CH_B, range(4)))
+    assert any("lost 2 != mailbox drops 0" in p for p in c.delivery_problems(spec, silent))
+
+
+def test_p2_worker_sender_must_not_be_the_receiver():
+    c = _checks()
+    spec = {"n": 2, "expect": "each"}
+    workers = (_worker(1, CH_A, range(2)), _worker(2, CH_B, range(2)))
+    good = _trial(*workers, jobs=[{"to": CH_A, "sender": 2}, {"to": CH_B, "sender": 1}])
+    assert c.delivery_problems(spec, good) == []
+    self_send = _trial(*workers, jobs=[{"to": CH_A, "sender": 1}])
+    assert any("its own channel" in p for p in c.delivery_problems(spec, self_send))
+
+
+def test_p2_summary_counts_cancels_near_the_send_window():
+    c = _checks()
+    trial = _trial(
+        _worker(1, "lab.plain.k", [0], cancel_times=[9.0, 9.96, 10.5, 11.04, 12.0]),
+        _worker(2, "lab.plain.k", [1]),
+    )
+    s = c.delivery_summary({"n": 3}, trial)
+    assert s["workers"][0]["cancels_near_send"] == 3
+    assert s["union_lost"] == 1 and s["lost_ids"] == [2] and s["total"] == 2
 
 
 def _benchstat():

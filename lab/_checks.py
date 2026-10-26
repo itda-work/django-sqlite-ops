@@ -4,12 +4,16 @@
   격리 디렉터리에 같은 해시로 있는지(``template_fingerprint``·``quarantine_problems``).
 - L8a: S3 전체 단절 동안 헬스가 제한 시간 안에 ``unknown(stale)`` 로 바뀌고 복구 전까지
   유지되는지(``full_outage_problems``). 표본 인덱스가 아니라 경과 시간과 결과의 age 로 본다.
+- P2(#66): 워커 사이 채널 레이어 전달의 손실·중복·용량 드롭(``delivery_summary``·
+  ``delivery_problems``). 입력은 ``lab_tools/chanlab_run.py`` 의 시도 원자료다.
 
 입력은 ``lab_tools/inspect_data.py`` 의 스냅샷(``{"entries": {상대경로: {...}}}``)과 헬스 표본이다.
 표준 라이브러리만 쓴다.
 """
 
 from __future__ import annotations
+
+import re
 
 DB = "app.sqlite3"
 META = ".app.sqlite3-litestream"
@@ -327,4 +331,181 @@ def ltx_process_problems(
     left = sorted({pid for _t, procs in after for pid, _s in procs} & set(span))
     if left:
         problems.append(f"ltx pids from the outage still running after recovery: {left}")
+    return problems
+
+
+# --- P2 채널 레이어 전달(#66) -------------------------------------------------------------
+
+# channels-nats 0.10.0 의 용량 드롭 경고(layer.py ``_enqueue``). 첫 건과 그 뒤 60초마다
+# "is full … N message(s) dropped so far", 자리가 나면 "has room again after dropping N".
+_FULL = re.compile(r"mailbox for (\S+) is full \(capacity \d+\); (\d+) message\(s\) dropped so far")
+_ROOM = re.compile(r"mailbox for (\S+) has room again after dropping (\d+) message\(s\)")
+
+
+# nats-py 2.16.0 ``Client._read_loop`` 이 일반 예외에서 남기고 읽기 루프를 끝내는 줄. 랩 뷰는
+# 예외를 ``[종류: 메시지]`` 로 덧붙인다(notes/chanlab.py ``_Capture``).
+NATS_READ_ERROR = "nats: encountered error"
+# 알려진 결함(docs/research/handoff-marco-nats-flush-cancel.md)의 표지. 읽기 루프 오류 줄에 이
+# 예외가 붙은 것만 결함으로 센다 — 다른 예외로 끝난 읽기 루프는 예외 대상이 아니다.
+KNOWN_DEFECT = "[InvalidStateError:"
+
+
+def _nats_lines(worker: dict) -> list[str]:
+    """수신 중 로그 + stop 뒤에 늦게 온 로그(``defect_ok`` 면 chanlab_run 이 다시 물어 붙인다)."""
+    return worker["nats_log"] + worker.get("late_nats_log", [])
+
+
+def known_defect_pids(spec: dict, trial: dict) -> list:
+    """``spec["defect_ok"]`` 인 시나리오에서 알려진 결함이 난 워커 PID.
+
+    그 워커의 읽기 루프 오류 줄이 모두 ``InvalidStateError`` 이고, 그 워커가 쓴 레이어 인스턴스의
+    읽기 루프가 실제로 끝났을 때(``read_loop_alive is False``)만 센다. 하나라도 다른 예외면
+    결함으로 보지 않는다(→ ``delivery_problems`` 가 실패로 낸다). nats 로그는 워커 프로세스 전역이라
+    다른 인스턴스의 줄이 시간 창에 섞일 수 있어(#66 리뷰 P3-2) 읽기 루프 상태로 묶는다.
+    ``defect_ok`` 가 없으면 빈 목록.
+    """
+    if not spec.get("defect_ok"):
+        return []
+    pids = []
+    for w in trial["workers"]:
+        errors = [m for m in _nats_lines(w) if NATS_READ_ERROR in m]
+        if errors and all(KNOWN_DEFECT in m for m in errors) and w.get("read_loop_alive") is False:
+            pids.append(w["pid"])
+    return pids
+
+
+def channel_spec_problems(specs: list[dict]) -> list[str]:
+    """``CHANNEL_SPECS`` 의 구조 검사. ``defect_ok`` 는 별도 레이어 인스턴스(``layer``)에만 둔다 —
+    결함 면제가 기본 레이어를 쓰는 시나리오에 닿지 않게 한다(#66 리뷰 P3-1)."""
+    return [
+        f"{s['id']}: defect_ok needs its own layer"
+        for s in specs
+        if s.get("defect_ok") and not s.get("layer")
+    ]
+
+
+def skip_after(spec: dict, defects: dict) -> str | None:
+    """같은 레이어 인스턴스의 앞 시나리오(``spec["after"]``)에서 알려진 결함이 났으면 건너뛸 사유.
+
+    ``defects`` 는 ``{시나리오 id: [결함이 난 시도]}``. 그 연결은 받지 못하므로 단언 대신 기록한다.
+    """
+    if defects.get(spec.get("after")):
+        return f"known defect in {spec['after']}"
+    return None
+
+
+def nats_drops(lines: list[str], channel: str) -> int:
+    """``channel`` 의 mailbox 가 버린 메시지 수. 드롭 구간마다 마지막 누적 값을 더한다."""
+    total = current = 0
+    for line in lines:
+        if (m := _FULL.search(line)) and m[1] == channel:
+            current = int(m[2])
+        elif (m := _ROOM.search(line)) and m[1] == channel:
+            total += int(m[2])
+            current = 0
+    return total + current
+
+
+def delivery_summary(spec: dict, trial: dict, near: float = 0.05) -> dict:
+    """시도 하나의 워커별 수신 요약. ``near`` 는 송신 창 앞뒤로 취소를 세는 여유(초)."""
+    n = spec["n"]
+    want = set(range(n))
+    workers = []
+    for w in trial["workers"]:
+        ids = w["ids"]
+        got = set(ids)
+        workers.append(
+            {
+                "pid": w["pid"],
+                "received": len(ids),
+                "dup": len(ids) - len(got),
+                "unknown": sorted(got - want)[:20],
+                "lost": len(want - got),
+                "in_order": ids == sorted(ids),
+                "drops": nats_drops(w["nats_log"], w["channel"]),
+                "cancels": w["cancels"],
+                "cancels_near_send": sum(
+                    1 for t in w["cancel_times"] if trial["t0"] - near <= t <= trial["t1"] + near
+                ),
+                "errors": w["errors"],
+                "nats_errors": [m for m in _nats_lines(w) if NATS_READ_ERROR in m],
+                "read_loop_alive": w.get("read_loop_alive"),
+            }
+        )
+    every = [i for w in trial["workers"] for i in w["ids"]]
+    union = set(every)
+    return {
+        "workers": workers,
+        "total": len(every),
+        "cross_dup": len(every) - len(union),
+        "union_lost": len(want - union),
+        "lost_ids": sorted(want - union)[:50],
+        "send_errors": trial["errors"],
+        "senders": trial["senders"],
+    }
+
+
+def delivery_problems(spec: dict, trial: dict) -> list[str]:
+    """계약에 맞지 않는 것을 문장으로(빈 목록 = 통과). ``spec["expect"]``:
+
+    - ``each``: 워커마다 0..n-1 을 정확히 한 번씩, 보낸 순서로(그룹·프로세스 전용 채널).
+    - ``split``: 일반 채널 큐 그룹. 워커 합이 0..n-1 을 정확히 한 번씩, 두 워커 모두 1건 이상.
+    - ``lossy``: 일반 채널 취소 공백. 손실은 허용, 중복·모르는 id·용량 드롭은 없음.
+    - ``drops``: 버스트. 워커마다 손실 = 그 mailbox 의 용량 드롭 수, 중복 없음.
+    - ``record``: 판정 대상(D2 재현). 중복·모르는 id 만 본다.
+
+    모든 경우에 송신 예외·수신 루프 예외가 없어야 하고, 워커 수가 ``spec["workers"]``(기본 2)다.
+    워커 ``nats_log`` 에 nats-py 읽기 루프 오류(``nats: encountered error``)가 없어야 한다 — 그 뒤로
+    그 연결은 아무것도 읽지 않는데(handoff-marco-nats-flush-cancel.md) ``lossy``·``record`` 는
+    손실로만 남기 때문이다. 메시지에 예외 이름을 드러낸다. 준비되지 않은 시도(``ready: false``,
+    ``may_not_ready``)도 실패다.
+
+    예외는 ``spec["defect_ok"]`` 하나다(#66 재개 2): ``known_defect_pids`` 가 센 워커의 읽기 루프
+    오류(워커 단위)와, 그런 워커가 있는 시도의 준비 실패(시도 단위)는 문제로 내지 않는다(호출자가
+    따로 기록한다). 중복·모르는 id·용량 드롭·합 > n·송수신 예외는 그 시도에서도 그대로 문제다.
+    """
+    s = delivery_summary(spec, trial)
+    n = spec["n"]
+    expect = spec["expect"]
+    defect = set(known_defect_pids(spec, trial))
+    problems = []
+    if trial.get("ready") is False and not defect:
+        problems.append(f"not ready after {trial.get('probes_sent')} probes")
+    if len(s["workers"]) != spec.get("workers", 2):
+        problems.append(f"{len(s['workers'])} workers reported")
+    if s["send_errors"]:
+        problems.append(f"send errors: {s['send_errors'][:3]}")
+    for w in s["workers"]:
+        tag = f"pid {w['pid']}"
+        if w["errors"]:
+            problems.append(f"{tag}: receive errors {w['errors'][:3]}")
+        if w["nats_errors"] and w["pid"] not in defect:
+            problems.append(f"{tag}: nats-py read loop error {w['nats_errors'][:3]}")
+        if w["unknown"]:
+            problems.append(f"{tag}: unknown ids {w['unknown']}")
+        if w["dup"]:
+            problems.append(f"{tag}: {w['dup']} duplicate(s)")
+        if expect == "each":
+            if w["received"] != n or w["lost"]:
+                problems.append(f"{tag}: received {w['received']}/{n}, lost {w['lost']}")
+            if not w["in_order"]:
+                problems.append(f"{tag}: out of order")
+        elif expect == "drops" and w["lost"] != w["drops"]:
+            problems.append(f"{tag}: lost {w['lost']} != mailbox drops {w['drops']}")
+        elif expect in ("split", "lossy") and w["drops"]:
+            problems.append(f"{tag}: {w['drops']} mailbox drop(s)")
+    if expect in ("split", "lossy", "record"):
+        if s["cross_dup"] - sum(w["dup"] for w in s["workers"]):
+            problems.append("a message reached more than one worker")
+        if s["total"] > n:
+            problems.append(f"received {s['total']} > sent {n}")
+    owner = {w["channel"]: w["pid"] for w in trial["workers"]}
+    for job in trial.get("jobs", []):
+        if owner.get(job["to"]) == job["sender"]:
+            problems.append(f"worker {job['sender']} sent to its own channel")
+    if expect == "split":
+        if s["union_lost"]:
+            problems.append(f"lost {s['union_lost']}: {s['lost_ids'][:10]}")
+        if any(w["received"] == 0 for w in s["workers"]):
+            problems.append("a worker got no share of the queue group")
     return problems

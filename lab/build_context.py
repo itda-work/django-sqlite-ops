@@ -19,6 +19,8 @@ BUILD = LAB / ".build"
 PROFILES = ROOT / "docs" / "profiles"
 
 WHEEL_PLACEHOLDER = "<wheel>"
+# P2(#66) 이미지에 넣는 channels-nats 판. [nats] extra 는 판을 고정하지 않아 랩이 고정한다.
+CHANNELS_NATS = "0.10.0"
 
 # (문서, 블록 고르기, 원문 줄, 바꾼 줄). 랩과 문서의 차이는 이 표가 전부다(lab/README.md).
 SUBSTITUTIONS = {
@@ -116,6 +118,12 @@ def main(wheel_path: str, build: Path = BUILD) -> None:
         build / "lab_tools" / "litestream-health.yml",
         lite.replace("http://toxiproxy:18333", "http://toxiproxy:18334"),
     )
+    # P2(#66): 랩 이미지 위에 [nats] extra 를 더하는 층(lab/nats.Dockerfile).
+    write(
+        build / "requirements-nats.txt",
+        f"django-sqlite-ops[nats] @ file:///app/{wheel.name}\nchannels-nats=={CHANNELS_NATS}\n",
+    )
+    shutil.copy2(LAB / "nats.Dockerfile", build / "nats.Dockerfile")
     write(build / "entrypoint.sh", single_entry, 0o755)
     write(build / "entrypoint-multiproc.sh", multi_entry, 0o755)
 

@@ -7,6 +7,7 @@
 from __future__ import annotations
 
 import json
+import os
 import re
 import threading
 import time
@@ -16,18 +17,23 @@ import urllib.request
 import pytest
 from _checks import (
     COARSE_SAMPLE_GAP,
+    channel_spec_problems,
+    delivery_problems,
+    delivery_summary,
     error_episodes,
     full_outage_deadline,
     full_outage_problems,
+    known_defect_pids,
     long_outage_bounds,
     long_outage_problems,
     ltx_process_problems,
     max_sample_gap,
     quarantine_problems,
+    skip_after,
     stale_dirs,
     template_fingerprint,
 )
-from _lab import Stack, boot_lines, decision, http_json, log
+from _lab import OUT, RUN_ID, Stack, boot_lines, decision, http_json, log
 
 META = ".app.sqlite3-litestream"
 
@@ -99,7 +105,7 @@ def key_lines(text: str, *needles: str) -> list[str]:
 # --- 배포 프로필 종단 검증 ---------------------------------------------------------------------
 
 
-def _profile_stop_check(stack: Stack, rec: dict, prefix: str, workers: int) -> None:
+def _profile_stop_check(stack: Stack, rec: dict, prefix: str, workers: int, during=None) -> None:
     # 이름 있는 빈 볼륨을 처음 붙일 때 이미지의 /data 소유자가 복사되는가
     owner = (
         stack.compose(
@@ -161,6 +167,9 @@ def _profile_stop_check(stack: Stack, rec: dict, prefix: str, workers: int) -> N
     rec["doctor_channels"] = key_lines(doctor.out, "backend")
     assert doctor.rc == 0, doctor.text
 
+    if during is not None:
+        during(stack, rec)
+
     write_rows(stack.host_port("app"), 400)
     # 쓰기 직후 곧바로 docker stop: 마지막 sync 가 400건을 모두 올리는가(D1a 의 ASGI 판)
     rc, took, logs = stack.stop_app("app")
@@ -176,6 +185,7 @@ def _profile_stop_check(stack: Stack, rec: dict, prefix: str, workers: int) -> N
         "exit",
     )
     assert rc == 0
+    assert took < 30, took  # stop_grace_period 30s 안(SIGKILL 이 아님)
     replica = stack.replica(prefix)
     rec["replica_after_stop"] = replica
     assert replica.get("rows") == 400 and replica.get("integrity") == "ok"
@@ -199,13 +209,214 @@ def test_P1_single_server_compose(run_id, rec):
         stack.down()
 
 
+# P2 채널 레이어 전달(#66). 기대값은 docs/research/lab-2026-10-26-multiproc-nats.md §1.
+# 수신은 uvicorn 워커 2개(notes/chanlab.py), 송신은 별도 프로세스 또는 워커.
+D2_TRIALS = int(os.environ.get("LAB_D2_TRIALS", "20"))
+CHANNEL_SPECS = [
+    {"id": "G-steady", "kind": "group", "pace": 0.002, "expect": "each"},
+    {"id": "G-cancel", "kind": "group", "mode": "cancel", "timeout": 0.001, "pace": 0.002,
+     "expect": "each"},
+    {"id": "G-worker", "kind": "group", "sender": "worker", "pace": 0.002, "expect": "each"},
+    {"id": "S-steady", "kind": "specific", "pace": 0.002, "expect": "each"},
+    {"id": "S-cancel", "kind": "specific", "mode": "cancel", "timeout": 0.001, "pace": 0.002,
+     "expect": "each"},
+    {"id": "S-worker", "kind": "specific", "sender": "worker", "pace": 0.002, "expect": "each"},
+    {"id": "P-steady", "kind": "plain", "pace": 0.002, "expect": "split"},
+    # 일반 채널 취소 공백(계약상 손실 허용). 1ms 는 구독 확인을 거의 늘 취소해 연결을 망가뜨리는
+    # 알려진 결함이라 strict xfail 로 따로 둔다(test_P2_nats_flush_cancel_known_defect). 10ms 에서도
+    # 그 결함이 가끔 난다(#66, 발생률은 docs/research/lab-2026-10-26-multiproc-nats.md §5). 그래서
+    # 별도 레이어 인스턴스(layer)에 가두고, 결함(InvalidStateError 로 끝난 읽기 루프)은 defect_ok 로
+    # 기록만 한다. 같은 인스턴스를 쓰는 P-cancel-after 는 앞 시도에 결함이 없었을 때만 돌려 each 로
+    # 단언한다(after).
+    {"id": "P-cancel", "kind": "plain", "mode": "cancel", "timeout": 0.01, "pace": 0.005,
+     "expect": "lossy", "layer": "pcancel10", "defect_ok": True, "may_not_ready": True,
+     "ready_deadline": 15},
+    {"id": "P-cancel-after", "kind": "group", "pace": 0.002, "expect": "each",
+     "layer": "pcancel10", "after": "P-cancel"},
+    {"id": "BURST", "kind": "group", "pace": 0, "expect": "drops"},
+    {"id": "NOCLOSE", "kind": "group", "pace": 0.002, "expect": "each", "close": False},
+    # D2(docs/research/sqlite-django-package-review-v0.md)와 같은 꼴: 일반 채널 경쟁 수신 둘,
+    # wait_for 0.5초, 200건 버스트. 수신 쪽 capacity 기본(100) / 1000. 폴링이 구독 확인을 취소할
+    # 수 있어(위 결함) 기본 레이어와 떼고, 시도마다 새 인스턴스(layer_per_trial)를 써 한 시도의
+    # 결함이 다음 시도로 번지지 않게 한다. 결함은 P-cancel 과 같이 기록만 한다.
+    {"id": "D2-cap100", "kind": "plain", "mode": "cancel", "timeout": 0.5, "pace": 0,
+     "expect": "record", "trials": D2_TRIALS, "layer": "d2cap100", "layer_per_trial": True,
+     "defect_ok": True, "may_not_ready": True, "ready_deadline": 15},
+    {"id": "D2-cap1000", "kind": "plain", "mode": "cancel", "timeout": 0.5, "pace": 0,
+     "expect": "record", "trials": D2_TRIALS, "capacity": 1000, "layer": "d2cap1000",
+     "layer_per_trial": True, "defect_ok": True, "may_not_ready": True, "ready_deadline": 15},
+    # 수신 루프를 남겨 둔 채 docker stop 한다(_profile_stop_check 의 종료 단언).
+    {"id": "LIVE", "kind": "group", "pace": 0.002, "expect": "each", "keep": True},
+]  # fmt: skip
+
+
+def _compact(spec: dict, trial: dict) -> dict:
+    s = delivery_summary(spec, trial)
+    keys = ("received", "lost", "dup", "drops", "cancels", "cancels_near_send", "in_order",
+            "read_loop_alive")  # fmt: skip
+    return {
+        "workers": [{k: w[k] for k in ("pid", *keys)} for w in s["workers"]],
+        "total": s["total"],
+        "union_lost": s["union_lost"],
+        "lost_ids": s["lost_ids"][:20],
+        "ready": trial["ready"],
+        "ready_s": trial["ready_s"],
+        "probes_sent": trial["probes_sent"],
+        "send_s": round(trial["t1"] - trial["t0"], 3),
+        "senders": s["senders"],
+    }
+
+
+def _run_channel_spec(stack: Stack, spec: dict) -> tuple[dict | None, float, str | None]:
+    """앱 컨테이너 안에서 lab_tools/chanlab_run.py 를 돌린다. (결과, 초, 실패 사유)."""
+    t0 = time.monotonic()
+    res = stack.compose(
+        "exec", "-T", "app", "timeout", "300", "python", "/app/lab_tools/chanlab_run.py",
+        json.dumps(spec), check=False, timeout=360,
+    )  # fmt: skip
+    took = round(time.monotonic() - t0, 2)
+    log(f"P2 channels {spec['id']}: rc {res.rc} in {took}s")
+    if res.rc != 0:
+        return None, took, f"runner rc {res.rc}: {res.text[-1500:]}"
+    return json.loads(res.out.strip().splitlines()[-1]), took, None
+
+
+def _p2_channels(stack: Stack, rec: dict) -> None:
+    assert not (bad := channel_spec_problems(CHANNEL_SPECS)), bad
+    versions = stack.compose(
+        "exec", "-T", "app", "python", "-c",
+        "import importlib.metadata as m, json; print(json.dumps({p: m.version(p) for p in "
+        "('channels-nats', 'channels', 'nats-py', 'msgpack', 'Django', 'uvicorn')}))",
+    )  # fmt: skip
+    rec["channel_versions"] = json.loads(versions.out.strip().splitlines()[-1])
+    assert rec["channel_versions"]["channels-nats"] == "0.10.0"
+
+    raw, results, problems, defects = {}, {}, {}, {}
+    for spec in CHANNEL_SPECS:
+        spec = {"n": 200, **spec}
+        if skipped := skip_after(spec, defects):
+            # 같은 레이어 인스턴스의 앞 시나리오에서 알려진 결함이 났다. 그 연결은 받지 못한다.
+            log(f"P2 channels {spec['id']}: skipped ({skipped})")
+            results[spec["id"]] = {"skipped": skipped}
+            continue
+        out, took, error = _run_channel_spec(stack, spec)
+        if error:
+            problems[spec["id"]] = [error]
+            continue
+        raw[spec["id"]] = out
+        trials = out["trials"]
+        results[spec["id"]] = {
+            "runner_s": took,
+            "run_s": out["run_s"],
+            "close_s": out.get("close_s"),
+            "trials": [_compact(spec, t) for t in trials],
+        }
+        hit = [{"trial": i, "pids": pids} for i, t in enumerate(trials)
+               if (pids := known_defect_pids(spec, t))]  # fmt: skip
+        if spec.get("defect_ok"):
+            results[spec["id"]]["known_defect"] = {"trials": len(trials), "hit": hit}
+        if hit:
+            defects[spec["id"]] = hit
+        found = [
+            f"trial {i}: {p}" for i, t in enumerate(trials) for p in delivery_problems(spec, t)
+        ]
+        if found:
+            problems[spec["id"]] = found
+    OUT.mkdir(parents=True, exist_ok=True)
+    (OUT / f"chan-{RUN_ID}.json").write_text(json.dumps(raw), encoding="utf-8")
+    rec["channels"] = results
+    rec["channel_problems"] = problems
+    # 알려진 결함(InvalidStateError 로 끝난 읽기 루프) 발생: 시나리오별 {시도 수, 난 시도·워커}.
+    rec["channel_known_defects"] = {
+        k: v["known_defect"] for k, v in results.items() if "known_defect" in v
+    }
+    if problems:
+        # 접근 로그가 많아 꼬리만으로는 원인 줄이 밀려난다. 접근 로그를 뺀 줄을 남긴다.
+        lines = [ln for ln in stack.logs("app").splitlines() if not ln.startswith("INFO:")]
+        rec["app_log_lines"] = lines[-80:]
+    assert not problems, problems
+
+
 @pytest.mark.profile
 def test_P2_multiproc_compose(run_id, rec):
-    """single-server-multiproc 문서의 compose·entrypoint(uvicorn 워커 2, nats 컨테이너)."""
+    """single-server-multiproc 문서의 compose·entrypoint(uvicorn 워커 2, nats 컨테이너).
+
+    channels-nats([nats] extra)를 넣은 이미지로, 워커 사이 채널 레이어 전달을 함께 본다(#66).
+    """
     stack = Stack("p2", env={"WEB_WORKERS": "2"})
     try:
         stack.up_infra()
-        _profile_stop_check(stack, rec, f"p2-{run_id}", workers=2)
+        # 앱은 --no-deps 로 띄우므로(up_app) 문서 compose 의 depends_on 대신 브로커를 먼저 띄운다
+        # (multiproc 문서 §4 "브로커를 먼저 띄운다"). #66 전의 P2 는 nats 없이 돌았다.
+        stack.compose("up", "-d", "nats")
+        _profile_stop_check(stack, rec, f"p2-{run_id}", workers=2, during=_p2_channels)
+        rec["shutdown_channel_lines"] = key_lines(
+            stack.logs("app"), "channels_nats", "Traceback", "Task was destroyed", "Error"
+        )
+    finally:
+        stack.down()
+
+
+class NatsFlushCancelDefect(Exception):
+    """알려진 결함이 그대로 재현됐다(docs/research/handoff-marco-nats-flush-cancel.md)."""
+
+
+@pytest.mark.profile
+@pytest.mark.xfail(
+    strict=True,
+    raises=NatsFlushCancelDefect,
+    reason="nats-py 2.16.0: 취소된 flush 의 PONG 이 _read_loop 를 끝낸다 "
+    "(docs/research/handoff-marco-nats-flush-cancel.md). 고쳐지면 XPASS 로 실패해 알려 준다",
+)
+def test_P2_nats_flush_cancel_known_defect(run_id, rec):
+    """일반 채널을 1ms ``wait_for`` 로 폴링한 뒤에도 그 연결이 메시지를 받는가(#66).
+
+    기대(계약): 일반 채널 폴링은 두 폴링 사이의 메시지만 잃는다. 같은 레이어의 다른 수신은 그대로다.
+    실제(재현함): 첫 ``receive()`` 의 구독 확인 flush 가 취소되고, 그 PONG 에서 nats-py 읽기 루프가
+    ``InvalidStateError`` 로 끝나 그 연결로는 아무것도 받지 못한다. 결함을 별도 레이어 인스턴스
+    (``layer``)에 가두고, 문서 설정의 기본 레이어는 그 뒤에도 정상인지 먼저 단언한다.
+    """
+    stack = Stack("p2", env={"WEB_WORKERS": "2"})
+    layer = "flushcancel"
+    try:
+        stack.up_infra()
+        stack.compose("up", "-d", "nats")
+        stack.up_app("app", env=env(None, f"p2d-{run_id}", "--init-new"))
+        specs = [
+            {"id": "P-cancel-1ms", "kind": "plain", "mode": "cancel", "timeout": 0.001,
+             "pace": 0.005, "layer": layer, "may_not_ready": True, "ready_deadline": 10},
+            {"id": "after-1ms", "kind": "group", "pace": 0.002, "expect": "each", "layer": layer,
+             "may_not_ready": True, "ready_deadline": 10},
+            {"id": "default-after", "kind": "group", "pace": 0.002, "expect": "each"},
+        ]  # fmt: skip
+        trials = {}
+        for spec in specs:
+            spec = {"n": 200, **spec}
+            out, _took, error = _run_channel_spec(stack, spec)
+            assert error is None, error
+            trials[spec["id"]] = (spec, out["trials"][0])
+        polled, after, default = (
+            trials[k][1] for k in ("P-cancel-1ms", "after-1ms", "default-after")
+        )
+        invalid = [
+            m for w in polled["workers"] + after["workers"] for m in w["nats_log"]
+            if "InvalidStateError" in m
+        ]  # fmt: skip
+        rec["polled"] = {"ready": polled["ready"], "probes_sent": polled["probes_sent"],
+                         "cancels": [w["cancels"] for w in polled["workers"]]}  # fmt: skip
+        rec["after"] = {"ready": after["ready"], "probes_sent": after["probes_sent"]}
+        rec["invalid_state_lines"] = invalid[:4]
+        rec["default_after"] = _compact(trials["default-after"][0], default)
+
+        # 격리: 문서 설정의 기본 레이어(다른 연결)는 결함 뒤에도 정상이어야 한다.
+        assert delivery_problems(trials["default-after"][0], default) == []
+        if not after["ready"] and invalid:
+            raise NatsFlushCancelDefect(
+                f"connection stopped reading after 1ms polling; {len(invalid)} InvalidStateError"
+            )
+        # 결함이 사라졌다면 같은 연결의 그룹 수신이 계약대로여야 한다(→ XPASS 로 알린다).
+        assert after["ready"], f"not ready but no InvalidStateError logged: {rec['after']}"
+        assert delivery_problems(trials["after-1ms"][0], after) == []
     finally:
         stack.down()
 
