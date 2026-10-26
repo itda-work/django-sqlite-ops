@@ -70,6 +70,19 @@ def _layer(capacity: int | None, name: str | None = None):
     return _layers[key]
 
 
+def _read_loop_alive(layer) -> bool | None:
+    """진단: 이 워커 루프에서 그 레이어 연결의 nats-py 읽기 루프가 살아 있는가(연결이 없으면 None).
+
+    channels-nats(``_states``)·nats-py(``_reading_task``) 내부를 읽는다. 판정이 아니라 기록용이다.
+    """
+    try:
+        state = layer._states.get(asyncio.get_running_loop())
+        task = getattr(getattr(state, "client", None), "_reading_task", None)
+    except Exception:
+        return None
+    return None if task is None else not task.done()
+
+
 class _Listener:
     def __init__(
         self,
@@ -150,6 +163,9 @@ class _Listener:
             "errors": self.errors,
             "running": self.task is not None and not self.task.done(),
             "nats_log": [m for t, m in _log if self.started <= t <= until],
+            # stop 뒤의 줄. 취소된 확인의 PONG 은 stop 뒤에 와서 결함이 그때 날 수 있다.
+            "late_nats_log": [m for t, m in _log if self.stopped is not None and t > self.stopped],
+            "read_loop_alive": _read_loop_alive(self.layer),
             "now": time.monotonic(),
         }
 

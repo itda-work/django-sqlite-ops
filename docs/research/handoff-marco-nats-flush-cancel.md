@@ -15,7 +15,7 @@ django-sqlite-ops 회귀 랩 P2(`single-server-multiproc` 문서 compose, uvicor
 3. 같은 인스턴스로 `new_channel()` + `group_add()` 한 채널도 `group_send` 를 받지 못한다(185건 / 10초 동안 0건).
 4. 워커 로그: `nats: encountered error` 와 트레이스백 `nats/aio/client.py … _process_pong … future.set_result(True)` → `asyncio.exceptions.InvalidStateError: invalid state`(워커마다 1회).
 5. nats-server `connz?subs=1`: 그 연결에 새 SUB 가 있고 `out_msgs` 가 늘어난다. 워커의 nats-py `Subscription._wait_for_msgs` 태스크는 모두 빈 대기열에서 기다린다.
-6. 다른 레이어 인스턴스(다른 연결)는 정상이다(200/200). 10ms 폴링은 대개 계약대로(취소 공백 손실 16/200 만)였지만, **2026-10-26 P2 4회 중 1회는 10ms 에서도 같은 결함이 났다**(워커 하나에 `InvalidStateError`, 같은 인스턴스의 그룹 수신 probe 0/508). 실측 RTT 는 약 0.25ms 였으니, 확인 왕복이 가끔 10ms 를 넘는다는 뜻이다. 안전한 폴링 간격은 없다.
+6. 다른 레이어 인스턴스(다른 연결)는 정상이다(200/200). 10ms 폴링은 대개 계약대로(취소 공백 손실 16/200 만)였지만, **2026-10-26 P2 6회 중 1회는 10ms 에서도 같은 결함이 났다**(워커 하나에 `InvalidStateError`, 같은 인스턴스의 그룹 수신 probe 0/508). 실측 RTT 는 약 0.25ms 였으니, 확인 왕복이 가끔 10ms 를 넘는다는 뜻이다. 안전한 폴링 간격은 없다.
 
 ## 원인 (코드상 확인)
 

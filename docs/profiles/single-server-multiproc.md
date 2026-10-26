@@ -207,7 +207,7 @@ SQLite 기반 채널 레이어(channels-lite)는 **추천하지 않는다**. 폴
 - **브로커를 앱과 같은 `-exec` 에 넣지 않는다**(§2).
 - **한 번에 `capacity`(기본 100)보다 많이 몰아 보내면 받는 쪽이 버린다.** 경고는 60초에 한 번이라 첫 줄("1 message(s) dropped so far")만 보면 손실을 과소평가한다. 합계는 "has room again after dropping N" 줄이다(재현함, #66).
 - **구독 확인이 취소되거나 시간 초과되면 그 워커의 레이어 연결이 읽기를 멈춘다.** 구독 확인은 `new_channel`·`group_add`·일반 채널 첫 `receive` 가 기다리는 것이다. nats-py 2.16.0 의 읽기 루프가 끝나 그 연결은 아무것도 받지 못하고(로그 `nats: encountered error … InvalidStateError`), 그 뒤의 `new_channel`·`group_add` 도 예외 없이 성공한다.
-  - 일반 채널을 `wait_for` 로 폴링하는 것이 그 한 예다. 1ms 는 매번, 10ms 도 4회 중 1회 재현했다(랩 RTT 약 0.25ms, #66). 일반 채널은 폴링하지 말고 계속 `receive` 한다.
+  - 일반 채널을 `wait_for` 로 폴링하는 것이 그 한 예다. 1ms 는 매번, 10ms 도 6회 중 1회 재현했다(랩 RTT 약 0.25ms, 2026-10-26 확인, #66). 안전한 폴링 간격은 없다. 일반 채널은 폴링하지 말고 계속 `receive` 한다.
   - nats-py 의 flush 타임아웃(10초)과 레이어 `publish_deadline`(10초)도 같은 경로다. 브로커가 그보다 오래 멈췄다 살아나면 일어난다(코드상 확인).
   - 상류 처리는 [이관 문서](../research/handoff-marco-nats-flush-cancel.md).
 - **컨테이너를 늘려 확장하지 않는다.** 워커 수로 늘린다(§3 compose).

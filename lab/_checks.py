@@ -345,6 +345,30 @@ _ROOM = re.compile(r"mailbox for (\S+) has room again after dropping (\d+) messa
 # nats-py 2.16.0 ``Client._read_loop`` 이 일반 예외에서 남기고 읽기 루프를 끝내는 줄. 랩 뷰는
 # 예외를 ``[종류: 메시지]`` 로 덧붙인다(notes/chanlab.py ``_Capture``).
 NATS_READ_ERROR = "nats: encountered error"
+# 알려진 결함(docs/research/handoff-marco-nats-flush-cancel.md)의 표지. 읽기 루프 오류 줄에 이
+# 예외가 붙은 것만 결함으로 센다 — 다른 예외로 끝난 읽기 루프는 예외 대상이 아니다.
+KNOWN_DEFECT = "[InvalidStateError:"
+
+
+def _nats_lines(worker: dict) -> list[str]:
+    """수신 중 로그 + stop 뒤에 늦게 온 로그(``defect_ok`` 면 chanlab_run 이 다시 물어 붙인다)."""
+    return worker["nats_log"] + worker.get("late_nats_log", [])
+
+
+def known_defect_pids(spec: dict, trial: dict) -> list:
+    """``spec["defect_ok"]`` 인 시나리오에서 알려진 결함이 난 워커 PID.
+
+    그 워커의 읽기 루프 오류 줄이 모두 ``InvalidStateError`` 일 때만 센다. 하나라도 다른 예외면
+    결함으로 보지 않는다(→ ``delivery_problems`` 가 실패로 낸다). ``defect_ok`` 가 없으면 빈 목록.
+    """
+    if not spec.get("defect_ok"):
+        return []
+    pids = []
+    for w in trial["workers"]:
+        errors = [m for m in _nats_lines(w) if NATS_READ_ERROR in m]
+        if errors and all(KNOWN_DEFECT in m for m in errors):
+            pids.append(w["pid"])
+    return pids
 
 
 def nats_drops(lines: list[str], channel: str) -> int:
@@ -381,7 +405,8 @@ def delivery_summary(spec: dict, trial: dict, near: float = 0.05) -> dict:
                     1 for t in w["cancel_times"] if trial["t0"] - near <= t <= trial["t1"] + near
                 ),
                 "errors": w["errors"],
-                "nats_errors": [m for m in w["nats_log"] if NATS_READ_ERROR in m],
+                "nats_errors": [m for m in _nats_lines(w) if NATS_READ_ERROR in m],
+                "read_loop_alive": w.get("read_loop_alive"),
             }
         )
     every = [i for w in trial["workers"] for i in w["ids"]]
@@ -409,12 +434,20 @@ def delivery_problems(spec: dict, trial: dict) -> list[str]:
     모든 경우에 송신 예외·수신 루프 예외가 없어야 하고, 워커 수가 ``spec["workers"]``(기본 2)다.
     워커 ``nats_log`` 에 nats-py 읽기 루프 오류(``nats: encountered error``)가 없어야 한다 — 그 뒤로
     그 연결은 아무것도 읽지 않는데(handoff-marco-nats-flush-cancel.md) ``lossy``·``record`` 는
-    손실로만 남기 때문이다. 메시지에 예외 이름을 드러낸다.
+    손실로만 남기 때문이다. 메시지에 예외 이름을 드러낸다. 준비되지 않은 시도(``ready: false``,
+    ``may_not_ready``)도 실패다.
+
+    예외는 ``spec["defect_ok"]`` 하나다(#66 재개 2): ``known_defect_pids`` 가 센 워커의 읽기 루프
+    오류와, 그런 워커가 있는 시도의 준비 실패는 문제로 내지 않는다(호출자가 따로 기록한다). 중복·
+    모르는 id·용량 드롭·합 > n·송수신 예외는 그 시도에서도 그대로 문제다.
     """
     s = delivery_summary(spec, trial)
     n = spec["n"]
     expect = spec["expect"]
+    defect = set(known_defect_pids(spec, trial))
     problems = []
+    if trial.get("ready") is False and not defect:
+        problems.append(f"not ready after {trial.get('probes_sent')} probes")
     if len(s["workers"]) != spec.get("workers", 2):
         problems.append(f"{len(s['workers'])} workers reported")
     if s["send_errors"]:
@@ -423,7 +456,7 @@ def delivery_problems(spec: dict, trial: dict) -> list[str]:
         tag = f"pid {w['pid']}"
         if w["errors"]:
             problems.append(f"{tag}: receive errors {w['errors'][:3]}")
-        if w["nats_errors"]:
+        if w["nats_errors"] and w["pid"] not in defect:
             problems.append(f"{tag}: nats-py read loop error {w['nats_errors'][:3]}")
         if w["unknown"]:
             problems.append(f"{tag}: unknown ids {w['unknown']}")

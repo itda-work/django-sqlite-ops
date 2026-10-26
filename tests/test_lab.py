@@ -527,6 +527,55 @@ def test_p2_nats_read_loop_error_fails_every_expectation():
     )
 
 
+DEAD = "nats: encountered error [InvalidStateError: invalid state]"
+
+
+def test_p2_known_defect_is_excused_only_with_defect_ok():
+    """defect_ok 시나리오만 InvalidStateError 로 끝난 읽기 루프를 결함으로 세고 넘긴다(#66)."""
+    c = _checks()
+    ch = "lab.plain.k"
+    for expect in ("lossy", "record"):
+        trial = _trial(_worker(1, ch, [0], nats_log=[DEAD]), _worker(2, ch, [1]))
+        ok = {"n": 4, "expect": expect, "defect_ok": True}
+        assert c.known_defect_pids(ok, trial) == [1]
+        assert c.delivery_problems(ok, trial) == []
+        # 같은 시도라도 defect_ok 가 없으면 실패다(기본 레이어 시나리오)
+        plain = {"n": 4, "expect": expect}
+        assert c.known_defect_pids(plain, trial) == []
+        assert any("read loop error" in p for p in c.delivery_problems(plain, trial))
+    # stop 뒤에 늦게 온 줄도 센다
+    late = _trial(_worker(1, ch, []), _worker(2, ch, [1]))
+    late["workers"][0]["late_nats_log"] = [DEAD]
+    assert c.known_defect_pids({"n": 2, "expect": "lossy", "defect_ok": True}, late) == [1]
+
+
+def test_p2_known_defect_keeps_the_rest_of_the_contract():
+    """결함이 난 시도도 중복·용량 드롭·합 > n·다른 예외·결함 없는 준비 실패는 실패다."""
+    c = _checks()
+    ch = "lab.plain.k"
+    spec = {"n": 4, "expect": "lossy", "defect_ok": True}
+    dup = _trial(_worker(1, ch, [0, 0], nats_log=[DEAD]), _worker(2, ch, [1]))
+    assert any("duplicate" in p for p in c.delivery_problems(spec, dup))
+    dropped = _trial(_worker(1, ch, [0], nats_log=[DEAD, _full(ch, 2)]), _worker(2, ch, []))
+    assert any("mailbox drop" in p for p in c.delivery_problems(spec, dropped))
+    # 다른 예외로 끝난 읽기 루프는 결함이 아니다 — 줄 하나라도 섞이면 실패
+    other = "nats: encountered error [ValueError: bad]"
+    for log in ([other], [DEAD, other]):
+        trial = _trial(_worker(1, ch, [0], nats_log=log), _worker(2, ch, [1]))
+        assert c.known_defect_pids(spec, trial) == []
+        assert any("read loop error" in p for p in c.delivery_problems(spec, trial))
+    recv = _trial(_worker(1, ch, [0], nats_log=[DEAD], errors=["FlushTimeoutError: x"]),
+                  _worker(2, ch, [1]))  # fmt: skip
+    assert any("receive errors" in p for p in c.delivery_problems(spec, recv))
+    # 준비 실패: 결함이 있으면 기록만, 없으면 실패
+    stuck = {**_trial(_worker(1, ch, []), _worker(2, ch, [])), "ready": False, "probes_sent": 9}
+    assert any("not ready after 9" in p for p in c.delivery_problems(spec, stuck))
+    stuck["workers"][0]["nats_log"] = [DEAD]
+    assert c.delivery_problems(spec, stuck) == []
+    stuck["workers"][0]["nats_log"] = [other]
+    assert any("not ready" in p for p in c.delivery_problems(spec, stuck))
+
+
 def test_p2_split_queue_group_needs_union_once_and_both_workers():
     c = _checks()
     spec = {"n": 4, "expect": "split"}

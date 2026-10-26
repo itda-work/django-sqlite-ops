@@ -22,6 +22,7 @@ from _checks import (
     error_episodes,
     full_outage_deadline,
     full_outage_problems,
+    known_defect_pids,
     long_outage_bounds,
     long_outage_problems,
     ltx_process_problems,
@@ -219,22 +220,28 @@ CHANNEL_SPECS = [
      "expect": "each"},
     {"id": "S-worker", "kind": "specific", "sender": "worker", "pace": 0.002, "expect": "each"},
     {"id": "P-steady", "kind": "plain", "pace": 0.002, "expect": "split"},
-    # 일반 채널 취소 공백(계약상 손실 허용). 10ms 는 구독 확인 왕복(실측 ~0.25ms RTT)보다 길다.
-    # 1ms 는 그 확인을 취소해 연결을 망가뜨리는 알려진 결함이라 따로 둔다
-    # (test_P2_nats_flush_cancel_known_defect). 그래도 드물게 왕복이 10ms 를 넘을 수 있어 별도
-    # 레이어 인스턴스(layer)로 떼고, 바로 뒤 같은 인스턴스로 그룹 수신이 정상인지 본다.
+    # 일반 채널 취소 공백(계약상 손실 허용). 1ms 는 구독 확인을 거의 늘 취소해 연결을 망가뜨리는
+    # 알려진 결함이라 strict xfail 로 따로 둔다(test_P2_nats_flush_cancel_known_defect). 10ms 에서도
+    # 그 결함이 가끔 난다(#66 수정 1, P2 4회 중 1회). 그래서 별도 레이어 인스턴스(layer)에 가두고,
+    # 결함(InvalidStateError 로 끝난 읽기 루프)은 defect_ok 로 기록만 한다. 같은 인스턴스를 쓰는
+    # P-cancel-after 는 앞 시도에 결함이 없었을 때만 돌려 each 로 단언한다(after).
     {"id": "P-cancel", "kind": "plain", "mode": "cancel", "timeout": 0.01, "pace": 0.005,
-     "expect": "lossy", "layer": "pcancel10"},
+     "expect": "lossy", "layer": "pcancel10", "defect_ok": True, "may_not_ready": True,
+     "ready_deadline": 15},
     {"id": "P-cancel-after", "kind": "group", "pace": 0.002, "expect": "each",
-     "layer": "pcancel10"},
+     "layer": "pcancel10", "after": "P-cancel"},
     {"id": "BURST", "kind": "group", "pace": 0, "expect": "drops"},
     {"id": "NOCLOSE", "kind": "group", "pace": 0.002, "expect": "each", "close": False},
     # D2(docs/research/sqlite-django-package-review-v0.md)와 같은 꼴: 일반 채널 경쟁 수신 둘,
-    # wait_for 0.5초, 200건 버스트. 수신 쪽 capacity 기본(100) / 1000.
+    # wait_for 0.5초, 200건 버스트. 수신 쪽 capacity 기본(100) / 1000. 폴링이 구독 확인을 취소할
+    # 수 있어(위 결함) 기본 레이어와 떼고, 시도마다 새 인스턴스(layer_per_trial)를 써 한 시도의
+    # 결함이 다음 시도로 번지지 않게 한다. 결함은 P-cancel 과 같이 기록만 한다.
     {"id": "D2-cap100", "kind": "plain", "mode": "cancel", "timeout": 0.5, "pace": 0,
-     "expect": "record", "trials": D2_TRIALS},
+     "expect": "record", "trials": D2_TRIALS, "layer": "d2cap100", "layer_per_trial": True,
+     "defect_ok": True, "may_not_ready": True, "ready_deadline": 15},
     {"id": "D2-cap1000", "kind": "plain", "mode": "cancel", "timeout": 0.5, "pace": 0,
-     "expect": "record", "trials": D2_TRIALS, "capacity": 1000},
+     "expect": "record", "trials": D2_TRIALS, "capacity": 1000, "layer": "d2cap1000",
+     "layer_per_trial": True, "defect_ok": True, "may_not_ready": True, "ready_deadline": 15},
     # 수신 루프를 남겨 둔 채 docker stop 한다(_profile_stop_check 의 종료 단언).
     {"id": "LIVE", "kind": "group", "pace": 0.002, "expect": "each", "keep": True},
 ]  # fmt: skip
@@ -242,12 +249,14 @@ CHANNEL_SPECS = [
 
 def _compact(spec: dict, trial: dict) -> dict:
     s = delivery_summary(spec, trial)
-    keys = ("received", "lost", "dup", "drops", "cancels", "cancels_near_send", "in_order")
+    keys = ("received", "lost", "dup", "drops", "cancels", "cancels_near_send", "in_order",
+            "read_loop_alive")  # fmt: skip
     return {
         "workers": [{k: w[k] for k in ("pid", *keys)} for w in s["workers"]],
         "total": s["total"],
         "union_lost": s["union_lost"],
         "lost_ids": s["lost_ids"][:20],
+        "ready": trial["ready"],
         "ready_s": trial["ready_s"],
         "probes_sent": trial["probes_sent"],
         "send_s": round(trial["t1"] - trial["t0"], 3),
@@ -278,9 +287,13 @@ def _p2_channels(stack: Stack, rec: dict) -> None:
     rec["channel_versions"] = json.loads(versions.out.strip().splitlines()[-1])
     assert rec["channel_versions"]["channels-nats"] == "0.10.0"
 
-    raw, results, problems = {}, {}, {}
+    raw, results, problems, defects = {}, {}, {}, {}
     for spec in CHANNEL_SPECS:
         spec = {"n": 200, **spec}
+        if defects.get(spec.get("after")):
+            # 같은 레이어 인스턴스의 앞 시나리오에서 알려진 결함이 났다. 그 연결은 받지 못한다.
+            results[spec["id"]] = {"skipped": f"known defect in {spec['after']}"}
+            continue
         out, took, error = _run_channel_spec(stack, spec)
         if error:
             problems[spec["id"]] = [error]
@@ -293,6 +306,12 @@ def _p2_channels(stack: Stack, rec: dict) -> None:
             "close_s": out.get("close_s"),
             "trials": [_compact(spec, t) for t in trials],
         }
+        hit = [{"trial": i, "pids": pids} for i, t in enumerate(trials)
+               if (pids := known_defect_pids(spec, t))]  # fmt: skip
+        if spec.get("defect_ok"):
+            results[spec["id"]]["known_defect"] = {"trials": len(trials), "hit": hit}
+        if hit:
+            defects[spec["id"]] = hit
         found = [
             f"trial {i}: {p}" for i, t in enumerate(trials) for p in delivery_problems(spec, t)
         ]
@@ -302,6 +321,10 @@ def _p2_channels(stack: Stack, rec: dict) -> None:
     (OUT / f"chan-{RUN_ID}.json").write_text(json.dumps(raw), encoding="utf-8")
     rec["channels"] = results
     rec["channel_problems"] = problems
+    # 알려진 결함(InvalidStateError 로 끝난 읽기 루프) 발생: 시나리오별 {시도 수, 난 시도·워커}.
+    rec["channel_known_defects"] = {
+        k: v["known_defect"] for k, v in results.items() if "known_defect" in v
+    }
     if problems:
         # 접근 로그가 많아 꼬리만으로는 원인 줄이 밀려난다. 접근 로그를 뺀 줄을 남긴다.
         lines = [ln for ln in stack.logs("app").splitlines() if not ln.startswith("INFO:")]
