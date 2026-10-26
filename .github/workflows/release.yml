@@ -1,0 +1,81 @@
+name: Release
+
+# 태그(v*) push → 버전·CHANGELOG·분류 검사 → 빌드·산출물 검사 → PyPI(trusted publishing) → GitHub 릴리스 (#77, D-28).
+# PyPI 쪽 설정: pypi.org > Account settings > Publishing > pending publisher 를 추가한다.
+#   owner: itda-work / repository: django-sqlite-ops / workflow: release.yml / environment: pypi
+# GitHub 쪽: 저장소 Settings > Environments 에 `pypi` 를 만든다(required reviewers 권장).
+# API 토큰은 어디에도 저장하지 않는다(OIDC). 한 번 올린 버전은 PyPI 에서 다시 쓸 수 없다.
+
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    outputs:
+      prerelease: ${{ steps.check.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0 # origin/main 과 비교하려고 전체 이력을 받는다
+          persist-credentials: false
+      - uses: astral-sh/setup-uv@v6
+
+      - name: Refuse a tag that is not on main
+        run: git merge-base --is-ancestor "$GITHUB_SHA" origin/main
+
+      - name: Check the tag, version, CHANGELOG and classifiers agree
+        id: check
+        run: python3 scripts/release_check.py "$GITHUB_REF_NAME" --github-output "$GITHUB_OUTPUT"
+
+      - run: uv build
+      - run: uvx twine check --strict dist/*
+
+      # 빌드된 METADATA 의 Version 이 태그와 같은지, PyPI 설명에 상대 링크가 없는지
+      - name: Check the built distributions
+        run: python3 scripts/release_check.py "$GITHUB_REF_NAME" --dist dist
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: dist
+          path: dist/
+          if-no-files-found: error
+
+  publish:
+    needs: build
+    runs-on: ubuntu-latest
+    environment: pypi
+    permissions:
+      id-token: write # PyPI trusted publishing (OIDC). 이 잡에는 다른 권한을 주지 않는다
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: Publish to PyPI
+        uses: pypa/gh-action-pypi-publish@release/v1
+
+  # PyPI 업로드와 나눈다: 여기서 실패해도 이 잡만 다시 돌리면 된다(PyPI 재업로드는 거부된다)
+  github-release:
+    needs: [build, publish]
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          name: dist
+          path: dist/
+
+      - name: GitHub release
+        uses: softprops/action-gh-release@v3
+        with:
+          files: dist/*
+          generate_release_notes: true
+          # PEP 440 의 a·b·rc·dev 면 사전 릴리스다(release_check.py 가 판정)
+          prerelease: ${{ needs.build.outputs.prerelease == 'true' }}

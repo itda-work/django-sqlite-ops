@@ -1,12 +1,12 @@
-# django-sqlite-ops (가칭)
+# django-sqlite-ops
 
-> ⚠️ **실험적 프로젝트입니다 (Experimental).** itda-work 가 실험 목적으로 공개하는 라이브러리입니다. API·동작·지원 범위가 예고 없이 바뀔 수 있으니, 운영 환경에 쓸 때는 버전을 고정하고 CHANGELOG 를 확인하세요.
+> ⚠️ **실험적 프로젝트입니다 (Experimental).** itda-work 가 실험 목적으로 공개하는 라이브러리입니다. API·동작·지원 범위가 예고 없이 바뀔 수 있으니, 운영 환경에 쓸 때는 버전을 고정하고 [CHANGELOG](CHANGELOG.md) 를 확인하세요.
 
 Django 에서 SQLite 를 운영 DB 로 안전하게 쓰게 하는 **운영 도구**다. 권장 설정, 부팅 시 복원 판정, 진단, 복제 헬스, 배포 프로필을 맡는다. DB 백엔드를 바꾸거나 감싸지 않고, 표준 `DATABASES` 설정만 다룬다.
 
 ## 현재 상태
 
-PyPI 배포 전이다([D-4·D-9](docs/DECISIONS.md)). 패키지 이름 `django-sqlite-ops` 도 가칭이라 바뀔 수 있다([D-6](docs/DECISIONS.md)). 설치는 GitHub 에서 한다.
+PyPI 에 **실험적 사전 릴리스**로 배포한다([D-28](docs/DECISIONS.md), 2026-10-26 결정). 첫 버전은 `0.1.0a1` 이다. 사전 릴리스는 버전을 명시해 설치한다(아래 [설치](#설치)). 바뀐 점은 [CHANGELOG](CHANGELOG.md) 에 적는다. 외부 홍보는 하지 않는다. 패키지 이름 `django-sqlite-ops` 는 확정이다(D-28 이 D-6 을 갱신).
 
 | 기능 | 상태 | 이슈·근거 |
 |---|---|---|
@@ -25,13 +25,24 @@ PyPI 배포 전이다([D-4·D-9](docs/DECISIONS.md)). 패키지 이름 `django-s
 
 요구 버전: Python 3.13+, Django 5.2+, SQLite 3.37+. boot CLI 는 POSIX(Linux·macOS)와 PATH 의 `litestream` 0.5.17 이 필요하다([boot CLI](#boot-cli)).
 
+PyPI 에서 설치한다. 사전 릴리스는 버전을 명시해 설치한다. 실험적 프로젝트이므로 그 버전으로 고정해 둔다.
+
 ```bash
-uv add git+https://github.com/itda-work/django-sqlite-ops
+pip install "django-sqlite-ops==0.1.0a1"
 # 또는
-pip install git+https://github.com/itda-work/django-sqlite-ops
+uv add "django-sqlite-ops==0.1.0a1"
 ```
 
 필수 의존성은 Django 하나다. 채널 레이어는 extra 로 고른다: `[nats]`(channels-nats), `[channels-lite]`(channels-lite 만. aio 레이어에 필요한 의존성은 [channels-lite 패치 '함정'](#channels-lite-패치)).
+
+```bash
+pip install "django-sqlite-ops[nats]==0.1.0a1"
+uv add "django-sqlite-ops[channels-lite]==0.1.0a1"
+```
+
+`pip install --pre` 나 `uv add --prerelease=allow` 는 쓰지 않는다. 이 패키지뿐 아니라 Django 를 비롯한 **모든 의존성**의 사전 릴리스까지 허용한다(`uv add --prerelease=allow` 는 `uv.lock` 에 `prerelease-mode = "allow"` 로 남아 이후의 해석에도 적용된다). 버전을 지정자에 명시하면 그 사전 릴리스만 받아들여진다. 정식 릴리스가 나온 뒤에는 명시하지 않으면 사전 릴리스를 고르지 않는다.
+
+릴리스되지 않은 `main` 을 쓰려면 GitHub 에서 받는다: `pip install git+https://github.com/itda-work/django-sqlite-ops`.
 
 ## 빠른 시작
 
@@ -938,3 +949,5 @@ scripts/lab.sh bench                # PRAGMA 벤치 (lab/README.md)
 
 gh workflow run lab.yml -f scenarios=all   # 회귀 랩을 GitHub 러너(amd64)에서 수동 실행. 결과는 artifact (벤치 제외)
 ```
+
+릴리스: `CHANGELOG.md` 의 `[Unreleased]` 를 새 버전 절로 옮기고 `pyproject.toml` 의 version 을 올린 뒤 `python3 scripts/release_check.py v<버전>` 이 통과하면 태그 `v<버전>` 을 push 한다. `.github/workflows/release.yml` 이 같은 검사 뒤 PyPI(trusted publishing)와 GitHub 릴리스에 올린다. 산출물은 `uv build --out-dir <디렉터리>` 뒤 `python3 scripts/release_check.py v<버전> --dist <디렉터리>` 로 미리 볼 수 있다(빌드된 Version, PyPI 설명의 상대 링크). 태그 순서: PR 병합 → `git fetch` → `git tag v<버전> origin/main` → 그 커밋에서 `python3 scripts/release_check.py v<버전>` → `git push origin v<버전>`. squash 병합이라 브랜치의 커밋은 main 의 조상이 아니어서, 거기에 붙인 태그는 release.yml 의 조상 검사가 막는다.

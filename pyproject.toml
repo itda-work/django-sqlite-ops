@@ -1,19 +1,76 @@
 [build-system]
-requires = ["hatchling"]
+# License-Expression·License-File 은 core metadata 2.4 다(hatchling 1.26.0 부터 지원)
+# hatch-fancy-pypi-readme: PyPI 설명의 상대 링크를 절대 URL 로 바꾼다(아래 metadata.hooks, 설정 키는 25.1.0 README 로 확인)
+requires = ["hatchling>=1.26", "hatch-fancy-pypi-readme>=25.1"]
 build-backend = "hatchling.build"
 
 [project]
 name = "django-sqlite-ops"
-version = "0.0.0"
+version = "0.1.0a1"
 description = "[Experimental] Operations toolkit for running SQLite as a production database in Django"
-classifiers = ["Development Status :: 3 - Alpha"]
-readme = "README.md"
+dynamic = ["readme"]
+license = "MIT"
+license-files = ["LICENSE"]
 requires-python = ">=3.13"
+authors = [{ name = "itda-work" }]
+keywords = ["django", "sqlite", "litestream", "wal", "backup", "replication", "operations"]
+# Django·Python 버전은 CI 매트릭스(.github/workflows/ci.yml)와 맞춘다. POSIX: boot 의 잠금이 fcntl 을 쓴다
+classifiers = [
+  "Development Status :: 3 - Alpha",
+  "Framework :: Django",
+  "Framework :: Django :: 5.2",
+  "Framework :: Django :: 6.1",
+  "Intended Audience :: Developers",
+  "Operating System :: POSIX",
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "Programming Language :: Python :: 3.13",
+  "Programming Language :: Python :: 3.14",
+  "Topic :: Database",
+]
 dependencies = ["Django>=5.2"]
+
+[project.urls]
+Homepage = "https://github.com/itda-work/django-sqlite-ops"
+Repository = "https://github.com/itda-work/django-sqlite-ops"
+Issues = "https://github.com/itda-work/django-sqlite-ops/issues"
+Changelog = "https://github.com/itda-work/django-sqlite-ops/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
 nats = ["channels-nats"]
 channels-lite = ["channels-lite"]
+
+# PyPI 설명은 README 그대로이되, 상대 파일 링크(`](docs/...)`)를 GitHub 절대 URL 로 바꾼다.
+# PyPI 는 상대 링크를 저장소로 풀지 않고, 한 번 올린 버전의 설명은 다시 쓸 수 없다(#77).
+# 앵커(#...)와 http(s):·mailto: 는 그대로 둔다. GitHub 에서 보는 README.md 는 바뀌지 않는다.
+# 빌드된 METADATA 에 상대 링크가 남지 않았는지는 release_check.py --dist 가 검사한다
+[tool.hatch.metadata.hooks.fancy-pypi-readme]
+content-type = "text/markdown"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.fragments]]
+path = "README.md"
+
+[[tool.hatch.metadata.hooks.fancy-pypi-readme.substitutions]]
+pattern = '\]\((?!https?:|#|mailto:)([^)\s]+)\)'
+replacement = '](https://github.com/itda-work/django-sqlite-ops/blob/main/\1)'
+
+[tool.hatch.build.targets.wheel]
+packages = ["django_sqlite_ops"]
+
+# sdist 는 소스와 테스트가 기대는 파일(docs·lab·scripts)을 싣고, 에이전트·CI 설정과 lock 은 뺀다.
+# uv.lock 은 .gitignore 에 있어도 hatchling 이 싣는다(재현함, 2026-10-26)
+# lab/.build·.out 은 .gitignore 로도 빠지지만 ignore-vcs 를 켜도 빠지도록 적어 둔다
+[tool.hatch.build.targets.sdist]
+exclude = [
+  "/.claude",
+  "/.github",
+  "/.actrc",
+  "/AGENTS.md",
+  "/CLAUDE.md",
+  "/uv.lock",
+  "/lab/.build",
+  "/lab/.out",
+]
 
 [dependency-groups]
 dev = ["pytest>=8", "pyyaml>=6", "ruff>=0.6"]
