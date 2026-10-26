@@ -7,6 +7,7 @@ from notes.timing import timed  # noqa: E402
 # 벤치 계측(#26): 뷰 본문 시간 헤더와 DB 요청 수. probe·ping 은 DB 를 열지 않는다.
 urlpatterns += [  # noqa: F821
     path("lab/write", timed(lab_views.write)),  # noqa: F821
+    path("lab/rmw", timed(lab_views.rmw)),  # noqa: F821
     path("lab/count", timed(lab_views.count)),  # noqa: F821
     path("lab/read/<int:pk>", timed(lab_views.read)),  # noqa: F821
     path("lab/sorted", timed(lab_views.sorted_page)),  # noqa: F821

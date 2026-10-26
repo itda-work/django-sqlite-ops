@@ -55,7 +55,7 @@
 - `macos` 잡(`macos-latest`, py3.14, Django 6.1)이 전체 테스트를 돈다. `REQUIRE_CASE_INSENSITIVE_FS=1` 이라 대소문자 무시 볼륨 전용 테스트(`ci_lab`)가 skip 되면 실패한다(#50). Linux 잡에서는 그 테스트가 skip 된다.
 - act 는 Linux 컨테이너만 돌린다. `macos` 잡은 `ci-local.sh` 에서 'unsupported platform' 으로 건너뛴다. 로컬 macOS 에서는 `REQUIRE_CASE_INSENSITIVE_FS=1 uv run pytest -rs` 로 대신한다.
 - 회귀 랩은 `.github/workflows/lab.yml`(`workflow_dispatch` 전용, ubuntu-latest amd64)로 따로 돈다: `gh workflow run lab.yml -f scenarios=all`. 기본 CI(push/PR) 밖이고, act 는 Docker 소켓을 넘기지 않으므로 `ci-local.sh` 대상이 아니다. 결과(`lab/.out/`)는 artifact 로 올라간다. 벤치는 돌리지 않는다.
-- 릴리스는 `.github/workflows/release.yml` 이 한다(D-28, #77): 태그 `v*` push → 태그 커밋이 `origin/main` 의 조상인지 → `scripts/release_check.py`(태그·pyproject version·CHANGELOG 절·사전 릴리스의 `3 - Alpha` 분류) → `uv build` → `twine check --strict` → `release_check.py --dist`(빌드된 Version 과 태그, PyPI 설명의 상대 링크 0개) → PyPI trusted publishing(environment `pypi`, `id-token: write` 만, 토큰 없음) → `github-release` 잡(PEP 440 사전 릴리스면 prerelease). PyPI 설명의 상대 링크는 hatch-fancy-pypi-readme 가 `blob/main` 절대 URL 로 바꾼다. 태그 push 는 마스터 확인 뒤에만 한다. 한 번 올린 버전은 다시 쓸 수 없으니 먼저 `python3 scripts/release_check.py v<버전>` 을 돌린다. 태그 순서: PR 병합 → `git fetch` → `git tag v<버전> origin/main` → 그 커밋에서 `python3 scripts/release_check.py v<버전>` → `git push origin v<버전>`. squash 병합이라 브랜치의 커밋은 main 의 조상이 아니어서, 거기에 붙인 태그는 release.yml 의 조상 검사가 막는다.
+- 릴리스는 `.github/workflows/release.yml` 이 한다(D-28, #77): 태그 `v*` push → 태그 커밋이 `origin/main` 의 조상인지 → `scripts/release_check.py`(태그·pyproject version·CHANGELOG 절·사전 릴리스의 `3 - Alpha` 분류) → `uv build` → `twine check --strict` → `release_check.py --dist`(빌드된 Version 과 태그, PyPI 설명의 상대 링크 0개, GitHub blob 페이지를 가리키는 이미지 0개 — README 이미지는 `raw.githubusercontent.com` 절대 URL, #83) → PyPI trusted publishing(environment `pypi`, `id-token: write` 만, 토큰 없음) → `github-release` 잡(PEP 440 사전 릴리스면 prerelease). PyPI 설명의 상대 링크는 hatch-fancy-pypi-readme 가 `blob/main` 절대 URL 로 바꾼다. 태그 push 는 마스터 확인 뒤에만 한다. 한 번 올린 버전은 다시 쓸 수 없으니 먼저 `python3 scripts/release_check.py v<버전>` 을 돌린다. 태그 순서: PR 병합 → `git fetch` → `git tag v<버전> origin/main` → 그 커밋에서 `python3 scripts/release_check.py v<버전>` → `git push origin v<버전>`. squash 병합이라 브랜치의 커밋은 main 의 조상이 아니어서, 거기에 붙인 태그는 release.yml 의 조상 검사가 막는다.
 
 ## 함정 (실측에서 나온 것)
 - Litestream endpoint 에 `http://` 가 빠지면 HTTPS 로 접속해 restore·`ltx` 가 무한 대기한다(`ltx` 는 평범한 HTTP 서버로 재현함). 모든 Litestream 호출에 타임아웃을 둔다.
@@ -63,6 +63,7 @@
 - `litestream ltx` 는 복제본 경로가 없어도, 비어 있어도 rc 0 과 `[]` 다(0.5.17). 경로 오타와 빈 복제본을 출력으로 구분할 수 없다. `ltx DB_PATH` 도 로컬 메타가 아니라 복제본을 나열한다.
 - `litestream restore -integrity-check` 는 로그 한 줄을 stdout 의 `-json` 요약 앞에 쓴다. stdout 전체를 JSON 으로 읽으면 실패한다.
 - `restore -if-db-not-exists` 는 0바이트 DB 파일이 있으면 rc 0 으로 복원을 건너뛴다(재현함, DESIGN §4-1). `restore -o` 는 0바이트 파일은 덮고 내용 있는 파일은 거부한다.
+- Litestream 을 붙인 스택에서는 Django 기본 SQLite 설정도 WAL 로 돈다(복제를 시작하며 journal_mode 를 바꾼다, #83 에서 재현함 2026-10-26). Django 기본(rollback journal)을 잴 때는 Litestream 없는 앱(`labapp-plain`)을 쓴다.
 - restore 로 만든 DB 옆에는 로컬 메타(`.<db>-litestream/`)가 없다. replicate 가 시작돼야 생긴다.
 - S3 가 끊겨도 Litestream 은 로그·`status`·메트릭에 아무것도 남기지 않는다(D3). 그래서 헬스는 TXID 를 직접 비교해 계산한다.
 - Linux 에서 litestream-vfs 확장을 로드하면 그 뒤의 일반 connect 가 실패한다. 우회책 `sqlite3_reset_auto_extension()` 은 **모든** 자동 확장을 해제하므로 옵션으로만 둔다. 상류 수정 #1506 은 2026-10-08 에 머지됐지만 v0.5.17 이후라 아직 릴리스되지 않았다(2026-10-13 확인). 다음 릴리스가 나오면 재검증한다.

@@ -28,6 +28,18 @@ if os.environ.get("LAB_PRAGMAS"):
         pragmas=json.loads(os.environ["LAB_PRAGMAS"]),
     )
 
+# 기본 대 권장 비교(#83): "django-default" 면 Django 기본 SQLite 항목(OPTIONS 없음: rollback
+# journal, DEFERRED, sqlite3 기본 timeout 5초)으로 바꾼다. "recommended" 나 빈 값이면 프로필
+# 그대로다.
+_db_config = os.environ.get("LAB_DB_CONFIG", "")
+if _db_config == "django-default":
+    DATABASES["default"] = {  # noqa: F821
+        "ENGINE": "django.db.backends.sqlite3",
+        "NAME": DATABASES["default"]["NAME"],  # noqa: F821
+    }
+elif _db_config not in ("", "recommended"):
+    raise ValueError(f"LAB_DB_CONFIG must be django-default or recommended: {_db_config!r}")
+
 # PRAGMA 벤치(#26): CONN_MAX_AGE 축. "none" 이면 None(연결 유지), 숫자면 그 초.
 if os.environ.get("LAB_CONN_MAX_AGE"):
     _cma = os.environ["LAB_CONN_MAX_AGE"]

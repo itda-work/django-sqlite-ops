@@ -216,6 +216,49 @@ def test_dist_relative_link_fails(tmp_path, link):
     assert "the PyPI description has 1 relative links" in problem
 
 
+@pytest.mark.parametrize(
+    "image",
+    [
+        "![차트](https://github.com/itda-work/django-sqlite-ops/blob/main/docs/assets/a.svg)",
+        '<img alt="x" src="https://github.com/o/r/blob/main/a.png">',
+    ],
+)
+def test_dist_image_on_blob_page_fails(tmp_path, image):
+    # 상대 이미지 경로는 fancy-pypi-readme 치환으로 이런 blob URL 이 된다(#83)
+    [problem] = [
+        p
+        for p in release_check.dist_problems(
+            _dist(tmp_path, description=DESCRIPTION + image), "0.1.0a1"
+        )
+        if p.startswith("example-0.1.0a1-py3")
+    ]
+    assert "1 images on GitHub blob pages" in problem
+
+
+def test_dist_raw_image_and_blob_link_pass(tmp_path):
+    # raw URL 이미지와 blob 페이지로 가는 일반 링크는 괜찮다
+    text = DESCRIPTION + (
+        "![차트](https://raw.githubusercontent.com/o/r/main/docs/assets/a.svg)\n"
+        "[문서](https://github.com/o/r/blob/main/docs/DESIGN.md)\n"
+    )
+    assert release_check.dist_problems(_dist(tmp_path, description=text), "0.1.0a1") == []
+
+
+def test_readme_images_are_raw_urls_of_tracked_files():
+    # README 이미지는 PyPI 에서도 보이게 raw 절대 URL 로 건다. 상대 경로는 치환으로 blob 이 된다
+    readme = (ROOT / "README.md").read_text(encoding="utf-8")
+    images = [m[1] for pattern in release_check._IMAGE_TARGETS for m in pattern.finditer(readme)]
+    raw = "https://raw.githubusercontent.com/itda-work/django-sqlite-ops/main/"
+    # 이미지를 모두 지워도 통과하지 않게 README 차트를 기대값으로 둔다(#83 리뷰 P3-4)
+    assert sorted(images) == [
+        raw + "docs/assets/conn-max-age.svg",
+        raw + "docs/assets/dbconfig.svg",
+    ]
+    for target in images:
+        assert target.startswith(raw), target
+        assert (ROOT / target.removeprefix(raw)).is_file(), target
+
+
 def test_dist_needs_one_wheel_and_one_sdist(tmp_path):
     dist = _dist(tmp_path)
     (dist / "example-0.1.0a1.tar.gz").unlink()

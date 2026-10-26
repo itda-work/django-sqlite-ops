@@ -2,7 +2,8 @@
 
 닫힌 루프: 스레드 ``--concurrency`` 개가 keep-alive 연결 하나씩으로 요청을 보내고, 응답을 받으면
 다음 요청을 보낸다. ``--mode mixed`` 는 요청 종류를 비율로 고른다(읽기 ``/lab/read/<id>``, 정렬
-``/lab/sorted``, 나머지는 쓰기 ``POST /lab/write?n=<--write-rows>``). ``--mode ping`` 은 DB 없는
+``/lab/sorted``, 읽고-고쳐-쓰기 ``POST /lab/rmw?id=<id>``(#83, 기본 0), 나머지는 쓰기
+``POST /lab/write?n=<--write-rows>``). ``--mode ping`` 은 DB 없는
 Django 뷰, ``--mode rawping`` 은 Django 앞에서 바로 답하는 경로만 부른다(발생기·스택 한계 확인).
 
 요청마다 클라이언트 지연과 서버 헤더(``X-Lab-View-Us`` 뷰 본문, ``X-Lab-App-Us`` ASGI 래퍼에서
@@ -291,6 +292,7 @@ def main() -> None:
     p.add_argument("--max-id", type=int, default=1)
     p.add_argument("--read", type=float, default=0.7)
     p.add_argument("--sorted", type=float, default=0.1)
+    p.add_argument("--rmw", type=float, default=0.0, help="읽고-고쳐-쓰기 비율(#83)")
     p.add_argument("--write-rows", type=int, default=1)
     p.add_argument("--sample", type=float, default=0.5)
     p.add_argument("--seed", type=int, default=1)
@@ -306,7 +308,7 @@ def main() -> None:
     start = time.monotonic()
     measure_from = start + args.warmup
     end = measure_from + args.duration
-    kinds = ("read", "sorted", "write", "ping")
+    kinds = ("read", "sorted", "rmw", "write", "ping")
     lat: dict[str, list[float]] = {k: [] for k in kinds}
     view: dict[str, list[float]] = {k: [] for k in kinds}
     app: dict[str, list[float]] = {k: [] for k in kinds}
@@ -330,6 +332,8 @@ def main() -> None:
             return "read", "GET", f"/lab/read/{rng.randint(1, args.max_id)}"
         if r < args.read + args.sorted:
             return "sorted", "GET", "/lab/sorted"
+        if r < args.read + args.sorted + args.rmw:
+            return "rmw", "POST", f"/lab/rmw?id={rng.randint(1, args.max_id)}"
         return "write", "POST", f"/lab/write?n={args.write_rows}"
 
     def worker(i: int) -> None:

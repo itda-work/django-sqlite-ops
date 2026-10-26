@@ -4,7 +4,7 @@ import os
 import random
 
 from django.conf import settings
-from django.db import connection
+from django.db import connection, transaction
 from django.http import Http404, JsonResponse
 from django.views.decorators.csrf import csrf_exempt
 
@@ -24,6 +24,23 @@ def write(request):
         [Note(body=_BODY, score=random.randrange(1_000_000)) for _ in range(n)]
     )
     return JsonResponse({"written": len(notes), "last_id": notes[-1].pk if notes else None})
+
+
+@csrf_exempt
+def rmw(request):
+    """POST: 한 트랜잭션 안에서 행 ``id`` 를 읽고 고쳐 쓴다(#83, Django 의 흔한 get → save 꼴).
+
+    DEFERRED 트랜잭션은 읽기로 시작해 쓰기로 올라가므로, 그 사이 다른 쓰기가 있으면 SQLite 가
+    busy 대기 없이 ``database is locked`` 를 낼 수 있다. IMMEDIATE 는 BEGIN 에서 쓰기 잠금을 잡는다.
+    """
+    if request.method != "POST":
+        return JsonResponse({"error": "POST only"}, status=405)
+    pk = int(request.GET["id"])
+    with transaction.atomic():
+        note = Note.objects.get(pk=pk)
+        note.score = (note.score + 1) % 1_000_000
+        note.save(update_fields=["score"])
+    return JsonResponse({"id": pk, "score": note.score})
 
 
 def count(request):
@@ -77,6 +94,9 @@ def stats(request):
             "sizes": sizes,
             "pragmas": pragmas,
             "conn_max_age": settings.DATABASES["default"].get("CONN_MAX_AGE", 0),
+            "transaction_mode": settings.DATABASES["default"]
+            .get("OPTIONS", {})
+            .get("transaction_mode"),
             "pid": os.getpid(),
         }
     )

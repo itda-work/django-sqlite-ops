@@ -1720,3 +1720,72 @@ def test_cache_mech_multi_query_conditions_count_queries(small_db):
         r = m.run_cell(small_db, "baseline", "perconn", kind, 1, 0.2, 1)
         assert r["ops"] > 0 and r["ops"] % 10 == 0, (kind, r)
         assert r["close_mean_us"] is not None
+
+
+# --- Django 기본 대 권장 설정 비교(#83, lab/dbconfig_report.py) ---------------------------------
+
+
+def test_dbconfig_locked_verdict_needs_every_rep():
+    r = _lab_module("dbconfig_report")
+    assert r.locked_verdict([3, 1, 9], [0, 0, 0], 3) == "재현"
+    assert r.locked_verdict([3, 0, 9], [0, 0, 0], 3) == "재현 안 됨"
+    assert r.locked_verdict([3, 1, 9], [0, 1, 0], 3) == "재현 안 됨"
+    assert r.locked_verdict([3, 1], [0, 0], 3) == "판정 불가"
+
+
+def _dbconfig_run(config, workers, rep, rps, locked):
+    return {
+        "cma": f"w{workers}",
+        "variant": "baseline" if config == "django-default" else "recommended",
+        "config": config,
+        "workers": workers,
+        "rep": rep,
+        "pragmas": {"journal_mode": "delete" if config == "django-default" else "wal"},
+        "transaction_mode": None if config == "django-default" else "IMMEDIATE",
+        "phases": {
+            "rmw": {
+                "rps": rps,
+                "p50_ms": 1.0,
+                "p99_ms": 10.0,
+                "errors": locked,
+                "locked": locked,
+                "kinds": {"rmw": {"p99_ms": 9.0, "errors": locked}},
+                "exceptions": {"x.DoesNotExist: y": 2} if locked else {},
+            }
+        },
+    }
+
+
+def test_dbconfig_report_csv_and_tables():
+    r = _lab_module("dbconfig_report")
+    runs = [
+        _dbconfig_run(c, 1, rep, rps, locked)
+        for rep in (1, 2)
+        for c, rps, locked in (("django-default", 100.0, 5), ("recommended", 150.0, 0))
+    ]
+    data = {
+        "reps": 2,
+        "duration_s": 20,
+        "concurrency": 16,
+        "rows": 1000,
+        "workers": [1],
+        "configs": ["django-default", "recommended"],
+        "phases": {"rmw": {}},
+        "runs": runs,
+    }
+    rows = r.csv_rows(data)
+    assert [(x["rep"], x["config"], x["locked"]) for x in rows] == [
+        (1, "django-default", 5),
+        (1, "recommended", 0),
+        (2, "django-default", 5),
+        (2, "recommended", 0),
+    ]
+    assert rows[0]["transaction_mode"] == "" and rows[1]["transaction_mode"] == "IMMEDIATE"
+    assert set(rows[0]) == set(r.CSV_FIELDS)
+    out = r.tables(data)
+    assert (
+        "| `rmw` | +50.0, +50.0 | +0.0, +0.0 | +0.0, +0.0 | 예·아니오·아니오 | "
+        "재현 (기본 [5, 5], 권장 [0, 0]) |"
+    ) in out
+    # locked 밖의 예외도 숨기지 않는다
+    assert "x.DoesNotExist: y': 4" in out
