@@ -264,7 +264,7 @@ def test_layer_semantics_table_matches_design():
 
 
 DOCKERFILE = _blocks("dockerfile")
-REQUIREMENTS = [b for b in _blocks("text") if "django-sqlite-ops @" in b[2]]
+REQUIREMENTS = [b for b in _blocks("text") if re.search(r"(?m)^django-sqlite-ops\b", b[2])]
 
 
 def test_dockerfile_prepares_db_parent_directory():

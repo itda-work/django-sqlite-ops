@@ -30,7 +30,7 @@ SUBSTITUTIONS = {
     ],
     "requirements.txt": [
         (
-            "django-sqlite-ops @ https://github.com/itda-work/django-sqlite-ops/archive/refs/heads/main.zip",
+            "django-sqlite-ops==0.1.0a1",
             f"django-sqlite-ops @ file:///app/{WHEEL_PLACEHOLDER}",
         ),
     ],
@@ -82,7 +82,8 @@ def main(wheel_path: str, build: Path = BUILD) -> None:
     multi = "single-server-multiproc.md"
     dockerfile = one(blocks(single, "dockerfile"), "dockerfile")
     requirements = one(
-        [b for b in blocks(single, "text") if "django-sqlite-ops @" in b], "requirements"
+        [b for b in blocks(single, "text") if re.search(r"(?m)^django-sqlite-ops\b", b)],
+        "requirements",
     )
     litestream = one(
         [b for b in blocks(single, "yaml") if b.startswith("# /etc/litestream.yml")], "litestream"

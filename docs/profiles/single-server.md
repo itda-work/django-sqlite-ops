@@ -59,7 +59,7 @@ litestream replicate -config /etc/litestream.yml -exec "..."     PID 1, 복제
 | `litestream.yml` | 실제 litestream 0.5.17 의 `litestream databases -config` 가 읽음 |
 | `entrypoint.sh` | `bash -n`·`sh -n` 문법 검사 |
 | `compose.yaml` | YAML 구문, 그리고 회귀 랩이 그대로 띄운다(이미지 이름·라벨·호스트 포트만 덮음) |
-| Dockerfile, `requirements.txt` | 회귀 랩(`lab/`, #10)이 이 블록을 그대로 꺼내 빌드하고 띄운다. 다른 점은 패키지를 GitHub 대신 작업 트리 wheel 로 넣는 한 줄뿐이다([lab/README.md](../../lab/README.md)) |
+| Dockerfile, `requirements.txt` | 회귀 랩(`lab/`, #10)이 이 블록을 그대로 꺼내 빌드하고 띄운다. 다른 점은 패키지를 PyPI 대신 작업 트리 wheel 로 넣는 한 줄뿐이다([lab/README.md](../../lab/README.md)) |
 
 ### `settings.py`
 
@@ -188,10 +188,10 @@ ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 - `/data` 는 앱 사용자(`app`, uid 10001) 소유다. boot 는 그 안에 잠금·상태 파일·임시 복원 디렉터리를 만들고 격리할 때 rename 하므로, DB 파일뿐 아니라 디렉터리에도 쓰기 권한이 있어야 한다.
 - 이름 있는 빈 볼륨을 `/data` 에 처음 붙이면 Docker 가 이미지의 `/data` 내용을 볼륨으로 복사한다([Docker 문서](https://docs.docker.com/engine/storage/volumes/)). **소유자도 함께 넘어온다**: 새 볼륨의 `/data` 가 `10001:10001`(권한 755)이었다(회귀 랩 P1·P2, Docker 29.5.2). 바인드 마운트(`./data:/data`)는 복사가 일어나지 않으므로 호스트 디렉터리의 소유자를 uid 10001 로 맞춘다.
 
-`requirements.txt` 예(PyPI 배포 전이라 GitHub 아카이브로 받는다. 이미지에 `git` 이 없어도 된다):
+`requirements.txt` 예. 패키지는 PyPI 에서 받는다(`0.1.0a1`, 2026-10-26 배포 확인). 사전 릴리스는 버전을 명시해 설치한다. 실험적 프로젝트이므로 그 버전으로 고정해 둔다([README 설치](../../README.md#설치)):
 
 ```text
-django-sqlite-ops @ https://github.com/itda-work/django-sqlite-ops/archive/refs/heads/main.zip
+django-sqlite-ops==0.1.0a1
 Django>=5.2
 channels
 uvicorn[standard]
@@ -199,7 +199,7 @@ uvicorn[standard]
 
 `uvicorn` 만 설치하면 웹소켓 구현(`websockets`·`wsproto`)이 없어 HTTP 는 되지만 웹소켓 연결을 받지 못한다. `[standard]` extra 가 `websockets` 를 함께 넣는다(uvicorn 0.54.0 메타데이터, [설치 문서](https://uvicorn.dev/installation/)).
 
-운영에서는 `main.zip` 대신 커밋 해시 아카이브(`archive/<sha>.zip`)로 고정한다.
+릴리스되지 않은 `main` 이 필요하면 첫 줄을 커밋 해시로 고정한 GitHub 아카이브로 바꾼다: `django-sqlite-ops @ https://github.com/itda-work/django-sqlite-ops/archive/<sha>.zip`(이미지에 `git` 이 없어도 된다).
 
 ### `entrypoint.sh`
 
