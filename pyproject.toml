@@ -1,7 +1,7 @@
 [build-system]
 # License-Expression·License-File 은 core metadata 2.4 다(hatchling 1.26.0 부터 지원)
-# hatch-fancy-pypi-readme: PyPI 설명의 상대 링크를 절대 URL 로 바꾼다(아래 metadata.hooks)
-requires = ["hatchling>=1.26", "hatch-fancy-pypi-readme"]
+# hatch-fancy-pypi-readme: PyPI 설명의 상대 링크를 절대 URL 로 바꾼다(아래 metadata.hooks, 설정 키는 25.1.0 README 로 확인)
+requires = ["hatchling>=1.26", "hatch-fancy-pypi-readme>=25.1"]
 build-backend = "hatchling.build"
 
 [project]

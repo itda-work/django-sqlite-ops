@@ -950,4 +950,4 @@ scripts/lab.sh bench                # PRAGMA 벤치 (lab/README.md)
 gh workflow run lab.yml -f scenarios=all   # 회귀 랩을 GitHub 러너(amd64)에서 수동 실행. 결과는 artifact (벤치 제외)
 ```
 
-릴리스: `CHANGELOG.md` 의 `[Unreleased]` 를 새 버전 절로 옮기고 `pyproject.toml` 의 version 을 올린 뒤 `python3 scripts/release_check.py v<버전>` 이 통과하면 태그 `v<버전>` 을 push 한다. `.github/workflows/release.yml` 이 같은 검사 뒤 PyPI(trusted publishing)와 GitHub 릴리스에 올린다. 산출물은 `uv build --out-dir <디렉터리>` 뒤 `python3 scripts/release_check.py v<버전> --dist <디렉터리>` 로 미리 볼 수 있다(빌드된 Version, PyPI 설명의 상대 링크).
+릴리스: `CHANGELOG.md` 의 `[Unreleased]` 를 새 버전 절로 옮기고 `pyproject.toml` 의 version 을 올린 뒤 `python3 scripts/release_check.py v<버전>` 이 통과하면 태그 `v<버전>` 을 push 한다. `.github/workflows/release.yml` 이 같은 검사 뒤 PyPI(trusted publishing)와 GitHub 릴리스에 올린다. 산출물은 `uv build --out-dir <디렉터리>` 뒤 `python3 scripts/release_check.py v<버전> --dist <디렉터리>` 로 미리 볼 수 있다(빌드된 Version, PyPI 설명의 상대 링크). 태그 순서: PR 병합 → `git fetch` → `git tag v<버전> origin/main` → 그 커밋에서 `python3 scripts/release_check.py v<버전>` → `git push origin v<버전>`. squash 병합이라 브랜치의 커밋은 main 의 조상이 아니어서, 거기에 붙인 태그는 release.yml 의 조상 검사가 막는다.
