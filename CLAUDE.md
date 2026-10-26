@@ -20,21 +20,21 @@
 - **구현**: herdr pane 의 Claude Code 를 **`cc-alt`**(두 번째 계정, `--dangerously-skip-permissions`)로 띄운다. `herdr agent start` 는 `claude` 바이너리를 직접 불러 alias 가 닿지 않으므로, 셸 pane 에서 `herdr pane run <id> "cc-alt --model claude-opus-5-5 --effort medium"` 로 띄운 뒤 `herdr agent rename <id> impl` 로 이름을 붙인다. 이슈가 바뀌면 문맥을 비우기 위해 새로 띄운다(슬래시 명령은 prompt 로 보내면 실행되지 않는다).
 - **리뷰**: 기본은 구현과 다른 herdr pane 의 Claude Code 다(2026-10-14 부터, 마스터 지시 — Codex 주간 한도). 셸 pane 에서 `herdr pane run <id> "cc-alt --model claude-opus-5-5 --effort medium"` 뒤 `herdr agent rename <id> review`. 브리프(`.work/issue-<N>/review-brief.md`)에 다음을 적는다.
   - 코드를 고치지 않고, 저장소 작업 트리·브랜치를 바꾸지 않는다(구현자와 같은 작업 트리다). 쓰기는 `.work/issue-<N>/` 의 결과 파일만 한다.
-  - 실행 검증·변이 시험은 저장소 밖 임시 worktree 에서 한다. **한 명령 안에서**(또는 `.work/issue-<N>/mut.sh` 스크립트로) `set -euo pipefail` 아래 `git worktree add` → `cd "$W"` → `[ "$(pwd)" = "$W" ]` 확인 → 끝에 `worktree remove` 순서로 한다. Claude Code 는 저장소 밖으로 `cd` 한 셸 위치를 다음 명령에서 되돌리므로, 상대 경로를 다음 명령으로 넘기면 메인 작업 트리를 바꾼다(#54 리뷰에서 시도돼 거부함 — #73 코멘트에 기록).
+  - 실행 검증·변이 시험은 저장소 밖 임시 worktree 에서 한다. **한 명령 안에서**(또는 `.work/issue-<N>/mut.sh` 스크립트로) `set -euo pipefail` 아래 `git worktree add` → `cd "$W"` → `[ "$(pwd)" = "$W" ]` 확인 → 끝에 `worktree remove` 순서로 한다. 변이 대상 파일은 `$W` 아래 절대 경로로 쓴다. `W` 는 `mktemp -d "${TMPDIR%/}/x.XXXX"` 로 만든다. macOS `TMPDIR` 은 `/` 로 끝나 `//` 가 생기고 `pwd` 비교가 어긋난다(#77 에서 재현됨, 2026-10-26 확인). Claude Code 는 저장소 밖으로 `cd` 한 셸 위치를 다음 명령에서 되돌리므로, 상대 경로를 다음 명령으로 넘기면 메인 작업 트리를 바꾼다(#54 리뷰에서 시도돼 거부함 — #73 코멘트에 기록).
   - 결과는 지적마다 P1/P2/P3·근거(재현함/코드상 확인/미검증)·고칠 방향을 적고, 마지막 줄은 `VERDICT: PASS|CHANGES` 로 한다.
   - 대안으로 Codex `codex-alt` 를 쓸 수 있다: `herdr pane run <id> "codex-alt -m gpt-6-astra -c model_reasoning_effort=medium --sandbox workspace-write"`. 결과 파일을 써야 하므로 workspace-write 이고, 쓰기는 `.work/` 아래만 허용한다고 브리프에 적는다. 이 샌드박스에서는 Docker 소켓이 막혀 있으니 Docker 상태 확인은 오케스트레이터가 한다.
   - 지적은 구현자에게 돌려 고친다. 리뷰가 통과하고 CI 가 초록일 때만 병합한다.
 - **확인 창**: 전역 ask 규칙(`git push`·`cp`·`rm`·`curl`·`chmod` 등)은 `--dangerously-skip-permissions` 에서도 확인 창을 띄워 pane 을 멈춘다. 오케스트레이터는 다음과 같이 다룬다.
   - 대기 루프에서 완료 파일과 함께 `Do you want to proceed` 를 감지한다.
   - 명령 전체·브랜치·`git status`·대상 경로를 확인한 뒤에만 승인한다(`herdr pane send-keys <id> Enter` 또는 `1`).
-  - 명령 앞부분이 화면 밖이라 `cd` 위치나 대상을 확인할 수 없으면 Esc 로 거부하고, 같은 일을 스크립트 파일로 쓰게 한 뒤 읽고 실행을 지시한다(#68).
+  - 명령 앞부분이 화면 밖이라 `cd` 위치나 대상을 확인할 수 없으면 Esc 로 거부하고, 같은 일을 스크립트 파일로 쓰게 한 뒤 읽고 실행을 지시한다(#68). 상대 경로를 고치는 긴 변이 명령이 대표적이다(#66 에서 두 번 거부, 2026-10-26 확인). 그래서 브리프에 '변이 대상은 임시 worktree 의 절대 경로로, 스크립트 파일로 쓴다'를 미리 적는다.
   - `.work/issue-<N>/` 안의 단독 `rm -f -- ...` 는 훅이 승인한다(아래). 단 pane 의 cwd 가 메인 저장소일 때만이다. worktree cwd 의 pane 에서는 그 상대 경로가 없어 훅이 닿지 않으므로 확인 창으로 다룬다(#73 리뷰 재현).
 - **pane 수명**: 이슈마다 구현·리뷰 pane 을 `herdr pane split --current --direction right --cwd "$PWD" --no-focus`(리뷰 pane 은 `--direction down`) 로 새로 만들고, **그 이슈를 병합(또는 중단)하면 바로 `herdr pane close <id>` 로 닫는다.** 끝난 pane 을 다음 이슈에 재사용하거나 남겨 두지 않는다. 오케스트레이터가 만든 pane 만 닫는다.
-- **동시 진행**: 메인 작업 트리를 다른 구현자가 쓰고 있으면 `git worktree add -b issue-<N>-<slug> .work/issue-<N>/wt origin/main` 으로 worktree 를 만들고, 그 cwd 의 pane 으로 띄운다(#68·#71). 브리프에 '이 worktree 에서만, 메인 작업 트리는 건드리지 않는다'를 적는다. Docker 랩은 한 번에 하나만 돌린다(프로젝트 이름이 같다). 병합 뒤에는 `git worktree remove .work/issue-<N>/wt` → `git branch -D issue-<N>-<slug>`(squash 병합이라 `-d` 는 거부된다. `gh pr merge --delete-branch` 가 이미 지웠으면 생략) → `rm -rf -- ".work/issue-${N:?}"` 순서로 정리한다. 디렉터리를 먼저 지우면 worktree 메타가 남아 `git worktree prune` 이 필요하다.
+- **동시 진행**: 메인 작업 트리를 다른 구현자가 쓰고 있으면 `git worktree add -b issue-<N>-<slug> .work/issue-<N>/wt origin/main` 으로 worktree 를 만들고, 그 cwd 의 pane 으로 띄운다(#68·#71). 브리프에 '이 worktree 에서만, 메인 작업 트리는 건드리지 않는다'를 적는다. Docker 랩은 한 번에 하나만 돌린다(프로젝트 이름이 같다). 병합 뒤에는 `git worktree remove .work/issue-<N>/wt` → `git branch -D issue-<N>-<slug>`(squash 병합이라 `-d` 는 거부된다) → `.work/issue-<N>/` 삭제 순서로 정리한다. 디렉터리를 먼저 지우면 worktree 메타가 남아 `git worktree prune` 이 필요하다. `gh pr merge --delete-branch` 는 worktree 에 체크아웃된 로컬 브랜치와 그 worktree 까지 지운다(#79 병합 때 관측, 2026-10-26 확인). 그때는 앞의 두 단계가 'not a working tree' 등으로 실패하지만 무해하니 `git worktree list` 로 확인하고 디렉터리만 지운다.
 - **README 는 활용 가이드다**(#11). 기능을 추가하는 PR 은 README 의 해당 절(설치·빠른 시작·사용 예·함정)을 함께 갱신한다. 없는 기능은 '예정'으로만 적는다.
-- **실측·테스트 디렉터리는 비우지 말고 매번 새로 만든다.** 꼭 지워야 하면 `rm -rf -- "${D:?}"` 처럼 `:?` 로 빈 값을 막고 와일드카드 없이 디렉터리 하나만 지정한다. `cd X && rm -rf *`, `rm -rf "$D"/*` 는 쓰지 않는다(cwd 가 틀리거나 변수가 비면 저장소나 `/` 를 지운다 — #3·#7 에서 실제로 시도돼 거부함).
+- **실측·테스트 디렉터리는 비우지 말고 매번 새로 만든다.** 꼭 지워야 하면 `rm -rf -- "${D:?}"` 처럼 `:?` 로 빈 값을 막고 와일드카드 없이 디렉터리 하나만 지정한다. 이 꼴은 구현·리뷰 pane 용이다. 오케스트레이터 세션에서는 삭제 가드 훅(`~/.claude/hooks/dangerous-delete-guard.py`)이 변수로 시작하는 경로를 막으므로 확인한 절대 경로를 그대로 쓴다(2026-10-26 재현). `cd X && rm -rf *`, `rm -rf "$D"/*` 는 쓰지 않는다(cwd 가 틀리거나 변수가 비면 저장소나 `/` 를 지운다 — #3·#7 에서 실제로 시도돼 거부함).
 - **정본 문서가 현재 상태와 어긋나면 발견한 즉시 고친다.** 구현 상태, 모듈 구성, 버전, 상류 이슈·PR 상태처럼 시간이 지나면 바뀌는 사실은 확인한 날짜를 함께 적는다. 작업 중인 이슈와 관련 있으면 그 PR 에 넣고, 아니면 docs 이슈를 따로 연다. `docs/research/` 는 당시 기록이므로 고치지 않고 정본(DESIGN·README·CLAUDE.md)에 현재 상태를 적는다.
-- 브리프와 리뷰 결과는 `.work/issue-<N>/`(git 무시)의 파일로 주고받는다. 긴 지시를 프롬프트에 넣지 않는다. 이 디렉터리는 작업 중 전달 통로일 뿐이고 기록의 정본은 이슈 코멘트다. 그래서 **이슈를 병합(또는 중단)하면 pane 을 닫을 때 `rm -rf -- ".work/issue-${N:?}"` 로 함께 지운다.** 지우기 전에 남길 결론·근거가 이슈 코멘트에 있는지 확인한다.
+- 브리프와 리뷰 결과는 `.work/issue-<N>/`(git 무시)의 파일로 주고받는다. 긴 지시를 프롬프트에 넣지 않는다. 이 디렉터리는 작업 중 전달 통로일 뿐이고 기록의 정본은 이슈 코멘트다. 그래서 **이슈를 병합(또는 중단)하면 pane 을 닫을 때 `.work/issue-<N>/` 도 함께 지운다**(오케스트레이터는 절대 경로로, 위 삭제 규칙). 지우기 전에 남길 결론·근거가 이슈 코멘트에 있는지 확인한다.
 - 작업 중 `.work/issue-<N>/` 의 파일을 지울 때는 **다른 명령과 섞지 않은 단독 `rm -f -- .work/issue-<N>/<파일> ...`** 로 쓴다. 이 꼴만 `.claude/hooks/allow-work-file-rm.py`(PermissionRequest 훅)가 확인 없이 승인한다. 전역 `ask: Bash(rm:*)` 는 allow 규칙이나 PreToolUse 훅으로는 넘지 못한다(공식 문서, 실측). 그 밖의 `rm`(디렉터리·와일드카드·`-r`·다른 경로·명령 연결)은 그대로 확인을 받는다. 브리프에 이 꼴을 적는다.
 
 ## 규약
@@ -68,6 +68,7 @@
 - Linux 에서 litestream-vfs 확장을 로드하면 그 뒤의 일반 connect 가 실패한다. 우회책 `sqlite3_reset_auto_extension()` 은 **모든** 자동 확장을 해제하므로 옵션으로만 둔다. 상류 수정 #1506 은 2026-10-08 에 머지됐지만 v0.5.17 이후라 아직 릴리스되지 않았다(2026-10-13 확인). 다음 릴리스가 나오면 재검증한다.
 - SeaweedFS 는 버킷마다 볼륨을 잡는다. 랩에서는 버킷 하나를 두고 prefix 로 나누며, `-volume.max` 를 올린다.
 - macOS 에는 `timeout` 명령이 없다.
+- `.work/issue-<N>/` 아래에서 `uv init`·`uv add` 를 하면 uv 가 상위의 이 저장소를 workspace 루트로 잡아 메인 `pyproject.toml` 에 `[tool.uv.workspace] members = [...]` 를 넣는다(#77 에서 재현됨, 2026-10-26 확인). 시험 프로젝트는 저장소 밖에 만들거나 `uv init --no-workspace` 를 쓰고, 브리프에 적는다.
 - aio 계열 채널 레이어는 `await layer.close()` 가 없으면 프로세스가 끝나지 않을 수 있다. channels-nats 0.10.0 은 `close()` 없이도 `asyncio.run` 이 끝나면 프로세스가 끝났다(#66).
 - 랩은 앱을 `compose up --no-deps` 로 띄운다. 문서 compose 의 `depends_on`(P2 의 nats)은 시나리오가 따로 띄워야 한다. #66 전의 P2 는 nats 없이 돌았다.
 - channels-nats 의 용량 드롭 경고는 60초에 한 번이고, 합계("has room again after dropping N")는 자리가 난 뒤 다음 메시지가 들어올 때만 나온다. 버스트 뒤 손실을 로그로 셀 때는 메시지를 하나 더 보낸다(#66).
