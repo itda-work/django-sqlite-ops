@@ -9,6 +9,7 @@ scripts/lab.sh run all        # L1–L8, P1·P2 (약 8분 + P2 채널 시나리�
 scripts/lab.sh run L6         # pytest -k 로 좁힌다 (L1..L8, L8c 처럼 하나만, P1, P2)
 scripts/lab.sh bench          # PRAGMA 벤치 + 포화 측정 (약 50분). pytest 인자를 넘길 수 있다(-k saturation)
 scripts/lab.sh soak           # fd·RSS 장시간 실행, CONN_MAX_AGE None·0 각 30분 (약 70분, #33)
+scripts/lab.sh dbconfig       # Django 기본 SQLite 대 권장 설정, 동시 쓰기 (약 30분, #83)
 scripts/lab.sh cache [mech]   # cache_size 최소 재현(mech: 원인 가설)을 랩 이미지의 Python·SQLite 로 (약 19분 / 6분, #27)
 scripts/lab.sh up             # 이미지 빌드 + SeaweedFS·toxiproxy 만 띄워 둔다(디버깅용)
 scripts/lab.sh down           # 이 랩의 자원만 지우고 남은 것을 보여 준다(비어 있어야 한다)
@@ -49,6 +50,7 @@ ubuntu-latest(amd64)에서 `scripts/lab.sh run <선택>` 을 그대로 돌리고
 | `toxiproxy` | `ghcr.io/shopify/toxiproxy:2.12.0@sha256:9378ed52…` | 앱 ↔ S3. 프록시 `s3`(:18333, boot·replicate)와 `s3h`(:18334, L8b 의 헬스 조회만) |
 | `labapp` / `labapp-nv` | `dso-lab-app:<태그>` | 시나리오 앱. 볼륨 `LAB_VOLUME` 있음 / 없음(무상태). 재시작하지 않는다(종료 코드를 본다) |
 | `labapp-soak` | 같은 이미지 | soak 앱(#33). `labapp` + `nofile`·메모리 한도(스왑 없음) |
+| `labapp-plain` | 같은 이미지 | 기본 대 권장 비교(#83). boot·Litestream 없이 `migrate` → `uvicorn --workers $LAB_WORKERS` |
 | `tool` | 같은 이미지 | 볼륨 없이 복제본을 `/tmp` 로 복원해 TXID·행 수·`integrity_check` 를 낸다 |
 | `loadgen` | 같은 이미지 | 벤치 부하 발생기(`lab_tools/loadgen.py`) |
 | P1 `app` | 같은 이미지 | **single-server 문서의 compose.yaml 그대로** + `profile-override.yaml` |
@@ -151,7 +153,7 @@ L6 의 훅은 `LAB_RENAME_DELAY` 가 있을 때만 `os.rename` 뒤에 한 줄(`[
 
 ## fd·RSS 장시간 실행 (soak, #33)
 
-`lab/test_soak.py` 의 `test_soak`(마커 `soak`)이다. `scripts/lab.sh soak` 으로만 돈다 — `run` 은 `-m "not bench and not soak"` 이고 GitHub 의 `lab.yml` 도 `run` 만 부르므로 기본 수집·CI 에 들어가지 않는다. 결과는 [`fd-soak-2026-10-09.md`](../docs/research/fd-soak-2026-10-09.md).
+`lab/test_soak.py` 의 `test_soak`(마커 `soak`)이다. `scripts/lab.sh soak` 으로만 돈다 — `run` 은 `-m "not bench and not soak and not dbconfig"` 이고 GitHub 의 `lab.yml` 도 `run` 만 부르므로 기본 수집·CI 에 들어가지 않는다. 결과는 [`fd-soak-2026-10-09.md`](../docs/research/fd-soak-2026-10-09.md).
 
 - 앱은 `labapp-soak`(lab-compose.yaml)이다. `labapp` 과 같고 compose [`ulimits`](https://docs.docker.com/reference/compose-file/services/#ulimits) 로 `nofile` soft·hard 를 `LAB_SOAK_NOFILE`(기본 1048576 = 이 랩 VM 의 `fs.nr_open`, 컨테이너가 올릴 수 있는 최대)로, [`mem_limit`](https://docs.docker.com/reference/compose-file/services/#mem_limit)·[`memswap_limit`](https://docs.docker.com/reference/compose-file/services/#memswap_limit) 를 같은 값 `LAB_SOAK_MEM`(기본 `2g`, 스왑 없음)으로 둔다. 시작할 때 앱 프로세스의 `/proc/self/limits`·`/proc/1/limits`·`nr_open`·cgroup `memory.max` 를 원자료로 남기고, nofile 이 요청값과 다르거나 메모리 한도가 없으면 실패한다.
 - `CONN_MAX_AGE` 값마다 스택을 새로 띄워(`down -v` → `up`) 새 볼륨·prefix 로 `--init-new` 부팅 → 행 `LAB_SOAK_ROWS` 개 → 부하 직전 표본 → `loadgen --report-every`. 부하는 벤치 `mixed` 와 같다(읽기 70%·정렬 10%·1행 쓰기 20%, 동시 `LAB_SOAK_CONCURRENCY`). 두 값이 같은 부하다.
@@ -164,6 +166,18 @@ L6 의 훅은 `LAB_RENAME_DELAY` 가 있을 때만 `os.rename` 뒤에 한 줄(`[
 환경 변수: `LAB_SOAK_DURATION`(1800초), `LAB_SOAK_INTERVAL`(10초), `LAB_SOAK_CONCURRENCY`(16), `LAB_SOAK_ROWS`(100000), `LAB_SOAK_CMA`(`none,0`), `LAB_SOAK_MEM`(`2g`), `LAB_SOAK_NOFILE`(1048576), `LAB_SOAK_STOP_MEM_FRAC`(0.8), `LAB_SOAK_STOP_ERR_RATE`(0.5), `LAB_SOAK_STOP_ERR_INTERVALS`(3). 짧게 확인할 때: `LAB_SOAK_DURATION=60 LAB_SOAK_INTERVAL=5 LAB_SOAK_ROWS=10000 scripts/lab.sh soak`.
 
 결과: `lab/.out/soak-<시각>.jsonl`(줄마다 `cma`·`kind` = `env`·`baseline`·`interval`·`final`·`summary`), `soak-<시각>-summary.json`(두 값 비교와 실행별 요약), 콘솔 `soak-<시각>.log`. 결과 문서의 표는 손으로 옮기지 않고 `uv run --no-project python lab/soak_report.py lab/.out/soak-<시각>.jsonl` 의 출력을 넣는다(중앙값은 `statistics.median`, p90 은 최근접 순위).
+
+## Django 기본 대 권장 설정 (dbconfig, #83)
+
+`lab/test_dbconfig.py`(마커 `dbconfig`)다. `scripts/lab.sh dbconfig` 으로만 돈다(`run`·`lab.yml` 밖). 결과는 [`bench-2026-10-26-default-vs-recommended.md`](../docs/research/bench-2026-10-26-default-vs-recommended.md).
+
+- **`test_litestream_sets_wal`**: 프로필 그대로의 `labapp`(boot → `litestream replicate`)에 Django 기본 설정(`LAB_DB_CONFIG=django-default`)을 넣고 `journal_mode` 를 남긴다. Litestream 이 복제를 시작하며 DB 를 WAL 로 바꾸므로(재현함, 2026-10-26) 이 스택으로는 Django 기본을 잴 수 없다.
+- **`test_dbconfig_bench`**: 그래서 `labapp-plain`(boot·Litestream 없음)으로 두 설정을 같은 이미지·같은 발생기로 번갈아 돈다. 설정은 `LAB_DB_CONFIG`: `django-default`(`ENGINE`·`NAME` 만, OPTIONS 없음) / `recommended`(프로필 문서의 `sqlite_database()` 그대로). 부팅 직후 `/lab/stats` 로 `journal_mode`(`delete`/`wal`)와 `transaction_mode`(없음/`IMMEDIATE`)를 확인한다.
+- 반복 r 마다 (워커 수, 설정) 조합을 돌고 순서를 r 만큼 회전한다. 실행마다 새 볼륨 → `lab_seed` → 3초 데움(집계 안 함) → 세 단계(각 20초, 워밍업 없음, 동시 16): `mixed`(벤치와 같음), `write`(읽기 30%·50행 쓰기 70%), `rmw`(읽기 50%·`POST /lab/rmw` 50% — `transaction.atomic()` 안에서 `get` → `save`).
+- `database is locked` 는 단계마다 앱 로그의 `django.db.utils.OperationalError: database is locked` 줄 증가로 센다. 단계에 워밍업이 없어 응답 500 수와 같은 구간이다. 그 밖의 예외 줄도 종류별로 남긴다.
+- 집계는 `_benchstat` 의 짝 비교(워커 수를 `cma` 자리, Django 기본을 `baseline` 자리)다. 표·CSV 는 `uv run --no-project python lab/dbconfig_report.py lab/.out/dbconfig-<시각>.json --csv docs/research/data/dbconfig-<날짜>.csv`.
+
+환경 변수: `LAB_DBCONFIG_REPS`(5), `LAB_DBCONFIG_DURATION`(20), `LAB_DBCONFIG_ROWS`(100000), `LAB_DBCONFIG_CONCURRENCY`(16), `LAB_DBCONFIG_WORKERS`(`1,4`). 결과: `lab/.out/dbconfig-<시각>.json`.
 
 ## cache_size 최소 재현 (#27)
 
@@ -207,6 +221,8 @@ lab/
 ├── test_bench.py           PRAGMA 벤치, 포화 측정
 ├── test_soak.py            fd·RSS 장시간 실행(#33)
 ├── soak_report.py          soak 원자료 → 결과 문서의 표(_soakstat 로 계산)
+├── test_dbconfig.py        Django 기본 대 권장 설정 비교(#83)
+├── dbconfig_report.py      그 원자료 → 결과 문서의 표·작은 CSV
 ├── cache_probe.py          cache_size 최소 재현(#27, 표준 라이브러리 sqlite3 만)
 ├── _cachestat.py           그 집계·판정(순수 함수, 같은 테스트가 검사)
 ├── cache_report.py         그 원자료 → 결과 문서의 표

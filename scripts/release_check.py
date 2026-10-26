@@ -9,6 +9,8 @@ release.yml 이 빌드 전에 태그 이름으로 돌린다. 로컬에서는 태
 `--dist DIR` 는 빌드된 wheel 의 METADATA 와 sdist 의 PKG-INFO 를 읽어 `Version` 이 태그(없으면
 pyproject version)와 같은지, PyPI 설명에 상대 링크가 남지 않았는지 본다. PyPI 는 설명의 상대
 링크를 저장소로 풀지 않으므로 pyproject 의 fancy-pypi-readme 치환이 모두 바꿨어야 한다.
+이미지는 GitHub blob 페이지(HTML)를 가리키면 깨지므로 그것도 거부한다(#83,
+raw.githubusercontent.com 을 쓴다).
 `--github-output PATH` 를 주면 `version=`·`prerelease=true|false` 를 그 파일에 덧붙인다
 (GitHub Actions 의 `$GITHUB_OUTPUT`). 한 번 올린 버전은 PyPI 에서 다시 쓸 수 없으므로,
 어긋나면 빌드 전에 거부한다. 표준 라이브러리만 쓴다.
@@ -46,6 +48,13 @@ _LINK_TARGETS = (
 )
 # 스킴(https:·mailto: 등)이나 문서 안 앵커(#)로 시작하면 상대 링크가 아니다
 _ABSOLUTE = re.compile(r"^(?:[A-Za-z][A-Za-z0-9+.-]*:|#)")
+# 이미지 대상: 마크다운 `![alt](x)`, 원시 HTML 의 img src
+_IMAGE_TARGETS = (
+    re.compile(r"!\[[^\]]*\]\(\s*<?([^)\s>]+)"),
+    re.compile(r"""<img\b[^>]*?\bsrc\s*=\s*["']([^"']*)["']""", re.I),
+)
+# GitHub 의 blob 페이지는 HTML 이라 이미지로 열리지 않는다(#83). raw.githubusercontent.com 을 쓴다
+_BLOB = re.compile(r"^https?://github\.com/[^/]+/[^/]+/blob/")
 SECTION = re.compile(r"^## \[(?P<version>[^\]]+)\](?P<rest>.*)$", re.M)
 DATED = re.compile(r"^ - \d{4}-\d{2}-\d{2}$")
 
@@ -63,6 +72,17 @@ def relative_links(markdown: str) -> list[str]:
     for pattern in _LINK_TARGETS:
         found += [(m.start(1), m[1]) for m in pattern.finditer(markdown)]
     return [target for _, target in sorted(found) if not _ABSOLUTE.match(target)]
+
+
+def blob_images(markdown: str) -> list[str]:
+    """PyPI·GitHub 에서 깨질 이미지 대상(GitHub blob 페이지 URL)을 나온 순서대로 돌려준다.
+
+    상대 이미지 경로는 fancy-pypi-readme 치환이 ``blob/main`` URL 로 바꾸므로 여기에 걸린다.
+    """
+    found = []
+    for pattern in _IMAGE_TARGETS:
+        found += [(m.start(1), m[1]) for m in pattern.finditer(markdown)]
+    return [target for _, target in sorted(found) if _BLOB.match(target)]
 
 
 def _metadata(path: Path) -> email.message.Message:
@@ -102,6 +122,13 @@ def dist_problems(dist: Path, expected: str) -> list[str]:
             shown = ", ".join(links[:5]) + (", ..." if len(links) > 5 else "")
             found.append(
                 f"{path.name}: the PyPI description has {len(links)} relative links ({shown})"
+            )
+        images = blob_images(metadata.get_payload())
+        if images:
+            shown = ", ".join(images[:5]) + (", ..." if len(images) > 5 else "")
+            found.append(
+                f"{path.name}: the PyPI description has {len(images)} images on GitHub blob"
+                f" pages, which do not render; use raw.githubusercontent.com URLs ({shown})"
             )
     return found
 

@@ -63,6 +63,7 @@
 - `litestream ltx` 는 복제본 경로가 없어도, 비어 있어도 rc 0 과 `[]` 다(0.5.17). 경로 오타와 빈 복제본을 출력으로 구분할 수 없다. `ltx DB_PATH` 도 로컬 메타가 아니라 복제본을 나열한다.
 - `litestream restore -integrity-check` 는 로그 한 줄을 stdout 의 `-json` 요약 앞에 쓴다. stdout 전체를 JSON 으로 읽으면 실패한다.
 - `restore -if-db-not-exists` 는 0바이트 DB 파일이 있으면 rc 0 으로 복원을 건너뛴다(재현함, DESIGN §4-1). `restore -o` 는 0바이트 파일은 덮고 내용 있는 파일은 거부한다.
+- Litestream 을 붙인 스택에서는 Django 기본 SQLite 설정도 WAL 로 돈다(복제를 시작하며 journal_mode 를 바꾼다, #83 에서 재현함 2026-10-26). Django 기본(rollback journal)을 잴 때는 Litestream 없는 앱(`labapp-plain`)을 쓴다.
 - restore 로 만든 DB 옆에는 로컬 메타(`.<db>-litestream/`)가 없다. replicate 가 시작돼야 생긴다.
 - S3 가 끊겨도 Litestream 은 로그·`status`·메트릭에 아무것도 남기지 않는다(D3). 그래서 헬스는 TXID 를 직접 비교해 계산한다.
 - Linux 에서 litestream-vfs 확장을 로드하면 그 뒤의 일반 connect 가 실패한다. 우회책 `sqlite3_reset_auto_extension()` 은 **모든** 자동 확장을 해제하므로 옵션으로만 둔다. 상류 수정 #1506 은 2026-10-08 에 머지됐지만 v0.5.17 이후라 아직 릴리스되지 않았다(2026-10-13 확인). 다음 릴리스가 나오면 재검증한다.

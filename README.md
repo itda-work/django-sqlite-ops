@@ -4,6 +4,45 @@
 
 Django 에서 SQLite 를 운영 DB 로 안전하게 쓰게 하는 **운영 도구**다. 권장 설정, 부팅 시 복원 판정, 진단, 복제 헬스, 배포 프로필을 맡는다. DB 백엔드를 바꾸거나 감싸지 않고, 표준 `DATABASES` 설정만 다룬다.
 
+## 왜 쓰는가
+
+Django 의 기본 SQLite 설정은 동시 쓰기를 고려하지 않는다. 이 패키지는 실측으로 확인한 권장 설정을 한 줄로 넣고, 운영에서 조용히 망가지는 설정과 상태를 막는다. 아래는 모두 회귀 랩(Docker, colima arm64)에서 잰 값이다. 이득이 재현되지 않은 것(PRAGMA `mmap_size`·`cache_size`·`journal_size_limit`)은 기본값에 넣지 않았다([#26](docs/research/bench-2026-10-08.md), [#27](docs/research/cache-size-2026-10-12.md)).
+
+**1. 동시 쓰기에서 `database is locked` 가 사라진다** ([측정](docs/research/bench-2026-10-26-default-vs-recommended.md), 2026-10-26)
+
+![Django 기본 설정 대 권장 설정의 처리량·p99·locked 오류](https://raw.githubusercontent.com/itda-work/django-sqlite-ops/main/docs/assets/dbconfig.svg)
+
+- 측정 조건: Django 기본 설정(rollback journal, DEFERRED)과 `sqlite_database()`(WAL, `IMMEDIATE`, `synchronous=NORMAL`)를 같은 앱·같은 부하(동시 16)로 5회씩 번갈아 돌렸다. Litestream 은 붙이지 않았다.
+- `transaction.atomic()` 안에서 읽고 고쳐 쓰는 요청은 Django 기본에서 **42.9–47.9% 가 `database is locked`(HTTP 500)** 로 실패했다. 권장 설정은 10번의 실행 모두에서 0건이었다.
+- 50행 INSERT 가 70% 인 부하에서 처리량은 워커 1 에서 +64–133%, 워커 4 에서 +116–885% 였다. p99 는 −48–93% 였다.
+- 다 좋아지지는 않았다.
+  - 워커 1 의 읽기 위주 부하에서는 처리량 차이가 재현되지 않았다(p99 는 −57–75%).
+  - 워커 1 의 읽고-고쳐-쓰기 요청은 권장 설정의 p99 가 더 높았다(+36–144%). 기본 설정이라면 실패했을 요청이 실패하지 않고 쓰기 잠금을 기다리기 때문이다.
+
+**2. ASGI 에서 `CONN_MAX_AGE=None` 을 막는다** ([#26](docs/research/bench-2026-10-08.md#결과-연결-재사용), 2026-10-08 · [#33](docs/research/fd-soak-2026-10-09.md), 2026-10-09)
+
+![CONN_MAX_AGE 0 대 None 의 열린 DB fd 와 500 오류](https://raw.githubusercontent.com/itda-work/django-sqlite-ops/main/docs/assets/conn-max-age.svg)
+
+- uvicorn 의 동기 뷰에서 `CONN_MAX_AGE=None` 은 연결을 재사용하지 않는다(DB 요청마다 새 연결 약 1개). 대신 닫지 않고 쌓는다.
+- 열린 DB 파일 fd 가 기본 한도 1,024 바로 아래(810–982)까지 올라갔다. 그때 `unable to open database file` 500 이 났다.
+- 한도를 올리면 오류는 없어진다. 그래도 fd 는 16.75배, RSS 는 5.62배 많이 쓰고 이득은 없다.
+- [시스템 체크](#시스템-체크) `sqlite_ops.W005` 가 이 설정을 알린다.
+
+**3. 위험한 부팅을 거부하고, 안전할 때만 복원한다** ([회귀 랩](docs/research/lab-2026-10-08.md), 2026-10-08 · [L8c·L8d](docs/research/lab-2026-10-25-long-outage.md), 2026-10-25)
+
+Litestream 만 쓰면 옛 볼륨으로 재부팅했을 때 최신 복제본이 덮인다(150건 → 55건, [재현](docs/research/litestream-django-docker.md#d4-부팅-가드-옛-볼륨-재부팅이-최신본을-덮는-문제-막기)). 아래는 [boot CLI](#boot-cli) 가 각 경계에서 한 일이다(모두 Docker 로 재현, arm64·amd64 통과).
+
+| 상황 | boot 의 결과 |
+|---|---|
+| L1 볼륨 없는 새 컨테이너 | 복제본에서 복원, 행 수 일치 |
+| L2 옛 볼륨으로 재부팅(복제본이 더 앞섬) | exit 2 `remote_ahead`, 복제본 손상 0 |
+| L3 로컬 메타만 사라짐 | exit 2 `no_local_meta`, DB 무변경 |
+| L4 부팅 중 S3 끊김(거부·무응답) | 타임아웃 뒤 exit 2 `remote_error` |
+| L5 복제되지 않은 로컬 커밋 | 그대로 진행, 커밋 보존 |
+| L6 복원 도중 kill | 반쯤 옮겨진 상태 없음, 재실행으로 완료 |
+| L7 복제본 객체 손상 | exit 4, 로컬 파일 무변경 |
+| L8 S3 끊김 중 헬스 | 업로드만 끊기면 `backlog`, 조회까지 끊기면 `unknown`. 복구 뒤 `caught_up` |
+
 ## 현재 상태
 
 PyPI 에 **실험적 사전 릴리스**로 배포한다([D-28](docs/DECISIONS.md), 2026-10-26 결정). 첫 버전은 `0.1.0a1` 이다. 사전 릴리스는 버전을 명시해 설치한다(아래 [설치](#설치)). 바뀐 점은 [CHANGELOG](CHANGELOG.md) 에 적는다. 외부 홍보는 하지 않는다. 패키지 이름 `django-sqlite-ops` 는 확정이다(D-28 이 D-6 을 갱신).
@@ -949,8 +988,12 @@ scripts/ci-local.sh litestream      # 실제 litestream 바이너리 + channels-
 
 scripts/lab.sh run all              # 회귀 랩 L1–L8·프로필 종단 검증 (Docker, 약 8분, 끝나면 down -v)
 scripts/lab.sh bench                # PRAGMA 벤치 (lab/README.md)
+scripts/lab.sh dbconfig             # Django 기본 대 권장 설정 비교 (약 25분, #83)
+
+# README 차트(docs/assets/*.svg)를 커밋된 CSV(docs/research/data/)에서 다시 만든다. matplotlib 은 의존성이 아니다
+uv run --no-project --with matplotlib==3.11.2 python docs/assets/charts.py
 
 gh workflow run lab.yml -f scenarios=all   # 회귀 랩을 GitHub 러너(amd64)에서 수동 실행. 결과는 artifact (벤치 제외)
 ```
 
-릴리스: `CHANGELOG.md` 의 `[Unreleased]` 를 새 버전 절로 옮기고 `pyproject.toml` 의 version 을 올린 뒤 `python3 scripts/release_check.py v<버전>` 이 통과하면 태그 `v<버전>` 을 push 한다. `.github/workflows/release.yml` 이 같은 검사 뒤 PyPI(trusted publishing)와 GitHub 릴리스에 올린다. 산출물은 `uv build --out-dir <디렉터리>` 뒤 `python3 scripts/release_check.py v<버전> --dist <디렉터리>` 로 미리 볼 수 있다(빌드된 Version, PyPI 설명의 상대 링크). 태그 순서: PR 병합 → `git fetch` → `git tag v<버전> origin/main` → 그 커밋에서 `python3 scripts/release_check.py v<버전>` → `git push origin v<버전>`. squash 병합이라 브랜치의 커밋은 main 의 조상이 아니어서, 거기에 붙인 태그는 release.yml 의 조상 검사가 막는다.
+릴리스: `CHANGELOG.md` 의 `[Unreleased]` 를 새 버전 절로 옮기고 `pyproject.toml` 의 version 을 올린 뒤 `python3 scripts/release_check.py v<버전>` 이 통과하면 태그 `v<버전>` 을 push 한다. `.github/workflows/release.yml` 이 같은 검사 뒤 PyPI(trusted publishing)와 GitHub 릴리스에 올린다. 산출물은 `uv build --out-dir <디렉터리>` 뒤 `python3 scripts/release_check.py v<버전> --dist <디렉터리>` 로 미리 볼 수 있다(빌드된 Version, PyPI 설명의 상대 링크, GitHub blob 페이지를 가리키는 이미지). README 이미지는 PyPI 에서도 보이게 `raw.githubusercontent.com` 절대 URL 로 건다(상대 경로는 치환으로 blob 페이지가 되어 깨진다). 태그 순서: PR 병합 → `git fetch` → `git tag v<버전> origin/main` → 그 커밋에서 `python3 scripts/release_check.py v<버전>` → `git push origin v<버전>`. squash 병합이라 브랜치의 커밋은 main 의 조상이 아니어서, 거기에 붙인 태그는 release.yml 의 조상 검사가 막는다.

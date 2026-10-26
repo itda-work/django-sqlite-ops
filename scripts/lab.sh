@@ -5,6 +5,7 @@
 #   scripts/lab.sh run [L1..L8|P1|P2|all]   # 시나리오(끝나면 down -v)
 #   scripts/lab.sh bench [pytest 인자]   # PRAGMA 벤치(끝나면 down -v)
 #   scripts/lab.sh soak [pytest 인자]    # fd·RSS 장시간 실행(#33, 끝나면 down -v)
+#   scripts/lab.sh dbconfig [pytest 인자] # Django 기본 대 권장 설정 비교(#83, 끝나면 down -v)
 #   scripts/lab.sh cache [mech] [인자]   # cache_size 최소 재현(mech: 원인 가설)을 Linux 컨테이너에서(#27, 끝나면 down -v)
 #   scripts/lab.sh down               # 이 랩의 컨테이너·볼륨·네트워크만 지운다
 #
@@ -90,9 +91,9 @@ case "$cmd" in
     stamp="$(date +%Y%m%d-%H%M%S)"
     sel="${1:-all}"
     if [[ "$sel" == all ]]; then
-      pytest_lab -m "not bench and not soak" 2>&1 | tee "$OUT/run-$stamp.log"
+      pytest_lab -m "not bench and not soak and not dbconfig" 2>&1 | tee "$OUT/run-$stamp.log"
     else
-      pytest_lab -m "not bench and not soak" -k "$sel" 2>&1 | tee "$OUT/run-$stamp.log"
+      pytest_lab -m "not bench and not soak and not dbconfig" -k "$sel" 2>&1 | tee "$OUT/run-$stamp.log"
     fi
     ;;
   bench)
@@ -106,6 +107,12 @@ case "$cmd" in
     build
     stamp="$(date +%Y%m%d-%H%M%S)"
     pytest_lab -m soak "$@" 2>&1 | tee "$OUT/soak-$stamp.log"
+    ;;
+  dbconfig)
+    trap down EXIT
+    build
+    stamp="$(date +%Y%m%d-%H%M%S)"
+    pytest_lab -m dbconfig "$@" 2>&1 | tee "$OUT/dbconfig-$stamp.log"
     ;;
   cache)
     # lab/cache_probe.py 를 랩 이미지의 Python·SQLite 로 돌린다(#27). DB 는 labapp 의 볼륨
@@ -132,7 +139,7 @@ case "$cmd" in
     down
     ;;
   *)
-    echo "사용법: $0 up | run [L1..L8|P1|P2|all] | bench | soak | cache | down" >&2
+    echo "사용법: $0 up | run [L1..L8|P1|P2|all] | bench | soak | dbconfig | cache | down" >&2
     exit 64
     ;;
 esac

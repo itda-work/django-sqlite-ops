@@ -22,6 +22,7 @@ x-app: &app
     LAB_HEALTH_CONFIG: ${LAB_HEALTH_CONFIG:-}
     LAB_PRAGMAS: ${LAB_PRAGMAS:-}
     LAB_CONN_MAX_AGE: ${LAB_CONN_MAX_AGE:-}
+    LAB_DB_CONFIG: ${LAB_DB_CONFIG:-}
     LAB_RENAME_DELAY: ${LAB_RENAME_DELAY:-}
     PYTHONPATH: ${LAB_PYTHONPATH:-}
     DJANGO_SETTINGS_MODULE: ${LAB_SETTINGS:-proj.settings}
@@ -66,6 +67,18 @@ services:
         hard: ${LAB_SOAK_NOFILE:-1048576}
     mem_limit: ${LAB_SOAK_MEM:-2g}
     memswap_limit: ${LAB_SOAK_MEM:-2g}
+
+  # 기본 대 권장 비교(#83): boot·Litestream 없이 migrate → uvicorn 만 띄운다. Litestream 은 복제를
+  # 시작할 때 DB 를 WAL 로 바꾸므로 Django 기본(rollback journal)을 재려면 빼야 한다(#83 에서 확인).
+  # 워커 수는 LAB_WORKERS(기본 1). 볼륨·이미지·설정 조각은 labapp 과 같다.
+  labapp-plain:
+    <<: *app
+    ports: ["127.0.0.1::8000"]
+    volumes: ["${LAB_VOLUME:-v01}:/data"]
+    entrypoint:
+      - sh
+      - -c
+      - python manage.py migrate --noinput && exec uvicorn proj.asgi:application --host 0.0.0.0 --port 8000 --workers ${LAB_WORKERS:-1}
 
   # 볼륨 없는 앱(무상태 교체, L1).
   labapp-nv:

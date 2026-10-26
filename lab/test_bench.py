@@ -121,10 +121,21 @@ def seed(stack, port: int) -> dict:
     return http_json("GET", port, "/lab/probe")
 
 
-def load(stack, e: dict, *, mode: str, duration: float, concurrency: int, seed_n: int, **kw):
+def load(
+    stack,
+    e: dict,
+    *,
+    mode: str,
+    duration: float,
+    concurrency: int,
+    seed_n: int,
+    url: str = "http://labapp:8000",
+    max_id: int = ROWS,
+    **kw,
+):
     argv = [
         "--url",
-        "http://labapp:8000",
+        url,
         "--mode",
         mode,
         "--duration",
@@ -132,7 +143,7 @@ def load(stack, e: dict, *, mode: str, duration: float, concurrency: int, seed_n
         "--concurrency",
         str(concurrency),
         "--max-id",
-        str(ROWS),
+        str(max_id),
         "--seed",
         str(seed_n),
     ]
