@@ -590,7 +590,12 @@ def test_p2_runner_spec_sets_late_for_every_channel_spec():
         got = c.runner_spec(spec)
         assert got["late"] is c.wants_late_check(spec), spec["id"]
         assert got["n"] == spec.get("n", 200), spec["id"]
+        # 원래 키는 그대로 두고(trials·layer·mode 등), 더하는 키는 n·late 뿐이다(#94 리뷰 P3-1)
+        assert {k: got[k] for k in spec} == spec, spec["id"]
+        assert set(got) == set(spec) | {"n", "late"}, spec["id"]
     assert {s["id"] for s in specs if c.runner_spec(s)["late"]} >= {"P-cancel", "D2-cap100"}
+    # spec 의 n 은 기본 200 이 덮지 않는다
+    assert c.runner_spec({**specs[0], "n": 50})["n"] == 50
 
 
 def test_p2_channels_passes_runner_spec_to_the_runner(tmp_path, monkeypatch):
