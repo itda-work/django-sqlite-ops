@@ -119,7 +119,7 @@ def test_unreleased_entries_fail(tmp_path):
         "## [Unreleased]\n", "## [Unreleased]\n\n- 아직 옮기지 않은 항목\n"
     )
     [problem] = release_check.problems(_project(tmp_path, changelog=text), None)
-    assert "still has entries under [Unreleased]" in problem
+    assert release_check.UNRELEASED_ENTRIES in problem
 
 
 def test_duplicate_version_section_fails(tmp_path):
@@ -150,7 +150,7 @@ def test_repository_itself_is_consistent():
     # 저장소의 pyproject·CHANGELOG 가 서로 맞는지. 릴리스 사이에는 [Unreleased] 에 항목이
     # 쌓이는 것이 정상이라 그 지적만 뺀다(릴리스 때는 release.yml 이 막는다, #91)
     found = release_check.problems(ROOT, None)
-    assert [p for p in found if "still has entries under [Unreleased]" not in p] == []
+    assert [p for p in found if release_check.UNRELEASED_ENTRIES not in p] == []
 
 
 # --dist: 빌드 산출물의 Version 과 PyPI 설명의 상대 링크 ------------------------------------

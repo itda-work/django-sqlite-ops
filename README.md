@@ -81,7 +81,7 @@ uv add "django-sqlite-ops==0.1.0a1"
 필수 의존성은 Django 하나다. 채널 레이어는 extra 로 고른다: `[nats]`(channels-nats), `[channels-lite]`(channels-lite 만. aio 레이어에 필요한 의존성은 [channels-lite 패치 '함정'](#channels-lite-패치)). **channels-nats 는 0.10.1 이상을 쓴다** — 0.10.0 이하는 구독 확인이 취소되면 그 워커가 채널 메시지를 더 받지 못한다([문제 해결 '채널 레이어'](#채널-레이어)). 다음 릴리스부터 `[nats]` 가 `channels-nats>=0.10.1` 을 요구한다(#91). 0.1.0a1 의 `[nats]` 는 하한이 없으므로 `channels-nats>=0.10.1` 을 함께 적는다. lock 파일에 0.10.0 이하가 잠겨 있으면 `uv lock --upgrade-package channels-nats` 처럼 그 패키지를 올린다.
 
 ```bash
-pip install "django-sqlite-ops[nats]==0.1.0a1"
+pip install "django-sqlite-ops[nats]==0.1.0a1" "channels-nats>=0.10.1"
 uv add "django-sqlite-ops[channels-lite]==0.1.0a1"
 ```
 
