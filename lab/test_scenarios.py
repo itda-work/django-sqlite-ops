@@ -26,10 +26,10 @@ from _checks import (
     max_sample_gap,
     quarantine_problems,
     runner_output,
+    runner_spec,
     spec_outcome,
     stale_dirs,
     template_fingerprint,
-    wants_late_check,
 )
 from _lab import OUT, RUN_ID, Stack, boot_lines, decision, http_json, log
 
@@ -275,8 +275,7 @@ def _p2_channels(stack: Stack, rec: dict) -> None:
 
     raw, results, problems = {}, {}, {}
     for spec in CHANNEL_SPECS:
-        spec = {"n": 200, **spec}
-        spec["late"] = wants_late_check(spec)
+        spec = runner_spec(spec)
         out, took, error = _run_channel_spec(stack, spec)
         if out is not None:
             raw[spec["id"]] = out

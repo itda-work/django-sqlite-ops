@@ -581,6 +581,46 @@ def test_p2_late_check_is_for_cancel_mode_only():
     assert not c.wants_late_check({"kind": "plain", "mode": "steady"})
 
 
+def test_p2_runner_spec_sets_late_for_every_channel_spec():
+    """러너는 ``late`` 키가 없으면 실패한다. ``runner_spec`` 이 모든 시나리오에 그 키를
+    넣는다(#94)."""
+    c = _checks()
+    specs = _lab_module("test_scenarios").CHANNEL_SPECS
+    for spec in specs:
+        got = c.runner_spec(spec)
+        assert got["late"] is c.wants_late_check(spec), spec["id"]
+        assert got["n"] == spec.get("n", 200), spec["id"]
+        # 원래 키는 그대로 두고(trials·layer·mode 등), 더하는 키는 n·late 뿐이다(#94 리뷰 P3-1)
+        assert {k: got[k] for k in spec} == spec, spec["id"]
+        assert set(got) == set(spec) | {"n", "late"}, spec["id"]
+    assert {s["id"] for s in specs if c.runner_spec(s)["late"]} >= {"P-cancel", "D2-cap100"}
+    # spec 의 n 은 기본 200 이 덮지 않는다
+    assert c.runner_spec({**specs[0], "n": 50})["n"] == 50
+
+
+def test_p2_channels_passes_runner_spec_to_the_runner(tmp_path, monkeypatch):
+    """``_p2_channels`` 가 러너에 ``runner_spec`` 을 거친 spec 을 넘긴다 — 배선 자체(#94)."""
+    scenarios = _lab_module("test_scenarios")
+    c = _checks()
+    sent = []
+
+    class FakeStack:
+        def compose(self, *args, **kwargs):
+            return type("R", (), {"out": json.dumps({"channels-nats": "0.10.1"})})()
+
+        def logs(self, service):
+            return ""
+
+    def fake_run(stack, spec):
+        sent.append(spec)
+        return {"spec": spec, "trials": []}, 0.0, None
+
+    monkeypatch.setattr(scenarios, "_run_channel_spec", fake_run)
+    monkeypatch.setattr(scenarios, "OUT", tmp_path)
+    scenarios._p2_channels(FakeStack(), {})
+    assert sent == [c.runner_spec(s) for s in scenarios.CHANNEL_SPECS]
+
+
 def _ready_trial(*workers, ready=True):
     return {**_trial(*workers), "ready": ready, "ready_s": 0.1 if ready else None,
             "probes_sent": 3}  # fmt: skip

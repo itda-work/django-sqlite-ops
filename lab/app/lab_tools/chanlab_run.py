@@ -11,8 +11,9 @@
 4. 수신이 멈출 때까지 기다리고, 꼬리 probe(용량 드롭 합계 로그용)를 보내 다시 기다린 뒤
    ``stop``(``keep`` 이면 남겨 둔다).
    ``late`` 면 stop 1초 뒤 다시 물어 stop 뒤의 nats 로그(``late_nats_log``)와 읽기 루프 상태를
-   붙인다. P2 가 ``_checks.wants_late_check``(``cancel`` 모드)로 정해 넘긴다. 취소된 구독 확인의
-   PONG 은 stop 뒤에 올 수 있다(#66 의 결함은 그때 났다).
+   붙인다. P2 가 ``_checks.runner_spec``(``cancel`` 모드면 참)으로 정해 넘긴다. 취소된 구독 확인의
+   PONG 은 stop 뒤에 올 수 있다(#66 의 결함은 그때 났다). ``late`` 키가 없으면 시도 전에 rc 1 로
+   끝난다(#94) — 배선이 빠졌을 때 재조회를 조용히 건너뛰지 않게 한다.
 5. ``close`` 면 ``await layer.close()`` 시간을 잰다. 아니면 닫지 않고 ``asyncio.run`` 을 끝낸다.
 
 시도가 ``TimeoutError`` 로 끝나면(준비 실패 등) 뒤 시도는 돌리지 않고, 그때까지의 ``trials`` 와
@@ -203,12 +204,14 @@ async def trial(layer, spec, index: int) -> dict:
     states = await settle(key, workers)
     if not spec.get("keep"):
         states = await each_worker("POST", "stop", workers, 60, key=key)
-        if spec.get("late"):
+        if spec["late"]:
             states = await late(key, workers, states)
     return {"key": key, **readiness, **sent, "workers": list(states.values())}
 
 
 async def main(spec: dict) -> dict:
+    if "late" not in spec:
+        sys.exit(f"spec {spec.get('id')!r} has no 'late' key (set it with _checks.runner_spec)")
     layer = get_channel_layer()
     out = {"spec": spec, "trials": []}
     for index in range(spec.get("trials", 1)):
