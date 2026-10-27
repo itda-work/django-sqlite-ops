@@ -6,7 +6,7 @@ build-backend = "hatchling.build"
 
 [project]
 name = "django-sqlite-ops"
-version = "0.1.0a1"
+version = "0.1.0a2"
 description = "[Experimental] Operations toolkit for running SQLite as a production database in Django"
 dynamic = ["readme"]
 license = "MIT"

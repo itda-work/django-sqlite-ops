@@ -2,13 +2,19 @@
 
 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/) 형식을 따르고, 버전은 [PEP 440](https://peps.python.org/pep-0440/) 으로 매긴다. 릴리스할 때 `[Unreleased]` 의 항목을 새 버전 절로 옮긴다(`scripts/release_check.py` 가 확인한다).
 
-> ⚠️ **실험적 프로젝트다.** 1.0 전에는 API·동작·지원 범위가 예고 없이 바뀔 수 있다. 사전 릴리스(`a`·`b`·`rc`)는 버전을 명시해 설치한다(`pip install "django-sqlite-ops==0.1.0a1"`). `--pre` 는 모든 의존성의 사전 릴리스까지 허용하므로 쓰지 않는다. 운영 환경에서는 버전을 고정한다.
+> ⚠️ **실험적 프로젝트다.** 1.0 전에는 API·동작·지원 범위가 예고 없이 바뀔 수 있다. 사전 릴리스(`a`·`b`·`rc`)는 버전을 명시해 설치한다(`pip install "django-sqlite-ops==0.1.0a2"`). `--pre` 는 모든 의존성의 사전 릴리스까지 허용하므로 쓰지 않는다. 운영 환경에서는 버전을 고정한다.
 
 ## [Unreleased]
+
+## [0.1.0a2] - 2026-10-27
+
+의존성 하한과 문서를 고친 사전 릴리스다. 패키지 코드(`django_sqlite_ops/`)는 0.1.0a1 과 같다. 저장소 안의 회귀 랩·CI 정비(#88·#90·#94)는 배포물에 들어가지 않으므로 여기 적지 않는다.
 
 ### Changed
 
 - **`[nats]` extra 가 `channels-nats>=0.10.1` 을 요구한다.** 0.10.0 이하에서는 구독 확인이 취소되거나 시간 초과되면 그 워커의 채널 수신이 예외 없이 멈춘다. 0.10.1 은 같은 API 의 패치 릴리스다 (#91·#88)
+- **README(PyPI 설명)를 고쳤다.** '왜 쓰는가' 절에 Django 기본 설정 대 권장 설정, `CONN_MAX_AGE` 의 실측 차트와 boot 의 실패 경계 L1–L8 표를 넣었다. 나빠진 지표와 재현되지 않은 이득도 함께 적는다 (#83). 문제 해결 '채널 레이어'의 channels-nats 결함 안내를 0.10.1 기준으로 고쳤다 (#88)
+- 배포 프로필 `single-server` 의 `requirements.txt` 예가 이 패키지를 PyPI 에서 받는다 (#84)
 
 ## [0.1.0a1] - 2026-10-26
 
@@ -30,5 +36,6 @@
 
 - 미검증 항목은 [DESIGN §12](docs/DESIGN.md#12-미검증확인-필요) 에 있다. 실제 클라우드 S3·R2·Tigris, Windows 의 boot CLI, ASGI 에서의 VFS 별칭 동작은 검증하지 않았다.
 
-[Unreleased]: https://github.com/itda-work/django-sqlite-ops/compare/v0.1.0a1...HEAD
+[Unreleased]: https://github.com/itda-work/django-sqlite-ops/compare/v0.1.0a2...HEAD
+[0.1.0a2]: https://github.com/itda-work/django-sqlite-ops/compare/v0.1.0a1...v0.1.0a2
 [0.1.0a1]: https://github.com/itda-work/django-sqlite-ops/releases/tag/v0.1.0a1
