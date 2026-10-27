@@ -37,7 +37,7 @@ Issues = "https://github.com/itda-work/django-sqlite-ops/issues"
 Changelog = "https://github.com/itda-work/django-sqlite-ops/blob/main/CHANGELOG.md"
 
 [project.optional-dependencies]
-nats = ["channels-nats"]
+nats = ["channels-nats>=0.10.1"]
 channels-lite = ["channels-lite"]
 
 # PyPI 설명은 README 그대로이되, 상대 파일 링크(`](docs/...)`)를 GitHub 절대 URL 로 바꾼다.

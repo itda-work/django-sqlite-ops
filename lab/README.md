@@ -65,7 +65,7 @@ ubuntu-latest(amd64)에서 `scripts/lab.sh run <선택>` 을 그대로 돌리고
 | 조각 | 문서 | 랩 |
 |---|---|---|
 | Dockerfile | `COPY requirements.txt .` | `COPY requirements.txt django_sqlite_ops-0.0.0-py3-none-any.whl ./` — 작업 트리에서 `uv build` 한 wheel 을 설치 전에 넣는다. **다른 줄은 같다** |
-| P2 이미지(#66) | multiproc §3 "`requirements.txt` 에 채널 레이어 패키지를 더한다. `[nats]` extra 로 넣어도 된다" | 위 이미지 위에 층 하나(`lab/nats.Dockerfile`): `requirements-nats.txt` = `django-sqlite-ops[nats] @ file:///app/<wheel>` + `channels-nats==0.10.1`(extra 가 판을 고정하지 않아 랩이 `build_context.CHANNELS_NATS` 로 고정). 문서 Dockerfile 은 그대로 |
+| P2 이미지(#66) | multiproc §3 "`requirements.txt` 에 채널 레이어 패키지를 더한다. `[nats]` extra 로 넣어도 된다" | 위 이미지 위에 층 하나(`lab/nats.Dockerfile`): `requirements-nats.txt` = `django-sqlite-ops[nats] @ file:///app/<wheel>` + `channels-nats==0.10.1`(extra 는 하한 `>=0.10.1` 만 두므로 랩이 `build_context.CHANNELS_NATS` 로 판을 고정, #91). 문서 Dockerfile 은 그대로 |
 | `requirements.txt` | `django-sqlite-ops==0.1.0a1` | `django-sqlite-ops @ file:///app/<wheel>` |
 | `litestream.yml` | `bucket: my-app-backups`, `path: app`, `endpoint: http://s3.internal:8333` | `bucket: dso-lab`, `path: ${LAB_PREFIX}`(Litestream 이 환경 변수를 펼친다), `endpoint: http://toxiproxy:18333` |
 | `settings.py`·`urls.py` | 조각 | 조각 그대로 + `lab/app/proj/*_tail.py`(SECRET_KEY·ALLOWED_HOSTS, `notes` 앱, 헬스 주기·grace·조회 설정, 벤치용 PRAGMA, 랩 뷰) |

@@ -31,6 +31,8 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 
 ALPHA = "Development Status :: 3 - Alpha"
+# [Unreleased] 에 항목이 남았다는 지적의 문구. 저장소 일관성 테스트가 이 지적만 거른다(#91)
+UNRELEASED_ENTRIES = "still has entries under [Unreleased]"
 # PEP 440 공개 버전(에포크·로컬 없음)의 정규화된 꼴만 받는다. 앞자리 0(`0.01`)은 정규형이 아니다.
 # 예: 0.1.0a1, 1.0.0rc2, 1.0.0.post1, 1.0.0.dev3
 _N = r"(?:0|[1-9]\d*)"
@@ -179,9 +181,7 @@ def problems(root: Path, tag: str | None) -> list[str]:
         # 아래쪽 링크 정의([x]: URL)는 절의 내용이 아니다
         body = re.sub(r"^\[[^\]]+\]: \S+$", "", body, flags=re.M)
         if body.strip():
-            found.append(
-                f"CHANGELOG.md still has entries under [Unreleased]; move them to [{version}]"
-            )
+            found.append(f"CHANGELOG.md {UNRELEASED_ENTRIES}; move them to [{version}]")
     return found
 
 
