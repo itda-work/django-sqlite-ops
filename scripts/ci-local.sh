@@ -8,6 +8,9 @@
 #   CI_ARCH=amd64 scripts/ci-local.sh        # GitHub 러너와 같은 amd64 (에뮬레이션이라 느리다)
 #
 # 기본 이미지와 아키텍처는 저장소 루트의 .actrc 에 있다.
+# ci.yml 만 돌린다(-W). act 는 push 의 branches·tags 필터를 보지 않는다(act 0.2.89). 그래서
+# ci.yml(branches: [main])이 브랜치에서도 돌고, -W 가 없으면 release.yml(tags: [v*])까지 돌아
+# 실패한다(#90). lab.yml 은 workflow_dispatch 전용이라 push 대상이 아니다.
 # act 는 Linux 컨테이너만 돌린다. macOS 잡(macos, 대소문자 무시 볼륨 테스트)은 여기서 돌지 않고
 # act 가 'Skipping unsupported platform' 으로 건너뛴다. 로컬 macOS 에서는
 #   REQUIRE_CASE_INSENSITIVE_FS=1 uv run pytest -rs
@@ -28,7 +31,7 @@ fi
 
 # 잡 안에서 Docker 를 쓰지 않으므로 소켓을 컨테이너에 마운트하지 않는다.
 # (회귀 랩 잡이 생기면 다시 본다. DESIGN §10)
-args=(push --container-daemon-socket -)
+args=(push -W .github/workflows/ci.yml --container-daemon-socket -)
 if [[ -n "${CI_ARCH:-}" ]]; then
   args+=(--container-architecture "linux/${CI_ARCH}")
 fi
