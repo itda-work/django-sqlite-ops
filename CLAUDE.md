@@ -51,7 +51,7 @@
 
 ## CI
 - GitHub Actions(`.github/workflows/ci.yml`)가 정본이다: lint(ruff) + Python 3.13/3.14 × Django 5.2/6.1 매트릭스 + `sqlite-floor`(Ubuntu 22.04 시스템 SQLite 3.37.2) + `litestream`(릴리스 .deb 로 설치한 실제 바이너리와 `channels-lite[aio]==0.4.0`. `REQUIRE_LITESTREAM=1`·`REQUIRE_CHANNELS_LITE=1` 이라 둘 중 하나가 없어 skip 되면 실패. channels-lite 테스트는 이 잡에서만 돈다). uv 의 Python 은 최신 SQLite 를 품고 있어 하한은 `sqlite-floor` 에서만 검사된다.
-- 로컬에서는 `scripts/ci-local.sh` 로 같은 워크플로를 act 로 돌린다(`lint`, `litestream`, `test <py> <django>` 로 좁힐 수 있다). `-W .github/workflows/ci.yml` 로 `ci.yml` 만 돈다. act 는 `on.push.tags` 를 거르지 않아 `-W` 가 없으면 브랜치에서도 `release.yml` 을 돌려 실패한다(#90, 2026-10-27 확인). 지원 범위를 바꾸면 이 매트릭스와 DESIGN §5 를 함께 고친다.
+- 로컬에서는 `scripts/ci-local.sh` 로 같은 워크플로를 act 로 돌린다(`lint`, `litestream`, `test <py> <django>` 로 좁힐 수 있다). `-W .github/workflows/ci.yml` 로 `ci.yml` 만 돈다. act 는 push 의 `branches`·`tags` 필터를 보지 않는다(act 0.2.89). 그래서 `ci.yml`(`branches: [main]`)이 브랜치에서도 돌고, `-W` 가 없으면 `release.yml`(`tags: [v*]`)까지 돌아 실패한다(#90, 2026-10-27 확인). 지원 범위를 바꾸면 이 매트릭스와 DESIGN §5 를 함께 고친다.
 - `macos` 잡(`macos-latest`, py3.14, Django 6.1)이 전체 테스트를 돈다. `REQUIRE_CASE_INSENSITIVE_FS=1` 이라 대소문자 무시 볼륨 전용 테스트(`ci_lab`)가 skip 되면 실패한다(#50). Linux 잡에서는 그 테스트가 skip 된다.
 - act 는 Linux 컨테이너만 돌린다. `macos` 잡은 `ci-local.sh` 에서 'unsupported platform' 으로 건너뛴다. 로컬 macOS 에서는 `REQUIRE_CASE_INSENSITIVE_FS=1 uv run pytest -rs` 로 대신한다.
 - 회귀 랩은 `.github/workflows/lab.yml`(`workflow_dispatch` 전용, ubuntu-latest amd64)로 따로 돈다: `gh workflow run lab.yml -f scenarios=all`. 기본 CI(push/PR) 밖이고, act 는 Docker 소켓을 넘기지 않으므로 `ci-local.sh` 대상이 아니다. 결과(`lab/.out/`)는 artifact 로 올라간다. 벤치는 돌리지 않는다.
