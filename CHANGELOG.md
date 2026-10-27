@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **`[nats]` extra 가 `channels-nats>=0.10.1` 을 요구한다.** 0.10.0 이하에서는 구독 확인이 취소되거나 시간 초과되면 그 워커의 채널 수신이 예외 없이 멈춘다. 0.10.1 은 같은 API 의 패치 릴리스다 (#91·#88)
+
 ## [0.1.0a1] - 2026-10-26
 
 첫 실험적 사전 릴리스다([D-28](docs/DECISIONS.md)). v0.1 범위([DESIGN §3-1](docs/DESIGN.md#3-범위))를 담는다. 지원 범위: Python 3.13·3.14, Django 5.2·6.1, SQLite 3.37.2 이상, Litestream 0.5.17. boot CLI 는 POSIX(Linux·macOS)만 지원한다.

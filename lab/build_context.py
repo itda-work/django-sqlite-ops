@@ -19,7 +19,8 @@ BUILD = LAB / ".build"
 PROFILES = ROOT / "docs" / "profiles"
 
 WHEEL_PLACEHOLDER = "<wheel>"
-# P2(#66) 이미지에 넣는 channels-nats 판. [nats] extra 는 판을 고정하지 않아 랩이 고정한다.
+# P2(#66) 이미지에 넣는 channels-nats 판. [nats] extra 는 하한(>=0.10.1, #91)만 두므로
+# 랩이 판을 고정한다.
 CHANNELS_NATS = "0.10.1"
 
 # (문서, 블록 고르기, 원문 줄, 바꾼 줄). 랩과 문서의 차이는 이 표가 전부다(lab/README.md).

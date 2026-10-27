@@ -147,8 +147,10 @@ def test_unnormalized_version_fails(tmp_path, version):
 
 
 def test_repository_itself_is_consistent():
-    # 저장소의 pyproject·CHANGELOG 가 지금 버전으로 릴리스할 수 있는 상태인지
-    assert release_check.problems(ROOT, None) == []
+    # 저장소의 pyproject·CHANGELOG 가 서로 맞는지. 릴리스 사이에는 [Unreleased] 에 항목이
+    # 쌓이는 것이 정상이라 그 지적만 뺀다(릴리스 때는 release.yml 이 막는다, #91)
+    found = release_check.problems(ROOT, None)
+    assert [p for p in found if "still has entries under [Unreleased]" not in p] == []
 
 
 # --dist: 빌드 산출물의 Version 과 PyPI 설명의 상대 링크 ------------------------------------
