@@ -188,7 +188,7 @@ ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 - `/data` 는 앱 사용자(`app`, uid 10001) 소유다. boot 는 그 안에 잠금·상태 파일·임시 복원 디렉터리를 만들고 격리할 때 rename 하므로, DB 파일뿐 아니라 디렉터리에도 쓰기 권한이 있어야 한다.
 - 이름 있는 빈 볼륨을 `/data` 에 처음 붙이면 Docker 가 이미지의 `/data` 내용을 볼륨으로 복사한다([Docker 문서](https://docs.docker.com/engine/storage/volumes/)). **소유자도 함께 넘어온다**: 새 볼륨의 `/data` 가 `10001:10001`(권한 755)이었다(회귀 랩 P1·P2, Docker 29.5.2). 바인드 마운트(`./data:/data`)는 복사가 일어나지 않으므로 호스트 디렉터리의 소유자를 uid 10001 로 맞춘다.
 
-`requirements.txt` 예. 패키지는 PyPI 에서 받는다(`0.1.0a2`, 배포 뒤 확인). 사전 릴리스는 버전을 명시해 설치한다. 실험적 프로젝트이므로 그 버전으로 고정해 둔다([README 설치](../../README.md#설치)):
+`requirements.txt` 예. 패키지는 PyPI 에서 받는다(`0.1.0a2`, 2026-10-28 배포 확인). 사전 릴리스는 버전을 명시해 설치한다. 실험적 프로젝트이므로 그 버전으로 고정해 둔다([README 설치](../../README.md#설치)):
 
 ```text
 django-sqlite-ops==0.1.0a2
