@@ -10,11 +10,8 @@
    보낸다(``sender: worker``, 수신 워커가 아닌 쪽).
 4. 수신이 멈출 때까지 기다리고, 꼬리 probe(용량 드롭 합계 로그용)를 보내 다시 기다린 뒤
    ``stop``(``keep`` 이면 남겨 둔다).
-   ``may_not_ready`` 면 준비 기한(``ready_deadline``)을 넘겨도 실패하지 않고 ``ready: false`` 로
-   남긴다(본 메시지는 보내지 않는다).
-   ``defect_ok`` 면 stop 1초 뒤 다시 물어 stop 뒤의 nats 로그(``late_nats_log``)와 읽기 루프
-   상태를 붙인다. ``layer_per_trial`` 이면 시도마다 ``<layer>-<번호>`` 레이어 인스턴스를 새로 쓴다
-   (한 시도의 결함이 다음 시도로 번지지 않게).
+   ``mode: cancel`` 이면 stop 1초 뒤 다시 물어 stop 뒤의 nats 로그(``late_nats_log``)와 읽기 루프
+   상태를 붙인다. 취소된 구독 확인의 PONG 은 stop 뒤에 올 수 있다(#66 의 결함은 그때 났다).
 5. ``close`` 면 ``await layer.close()`` 시간을 잰다. 아니면 닫지 않고 ``asyncio.run`` 을 끝낸다.
 
 판정은 하지 않는다(``lab/_checks.py`` 의 ``delivery_problems``).
@@ -85,8 +82,6 @@ async def ready(layer, spec, key, channels, workers) -> dict:
         if all(s["probes"] > 0 for s in states.values()):
             return {"ready": True, "ready_s": round(time.monotonic() - t0, 3), "probes_sent": sent}
         if time.monotonic() > end:
-            if spec.get("may_not_ready"):
-                return {"ready": False, "ready_s": None, "probes_sent": sent}
             detail = {
                 pid: {
                     "probes": st["probes"],
@@ -187,19 +182,9 @@ async def trial(layer, spec, index: int) -> dict:
     params["timeout"] = spec.get("timeout")
     params["capacity"] = spec.get("capacity")
     params["layer"] = spec.get("layer")
-    if spec.get("layer_per_trial"):
-        params["layer"] = f"{spec['layer']}-{index}"
     started = await each_worker("POST", "listen", workers, 60, **params)
     channels = {pid: s["channel"] for pid, s in started.items()}
     readiness = await ready(layer, spec, key, channels, workers)
-    if not readiness["ready"]:
-        # 준비되지 않은 채 끝나도 되는 시나리오(알려진 결함). 본 메시지는 보내지 않는다.
-        states = await each_worker("POST", "stop", workers, 60, key=key)
-        if spec.get("defect_ok"):
-            states = await late(key, workers, states)
-        now = time.monotonic()
-        return {"key": key, **readiness, "t0": now, "t1": now, "errors": [], "senders": [],
-                "workers": list(states.values())}  # fmt: skip
     if spec.get("sender", "process") == "worker":
         sent = await send_from_worker(spec, key, channels)
     else:
@@ -212,7 +197,7 @@ async def trial(layer, spec, index: int) -> dict:
     states = await settle(key, workers)
     if not spec.get("keep"):
         states = await each_worker("POST", "stop", workers, 60, key=key)
-        if spec.get("defect_ok"):
+        if spec.get("mode") == "cancel":
             states = await late(key, workers, states)
     return {"key": key, **readiness, **sent, "workers": list(states.values())}
 

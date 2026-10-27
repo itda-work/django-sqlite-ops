@@ -47,7 +47,7 @@ PID 1 boot → exec → litestream replicate -exec "..."            nats-server
 
 ## 3. 설정 조각
 
-`litestream.yml`, Dockerfile 은 [`single-server` §3](single-server.md#3-설정-조각) 과 같다(Dockerfile 은 회귀 랩에서 종단 검증함). `requirements.txt` 에 채널 레이어 패키지를 더한다(`channels-nats` 또는 `channels-redis`). 이 패키지의 `[nats]` extra 로 넣어도 된다.
+`litestream.yml`, Dockerfile 은 [`single-server` §3](single-server.md#3-설정-조각) 과 같다(Dockerfile 은 회귀 랩에서 종단 검증함). `requirements.txt` 에 채널 레이어 패키지를 더한다(`channels-nats` 또는 `channels-redis`). 이 패키지의 `[nats]` extra 로 넣어도 된다. channels-nats 는 `channels-nats>=0.10.1` 로 적는다 — 0.10.0 이하는 구독 확인이 취소되면 그 워커의 연결이 읽기를 멈춘다(§5). `[nats]` extra 는 판을 고정하지 않는다.
 
 ### `settings.py` — channels-nats (추천)
 
@@ -133,7 +133,7 @@ exec python -m django_sqlite_ops.boot \
 
 ### `compose.yaml` (예)
 
-> **종단 검증함**(회귀 랩 P2): 이 파일 그대로에 이미지 이름·라벨·호스트 포트를 덮고 `WEB_WORKERS=2`·nats 이미지 태그 고정으로 띄웠다. 앱이 워커 2개(서로 다른 PID)로 응답하고, `sqlite_doctor` 가 exit 0·`channels_nats.NatsChannelLayer` OK 였다. **정정(2026-10-26)**: 2026-10-08 의 이 검증은 nats 컨테이너 없이 돌았다 — 랩이 앱을 `--no-deps` 로 띄워 `depends_on` 이 무시됐고, channels-nats 를 설치하지 않아 아무것도 실패하지 않았다(#66 에서 재현). 2026-10-26 부터는 nats 를 먼저 띄우고 channels-nats 0.10.0(`[nats]` extra)을 넣은 이미지로 워커 사이 전달을 확인한다: 그룹·전용 채널 워커마다 200/200, 일반 채널 큐 그룹 합 200·중복 0, 수신 루프를 남긴 채 stop exit 0·0.74초([`lab-2026-10-26-multiproc-nats.md`](../research/lab-2026-10-26-multiproc-nats.md)). 두 `settings.py` 조각과 `entrypoint.sh` 의 검증 범위는 [`single-server` §3](single-server.md#3-설정-조각) 표와 같다.
+> **종단 검증함**(회귀 랩 P2): 이 파일 그대로에 이미지 이름·라벨·호스트 포트를 덮고 `WEB_WORKERS=2`·nats 이미지 태그 고정으로 띄웠다. 앱이 워커 2개(서로 다른 PID)로 응답하고, `sqlite_doctor` 가 exit 0·`channels_nats.NatsChannelLayer` OK 였다. **정정(2026-10-26)**: 2026-10-08 의 이 검증은 nats 컨테이너 없이 돌았다 — 랩이 앱을 `--no-deps` 로 띄워 `depends_on` 이 무시됐고, channels-nats 를 설치하지 않아 아무것도 실패하지 않았다(#66 에서 재현). 2026-10-26 부터는 nats 를 먼저 띄우고 channels-nats(`[nats]` extra, 2026-10-26 0.10.0 · 2026-10-27 부터 0.10.1)를 넣은 이미지로 워커 사이 전달을 확인한다: 그룹·전용 채널 워커마다 200/200, 일반 채널 큐 그룹 합 200·중복 0, 수신 루프를 남긴 채 stop exit 0·0.74초([`lab-2026-10-26-multiproc-nats.md`](../research/lab-2026-10-26-multiproc-nats.md)). 두 `settings.py` 조각과 `entrypoint.sh` 의 검증 범위는 [`single-server` §3](single-server.md#3-설정-조각) 표와 같다.
 
 ```yaml
 services:
@@ -206,10 +206,11 @@ SQLite 기반 채널 레이어(channels-lite)는 **추천하지 않는다**. 폴
 - **channels-nats 는 수신자가 생기기 전의 메시지를 버린다.** `ChannelFull` 도 나지 않는다(§3 의미론 표). 이 차이에 기대는 코드는 channels_redis 가 맞다.
 - **브로커를 앱과 같은 `-exec` 에 넣지 않는다**(§2).
 - **한 번에 `capacity`(기본 100)보다 많이 몰아 보내면 받는 쪽이 버린다.** 경고는 60초에 한 번이라 첫 줄("1 message(s) dropped so far")만 보면 손실을 과소평가한다. 합계는 "has room again after dropping N" 줄이다(재현함, #66).
-- **구독 확인이 취소되거나 시간 초과되면 그 워커의 레이어 연결이 읽기를 멈춘다.** 구독 확인은 `new_channel`·`group_add`·일반 채널 첫 `receive` 가 기다리는 것이다. nats-py 2.16.0 의 읽기 루프가 끝나 그 연결은 아무것도 받지 못하고(로그 `nats: encountered error … InvalidStateError`), 그 뒤의 `new_channel`·`group_add` 도 예외 없이 성공한다.
-  - 일반 채널을 `wait_for` 로 폴링하는 것이 그 한 예다. 1ms 는 매번, 10ms 도 6회 중 1회 재현했다(랩 RTT 약 0.25ms, 2026-10-26 확인, #66). 안전한 폴링 간격은 없다. 일반 채널은 폴링하지 말고 계속 `receive` 한다.
-  - nats-py 의 flush 타임아웃(10초)과 레이어 `publish_deadline`(10초)도 같은 경로다. 브로커가 그보다 오래 멈췄다 살아나면 일어난다(코드상 확인).
-  - 상류 처리는 [이관 문서](../research/handoff-marco-nats-flush-cancel.md).
+- **channels-nats 는 0.10.1 이상을 쓴다.** 0.10.0 이하에서는 구독 확인이 취소되거나 시간 초과되면 그 워커의 레이어 연결이 읽기를 멈춘다. 구독 확인은 `new_channel`·`group_add`·일반 채널 첫 `receive` 가 기다리는 것이다. nats-py 2.16.0 의 읽기 루프가 끝나 그 연결은 아무것도 받지 못하고(로그 `nats: encountered error … InvalidStateError`), 그 뒤의 `new_channel`·`group_add` 도 예외 없이 성공한다.
+  - 0.10.0 에서 일반 채널을 `wait_for` 로 폴링하면 1ms 는 매번, 10ms 도 6회 중 1회 재현했다(랩 RTT 약 0.25ms, 2026-10-26, #66). nats-py 의 flush 타임아웃(10초)과 레이어 `publish_deadline`(10초)도 같은 경로다(브로커가 그보다 오래 멈췄다 살아날 때).
+  - 0.10.1 은 nats-py 2.16.0 이하일 때 상류 수정(nats-py PR #1031, 병합·미릴리스)과 같은 패치를 넣는다. 랩 P2 에서 1ms·10ms 폴링 뒤에도 같은 연결이 그룹 메시지를 200/200 받았다(재현함, #88, 2026-10-27). 세 경로는 channels-nats 저장소의 회귀 테스트가 본다.
+  - 0.10.1 에서도 일반 채널 폴링은 두 폴링 사이의 메시지를 잃는다(계약). 일반 채널은 폴링하지 말고 계속 `receive` 한다.
+  - 경위는 [이관 문서](../research/handoff-marco-nats-flush-cancel.md).
 - **컨테이너를 늘려 확장하지 않는다.** 워커 수로 늘린다(§3 compose).
 - **열린 파일 한도는 워커마다 따로다.** 컨테이너에 준 `nofile` 을 워커 프로세스가 각각 물려받는다. 설정·확인·계산은 [fd 한도 가이드](fd-limits.md).
 - **VFS 읽기 복제본은 예정(2단계)이다**([DESIGN §3-2](../DESIGN.md)).

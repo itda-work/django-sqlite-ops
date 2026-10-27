@@ -65,7 +65,7 @@ ubuntu-latest(amd64)에서 `scripts/lab.sh run <선택>` 을 그대로 돌리고
 | 조각 | 문서 | 랩 |
 |---|---|---|
 | Dockerfile | `COPY requirements.txt .` | `COPY requirements.txt django_sqlite_ops-0.0.0-py3-none-any.whl ./` — 작업 트리에서 `uv build` 한 wheel 을 설치 전에 넣는다. **다른 줄은 같다** |
-| P2 이미지(#66) | multiproc §3 "`requirements.txt` 에 채널 레이어 패키지를 더한다. `[nats]` extra 로 넣어도 된다" | 위 이미지 위에 층 하나(`lab/nats.Dockerfile`): `requirements-nats.txt` = `django-sqlite-ops[nats] @ file:///app/<wheel>` + `channels-nats==0.10.0`(extra 가 판을 고정하지 않아 랩이 `build_context.CHANNELS_NATS` 로 고정). 문서 Dockerfile 은 그대로 |
+| P2 이미지(#66) | multiproc §3 "`requirements.txt` 에 채널 레이어 패키지를 더한다. `[nats]` extra 로 넣어도 된다" | 위 이미지 위에 층 하나(`lab/nats.Dockerfile`): `requirements-nats.txt` = `django-sqlite-ops[nats] @ file:///app/<wheel>` + `channels-nats==0.10.1`(extra 가 판을 고정하지 않아 랩이 `build_context.CHANNELS_NATS` 로 고정). 문서 Dockerfile 은 그대로 |
 | `requirements.txt` | `django-sqlite-ops==0.1.0a1` | `django-sqlite-ops @ file:///app/<wheel>` |
 | `litestream.yml` | `bucket: my-app-backups`, `path: app`, `endpoint: http://s3.internal:8333` | `bucket: dso-lab`, `path: ${LAB_PREFIX}`(Litestream 이 환경 변수를 펼친다), `endpoint: http://toxiproxy:18333` |
 | `settings.py`·`urls.py` | 조각 | 조각 그대로 + `lab/app/proj/*_tail.py`(SECRET_KEY·ALLOWED_HOSTS, `notes` 앱, 헬스 주기·grace·조회 설정, 벤치용 PRAGMA, 랩 뷰) |
@@ -73,15 +73,14 @@ ubuntu-latest(amd64)에서 `scripts/lab.sh run <선택>` 을 그대로 돌리고
 | compose (P1·P2) | 그대로 | override: 이미지 이름, 라벨, 포트 `127.0.0.1::8000`(문서의 `8000:8000` 은 다른 서비스와 겹칠 수 있다), `LAB_PREFIX`·`BOOT_FLAGS` 주입. P2 는 `WEB_WORKERS=2`, nats 이미지 고정, 이미지 `dso-lab-app-nats` |
 | 기동 순서 (P2) | `depends_on: [nats]` | 앱은 `up --no-deps` 로 띄우므로 시나리오가 `up -d nats` 를 먼저 한다(문서 §4 '브로커를 먼저 띄운다'). **#66 전의 P2 는 nats 없이 돌았다**(2026-10-26 재현) |
 
-P2 는 channels-nats 를 넣은 이미지로 워커 사이 채널 전달을 런타임에 확인한다(#66). 수신은 uvicorn 워커의 비동기 뷰(`notes/chanlab.py`, `/lab/chan/listen·state·stop·send`), 시나리오 실행은 앱 컨테이너 안 별도 프로세스(`lab_tools/chanlab_run.py`), 판정은 `_checks.delivery_problems`(순수 함수)다. `/lab/chan/tasks` 는 워커 이벤트 루프의 asyncio 태스크 스택을 돌려주는 진단 뷰다(시나리오는 부르지 않는다. 알려진 결함의 원인을 이것으로 좁혔다).
+P2 는 channels-nats 를 넣은 이미지로 워커 사이 채널 전달을 런타임에 확인한다(#66). 수신은 uvicorn 워커의 비동기 뷰(`notes/chanlab.py`, `/lab/chan/listen·state·stop·send`), 시나리오 실행은 앱 컨테이너 안 별도 프로세스(`lab_tools/chanlab_run.py`), 판정은 `_checks.delivery_problems`(순수 함수)다. `/lab/chan/tasks` 는 워커 이벤트 루프의 asyncio 태스크 스택을 돌려주는 진단 뷰다(시나리오는 부르지 않는다. #66 의 읽기 루프 결함 원인을 이것으로 좁혔다).
 
 ## 시나리오
 
 | ID | 하는 일 | 확인 |
 |---|---|---|
 | P1 | single-server 문서 compose 로 빈 볼륨 소유자 → `check --deploy` → `--init-new` 첫 부팅 → doctor → 400건 쓰고 바로 `docker stop` → 같은 볼륨 재부팅 | 소유자 10001, `sqlite_ops.*` 없음, doctor exit 0, exit 0·복제 400/400, `match` |
-| P2 | 위와 같고 uvicorn 워커 2, nats 먼저. doctor 뒤 채널 시나리오(아래), 마지막 `LIVE` 수신 루프를 남긴 채 `docker stop` | 위 + 응답한 PID 2개, doctor 의 channels 줄, channels-nats 0.10.0, 채널 시나리오 문제 0, stop 30초 grace 안(exit 0) |
-| P2 결함 | `test_P2_nats_flush_cancel_known_defect`, **strict xfail**: 별도 레이어 인스턴스로 일반 채널을 1ms `wait_for` 폴링 → 같은 인스턴스로 그룹 수신 → 기본 레이어로 그룹 수신 | 기본 레이어는 200/200(격리 단언). 같은 인스턴스가 준비되지 않고 `InvalidStateError` 가 로그에 있으면 `NatsFlushCancelDefect`(xfail). 결함이 고쳐지면 XPASS 로 실패한다([이관](../docs/research/handoff-marco-nats-flush-cancel.md)) |
+| P2 | 위와 같고 uvicorn 워커 2, nats 먼저. doctor 뒤 채널 시나리오(아래), 마지막 `LIVE` 수신 루프를 남긴 채 `docker stop` | 위 + 응답한 PID 2개, doctor 의 channels 줄, channels-nats 0.10.1, 채널 시나리오 문제 0, stop 30초 grace 안(exit 0) |
 | L1 | 볼륨 A 로 200건 → 볼륨 없는 새 컨테이너 | `fresh` → 복원, 200건, 이어 쓴 것도 복제 |
 | L2 | A 50건 → B 가 복원해 150건 → A 로 재부팅 | exit 2 `remote_ahead`, 복제본 TXID·150건 그대로, A 무변경 |
 | L3 | 정상 종료 뒤 로컬 메타 디렉터리만 삭제 | exit 2 `no_local_meta`, DB 무변경 |
@@ -101,21 +100,16 @@ P2 채널 시나리오(`CHANNEL_SPECS`, N=200, 수신 워커 2). 준비 확인: 
 | G-steady·G-cancel·G-worker | 그룹, 계속 / `wait_for` 1ms / 송신이 워커 | `each`: 워커마다 0..199 를 한 번씩 순서대로 |
 | S-steady·S-cancel·S-worker | 프로세스 전용 채널 1:1(워커 → 다른 워커 포함) | `each` + 송신 PID ≠ 수신 PID |
 | P-steady | 일반 채널 큐 그룹 | `split`: 합이 한 번씩, 두 워커 모두 > 0 |
-| P-cancel → P-cancel-after | 일반 채널 10ms 폴링(별도 레이어 인스턴스 `pcancel10`) → 같은 인스턴스로 그룹 | `lossy`(손실 허용, 중복·용량 드롭 0, 알려진 결함은 기록) → `each`. P-cancel 에서 결함이 났으면 P-cancel-after 는 건너뛰고 결과와 러너 로그(`skipped (known defect in P-cancel)`)에 남긴다 |
+| P-cancel → P-cancel-after | 일반 채널 10ms 폴링(별도 레이어 인스턴스 `pcancel10`) → 같은 인스턴스로 그룹 | `lossy`(손실 허용, 중복·용량 드롭 0) → `each`(폴링한 연결이 계속 받는다) |
+| P-cancel-1ms → P-cancel-1ms-after | 같은 꼴을 1ms 폴링으로(인스턴스 `pcancel1`). #88 전의 strict xfail `test_P2_nats_flush_cancel_known_defect` 를 옮긴 것 | 위와 같다 |
 | BURST | 그룹, 간격 0 | `drops`: 워커마다 손실 = 로그의 드롭 수 |
 | NOCLOSE | 그룹, 송신 프로세스가 `close()` 없이 끝남 | `each`, 실행기 rc 0 |
-| D2-cap100·D2-cap1000 | D2 와 같은 꼴(일반 채널, 0.5초 폴링, 버스트 200) × `LAB_D2_TRIALS`(20), 수신 `capacity` 100 / 1000. 시도마다 새 레이어 인스턴스(`d2cap100-<번호>` 등) | `record`: 중복·모르는 id 0 만. 손실·알려진 결함은 기록 |
+| D2-cap100·D2-cap1000 | D2 와 같은 꼴(일반 채널, 0.5초 폴링, 버스트 200) × `LAB_D2_TRIALS`(20), 수신 `capacity` 100 / 1000. 시도 전부가 한 레이어 인스턴스(`d2cap100`·`d2cap1000`, 연결 하나)를 쓴다 | `record`: 중복·모르는 id 0. 손실은 기록. 한 시도에서 연결이 죽으면 뒤 시도가 준비 실패로 드러난다 |
 | LIVE | 그룹, 수신을 남겨 둔다 | `each`, 이어서 `docker stop` |
 
-모든 시나리오는 송신·수신 예외 0 이어야 하고, 워커 로그에 nats-py 읽기 루프 오류(`nats: encountered error`)가 없어야 한다. 원자료는 `lab/.out/chan-<시각>.json`.
+모든 시나리오는 송신·수신 예외 0 이고 준비가 끝나야 한다. 워커마다 nats-py 읽기 루프 오류 줄(`nats: encountered error`)이 없고, 그 워커가 쓴 레이어 인스턴스의 읽기 루프가 살아 있어야 한다(`read_loop_alive` 가 False 면 실패 — 로그 줄 없이 끝난 경우도 잡는다. 값은 `notes/chanlab.py` 가 channels-nats·nats-py 내부를 읽어 낸다). `mode: cancel` 시나리오는 stop 1초 뒤 다시 물어 늦게 온 줄(`late_nats_log`)과 읽기 루프 상태를 본다 — 취소된 구독 확인의 PONG 은 stop 뒤에 올 수 있다. 원자료는 `lab/.out/chan-<시각>.json`.
 
-예외는 `defect_ok` 를 단 시나리오(P-cancel·D2 두 판, 모두 별도 레이어 인스턴스) 하나다(#66 재개 2). 알려진 결함([이관 문서](../docs/research/handoff-marco-nats-flush-cancel.md): 구독 확인이 취소되면 nats-py 읽기 루프가 `InvalidStateError` 로 끝남)은 판정을 좁게 잡는다.
-- 결함으로 세는 경우: 한 워커의 읽기 루프 오류 줄이 **모두** `InvalidStateError` 이고, 그 워커가 쓴 레이어 인스턴스의 읽기 루프가 실제로 끝났을 때(`read_loop_alive` 가 False)만이다. stop 1초 뒤 다시 물어 늦게 온 줄(`late_nats_log`)과 읽기 루프 상태를 본다. nats 로그는 워커 프로세스 전역이라 다른 인스턴스의 늦은 줄이 섞일 수 있어 읽기 루프 상태로 묶는다(#66 리뷰 P3-2).
-- 면제는 워커 단위다. 한 워커의 결함은 다른 워커의 오류를 넘기지 않는다. 다만 준비 실패(`may_not_ready`)는 시도 단위로, 결함 워커가 하나라도 있는 시도면 넘긴다(일반 채널 큐 그룹은 한 워커가 죽으면 준비가 어차피 실패해 워커별로 가를 수 없다).
-- `defect_ok` 는 `layer` 를 단 스펙에만 둘 수 있다(`_checks.channel_spec_problems`, P2 첫머리에서 검사).
-- 결함이 난 시도도 실패인 것: 중복·모르는 id·용량 드롭·합 > N·송수신 예외, 다른 예외로 끝난 읽기 루프, 결함 없는 준비 실패.
-- 기록: 결과의 `channel_known_defects`(시나리오별 시도 수, 결함이 난 시도·워커 PID). 워커별 `read_loop_alive`(nats-py `_reading_task` 상태, 진단용)도 남는다.
-- 기본 레이어를 쓰는 시나리오(LIVE 등)에는 예외가 없다.
+면제는 없다. #88 전(channels-nats 0.10.0)에는 구독 확인이 취소되면 nats-py 읽기 루프가 `InvalidStateError` 로 끝나는 결함([이관 문서](../docs/research/handoff-marco-nats-flush-cancel.md))이 있어, 1ms 판을 strict xfail 로, P-cancel·D2 를 `defect_ok`(결함 기록만, 시도마다 새 인스턴스)로 두었다. 0.10.1 로 올리자 xfail 이 XPASS 로 알렸고(2026-10-27) 그 장치를 걷어 냈다. 폴링 시나리오는 여전히 별도 레이어 인스턴스를 쓴다 — 회귀가 나도 기본 레이어를 쓰는 시나리오(LIVE 등)로 번지지 않고 그 시나리오의 `-after` 에서 드러난다.
 
 L8 은 `LAB_HEALTH_REFRESH=2`, `LAB_HEALTH_GRACE=10` 으로 줄여 돈다(기본 15·60초면 20초 끊김이 grace 안에 든다). 헬스의 원격 조회 타임아웃은 `boot/litestream.py` 의 `DEFAULT_LTX_TIMEOUT`(30초)이고 `HEALTH` 설정으로 바꿀 수 없다(2026-10-25 확인). L8c·L8d 가 각각 약 2분 30초 걸린다.
 
