@@ -78,7 +78,7 @@ pip install "django-sqlite-ops==0.1.0a1"
 uv add "django-sqlite-ops==0.1.0a1"
 ```
 
-필수 의존성은 Django 하나다. 채널 레이어는 extra 로 고른다: `[nats]`(channels-nats), `[channels-lite]`(channels-lite 만. aio 레이어에 필요한 의존성은 [channels-lite 패치 '함정'](#channels-lite-패치)).
+필수 의존성은 Django 하나다. 채널 레이어는 extra 로 고른다: `[nats]`(channels-nats), `[channels-lite]`(channels-lite 만. aio 레이어에 필요한 의존성은 [channels-lite 패치 '함정'](#channels-lite-패치)). `[nats]` 는 channels-nats 의 판을 고정하지 않는다. **channels-nats 는 0.10.1 이상을 쓴다** — 0.10.0 이하는 구독 확인이 취소되면 그 워커가 채널 메시지를 더 받지 못한다([문제 해결 '채널 레이어'](#채널-레이어)). 이미 잠근 판이 있으면 `channels-nats>=0.10.1` 을 함께 적는다.
 
 ```bash
 pip install "django-sqlite-ops[nats]==0.1.0a1"
@@ -911,7 +911,7 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 - 한 번만 쓰는 boot 옵션(`--init-new`·`--adopt-existing`·`--on-unknown restore`)은 이미지에 굳히지 않고 `BOOT_FLAGS` 환경 변수로 넘긴 뒤 비운다.
 - 열린 파일 한도(`nofile`)의 확인·설정(Docker `--ulimit`, compose `ulimits`, systemd `LimitNOFILE=`)·계산법은 두 프로필 공통 문서 [docs/profiles/fd-limits.md](docs/profiles/fd-limits.md) 에 있다. 프로필 compose 예에는 `ulimits` 를 넣지 않았다(이유는 그 문서 §6).
 - `settings.py`·`urls.py` 조각은 테스트가 실행하고 `check --deploy` 를 통과하는지 본다. `litestream.yml` 은 실제 litestream 0.5.17 이 읽는지, `entrypoint.sh` 는 문법을 본다. Dockerfile·compose 는 회귀 랩이 문서 블록을 그대로 꺼내 빌드하고 띄워 종단 검증했다(첫 배포, `check --deploy`, `sqlite_doctor`, `docker stop` 시 exit 0·복제 400/400, 빈 볼륨 소유자 복사, 워커 2개 — [결과](docs/research/lab-2026-10-08.md)). multiproc 은 channels-nats(`[nats]` extra)를 넣어 워커 사이 전달도 랩에서 확인했다(2026-10-26, 아래). 2026-10-08 의 multiproc 검증은 랩이 nats 컨테이너를 띄우지 않은 채 돈 것이었다.
-- **multiproc 채널 전달(랩 P2, 2026-10-26, channels-nats 0.10.0, uvicorn 워커 2)**: 그룹·프로세스 전용 채널은 워커마다 200/200(워커 → 워커 포함), 일반 채널 큐 그룹은 합 200·중복 0. 수신 루프를 남긴 채 `docker stop` 이 exit 0·0.74초로 끝났다. 손실은 계약대로 두 곳에서만 났다: 일반 채널을 `wait_for` 로 폴링할 때 두 폴링 사이(10ms 폴링에서 16/200), 받는 쪽 mailbox 가 `capacity`(기본 100)를 넘칠 때(간격 없는 버스트 200건). 보내는 쪽에는 어느 쪽도 예외가 없다. 아래 '채널 레이어' 함정 두 줄을 본다([결과](docs/research/lab-2026-10-26-multiproc-nats.md)).
+- **multiproc 채널 전달(랩 P2, 2026-10-26 channels-nats 0.10.0, 2026-10-27 0.10.1 로 다시 확인, uvicorn 워커 2)**: 그룹·프로세스 전용 채널은 워커마다 200/200(워커 → 워커 포함), 일반 채널 큐 그룹은 합 200·중복 0. 수신 루프를 남긴 채 `docker stop` 이 exit 0·0.74초로 끝났다. 손실은 계약대로 두 곳에서만 났다: 일반 채널을 `wait_for` 로 폴링할 때 두 폴링 사이(10ms 폴링에서 16/200), 받는 쪽 mailbox 가 `capacity`(기본 100)를 넘칠 때(간격 없는 버스트 200건). 보내는 쪽에는 어느 쪽도 예외가 없다. 0.10.1 에서는 1ms·10ms 폴링 뒤에도 같은 연결이 그룹 메시지를 200/200 받는다(#88, 2026-10-27). 아래 '채널 레이어' 함정을 본다([결과](docs/research/lab-2026-10-26-multiproc-nats.md)).
 
 ## 문제 해결
 
@@ -977,7 +977,7 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 | channels-lite aio 레이어에서 한 메시지가 두 수신자에게 배달된다 | 선점 성공을 누적 `total_changes` 로 판정한다 | `SQLITE_OPS["PATCH_CHANNELS_LITE_AIO"] = True`([channels-lite 패치](#channels-lite-패치)) | 재현함(#8) |
 | 새 채널 DB 에 여러 프로세스가 처음 붙을 때 `database is locked` | 여러 연결이 동시에 처음 `journal_mode=WAL` 로 바꾸면 일부가 실패한다(원인 미확정) | `migrate` 직후 채널 DB 를 미리 WAL 로 바꿔 둔다 | 재현함(#8) |
 | 버스트로 보낸 메시지 일부가 사라지는데 경고는 "1 message(s) dropped so far" 한 줄뿐이다 | channels-nats 는 받는 쪽 mailbox 가 `capacity`(기본 100)를 넘치면 버린다(`ChannelFull` 없음). 경고는 60초에 한 번으로 묶이고 합계는 자리가 난 뒤 다음 메시지가 올 때 "has room again after dropping N" 으로 나온다 — 첫 줄만 보면 과소평가한다(실측 1줄 / 실제 1–16건) | 합계 줄을 본다. 한 번에 몰아 보내는 양이 `capacity` 를 넘으면 `capacity` 를 올리거나 나눠 보낸다. channels-nats D2 실측의 196/200 도 같은 모양이라 이것으로 본다(추론) | 재현함(#66) |
-| 한 워커가 채널 메시지를 하나도 받지 못한다. 로그에 `nats: encountered error … InvalidStateError` | 구독 확인(`new_channel`·`group_add`·일반 채널 첫 `receive`)이 취소되거나 시간 초과되면 nats-py 2.16.0 의 읽기 루프가 끝나 그 연결이 그룹 메시지까지 받지 못한다. 그 뒤의 `new_channel`·`group_add` 도 예외 없이 성공한다. 일반 채널을 1ms `wait_for` 로 폴링하는 것은 그 한 예다(알려진 결함, 회복 시간 미검증) | 일반 채널을 `wait_for` 로 폴링하지 않는다. 10ms 폴링에서도 재현됐다(랩 RTT 약 0.25ms 에서 P2 6회 중 1회, 2026-10-26 확인). 안전한 폴링 간격은 없다. 브로커가 10초 넘게 멈췄다 살아난 뒤에도 같은 일이 날 수 있다(nats-py flush 타임아웃·레이어 `publish_deadline`). 로그에 위 줄이 있는 워커는 재시작한다. 상류 수정(nats-py PR #1031)은 병합, 미릴리스(PyPI 최신 2.16.0, 2026-10-26 확인 — [channels-nats #41](https://github.com/itda-work/channels-nats/issues/41)). 상류 처리는 [이관 문서](docs/research/handoff-marco-nats-flush-cancel.md) | 1ms·10ms 폴링: 재현함(#66). 타임아웃·deadline 경로: 코드상 확인 |
+| 한 워커가 채널 메시지를 하나도 받지 못한다. 로그에 `nats: encountered error … InvalidStateError` | channels-nats 0.10.0 이하: 구독 확인(`new_channel`·`group_add`·일반 채널 첫 `receive`)이 취소되거나 시간 초과되면 nats-py 2.16.0 의 읽기 루프가 끝나 그 연결이 그룹 메시지까지 받지 못한다. 그 뒤의 `new_channel`·`group_add` 도 예외 없이 성공한다. 일반 채널을 `wait_for` 로 폴링하는 것(1ms 매번, 10ms 도 6회 중 1회), 브로커가 10초 넘게 멈췄다 살아나는 것(nats-py flush 타임아웃·레이어 `publish_deadline`)이 그 예다 | **channels-nats 0.10.1 이상으로 올린다.** 0.10.1 은 nats-py 2.16.0 이하일 때 상류 수정(nats-py PR #1031, 병합·미릴리스)과 같은 패치를 넣는다. 올리기 전에는 로그에 위 줄이 있는 워커를 재시작한다. 일반 채널 폴링은 0.10.1 에서도 두 폴링 사이의 메시지를 잃는다(계약) | 0.10.0 의 1ms·10ms 폴링: 재현함(#66). 0.10.1 에서 사라짐: 재현함(랩 P2, #88, 2026-10-27). 타임아웃·deadline 경로: channels-nats 회귀 테스트(이 저장소에서는 코드상 확인) |
 | HTTP 는 되는데 웹소켓 연결이 안 된다 | `uvicorn` 만 설치하면 웹소켓 구현이 없다 | `uvicorn[standard]` 를 설치한다([single-server §3](docs/profiles/single-server.md#dockerfile)) | 출처(uvicorn 0.54.0 메타데이터) |
 
 ## 개발

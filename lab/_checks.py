@@ -5,7 +5,9 @@
 - L8a: S3 전체 단절 동안 헬스가 제한 시간 안에 ``unknown(stale)`` 로 바뀌고 복구 전까지
   유지되는지(``full_outage_problems``). 표본 인덱스가 아니라 경과 시간과 결과의 age 로 본다.
 - P2(#66): 워커 사이 채널 레이어 전달의 손실·중복·용량 드롭(``delivery_summary``·
-  ``delivery_problems``). 입력은 ``lab_tools/chanlab_run.py`` 의 시도 원자료다.
+  ``delivery_problems``). 입력은 ``lab_tools/chanlab_run.py`` 의 시도 원자료다. 러너 출력 해석과
+  시나리오 하나의 판정(``runner_output``·``spec_outcome``), 늦은 재조회 여부(``wants_late_check``)도
+  여기 둔다(#88).
 
 입력은 ``lab_tools/inspect_data.py`` 의 스냅샷(``{"entries": {상대경로: {...}}}``)과 헬스 표본이다.
 표준 라이브러리만 쓴다.
@@ -13,6 +15,7 @@
 
 from __future__ import annotations
 
+import json
 import re
 
 DB = "app.sqlite3"
@@ -342,56 +345,26 @@ _FULL = re.compile(r"mailbox for (\S+) is full \(capacity \d+\); (\d+) message\(
 _ROOM = re.compile(r"mailbox for (\S+) has room again after dropping (\d+) message\(s\)")
 
 
-# nats-py 2.16.0 ``Client._read_loop`` 이 일반 예외에서 남기고 읽기 루프를 끝내는 줄. 랩 뷰는
-# 예외를 ``[종류: 메시지]`` 로 덧붙인다(notes/chanlab.py ``_Capture``).
+# nats-py ``Client._read_loop`` 이 일반 예외에서 남기고 읽기 루프를 끝내는 줄. 랩 뷰는
+# 예외를 ``[종류: 메시지]`` 로 덧붙인다(notes/chanlab.py ``_Capture``). channels-nats 0.10.0
+# 이하에서는 구독 확인이 취소되면 ``InvalidStateError`` 로 이 줄이 났다(#66·#88).
 NATS_READ_ERROR = "nats: encountered error"
-# 알려진 결함(docs/research/handoff-marco-nats-flush-cancel.md)의 표지. 읽기 루프 오류 줄에 이
-# 예외가 붙은 것만 결함으로 센다 — 다른 예외로 끝난 읽기 루프는 예외 대상이 아니다.
-KNOWN_DEFECT = "[InvalidStateError:"
 
 
 def _nats_lines(worker: dict) -> list[str]:
-    """수신 중 로그 + stop 뒤에 늦게 온 로그(``defect_ok`` 면 chanlab_run 이 다시 물어 붙인다)."""
+    """수신 중 로그 + stop 뒤에 늦게 온 로그. 취소된 확인의 PONG 은 stop 뒤에 올 수 있어
+    ``cancel`` 모드면 chanlab_run 이 1초 뒤 다시 물어 ``late_nats_log`` 를 붙인다."""
     return worker["nats_log"] + worker.get("late_nats_log", [])
 
 
-def known_defect_pids(spec: dict, trial: dict) -> list:
-    """``spec["defect_ok"]`` 인 시나리오에서 알려진 결함이 난 워커 PID.
+def wants_late_check(spec: dict) -> bool:
+    """stop 1초 뒤 다시 물어 늦은 nats 로그와 읽기 루프 상태를 붙일 시나리오인가(``cancel`` 모드).
 
-    그 워커의 읽기 루프 오류 줄이 모두 ``InvalidStateError`` 이고, 그 워커가 쓴 레이어 인스턴스의
-    읽기 루프가 실제로 끝났을 때(``read_loop_alive is False``)만 센다. 하나라도 다른 예외면
-    결함으로 보지 않는다(→ ``delivery_problems`` 가 실패로 낸다). nats 로그는 워커 프로세스 전역이라
-    다른 인스턴스의 줄이 시간 창에 섞일 수 있어(#66 리뷰 P3-2) 읽기 루프 상태로 묶는다.
-    ``defect_ok`` 가 없으면 빈 목록.
+    취소된 구독 확인의 PONG 은 stop 뒤에 올 수 있다(#66 의 결함은 그때 났다). P2 가 이 값을
+    ``spec["late"]`` 로 넣어 러너에 넘긴다 — 러너는 Django 를 불러 단위 테스트가 닿지 않는다
+    (#88 리뷰 P3-1).
     """
-    if not spec.get("defect_ok"):
-        return []
-    pids = []
-    for w in trial["workers"]:
-        errors = [m for m in _nats_lines(w) if NATS_READ_ERROR in m]
-        if errors and all(KNOWN_DEFECT in m for m in errors) and w.get("read_loop_alive") is False:
-            pids.append(w["pid"])
-    return pids
-
-
-def channel_spec_problems(specs: list[dict]) -> list[str]:
-    """``CHANNEL_SPECS`` 의 구조 검사. ``defect_ok`` 는 별도 레이어 인스턴스(``layer``)에만 둔다 —
-    결함 면제가 기본 레이어를 쓰는 시나리오에 닿지 않게 한다(#66 리뷰 P3-1)."""
-    return [
-        f"{s['id']}: defect_ok needs its own layer"
-        for s in specs
-        if s.get("defect_ok") and not s.get("layer")
-    ]
-
-
-def skip_after(spec: dict, defects: dict) -> str | None:
-    """같은 레이어 인스턴스의 앞 시나리오(``spec["after"]``)에서 알려진 결함이 났으면 건너뛸 사유.
-
-    ``defects`` 는 ``{시나리오 id: [결함이 난 시도]}``. 그 연결은 받지 못하므로 단언 대신 기록한다.
-    """
-    if defects.get(spec.get("after")):
-        return f"known defect in {spec['after']}"
-    return None
+    return spec.get("mode") == "cancel"
 
 
 def nats_drops(lines: list[str], channel: str) -> int:
@@ -455,21 +428,16 @@ def delivery_problems(spec: dict, trial: dict) -> list[str]:
     - ``record``: 판정 대상(D2 재현). 중복·모르는 id 만 본다.
 
     모든 경우에 송신 예외·수신 루프 예외가 없어야 하고, 워커 수가 ``spec["workers"]``(기본 2)다.
-    워커 ``nats_log`` 에 nats-py 읽기 루프 오류(``nats: encountered error``)가 없어야 한다 — 그 뒤로
-    그 연결은 아무것도 읽지 않는데(handoff-marco-nats-flush-cancel.md) ``lossy``·``record`` 는
-    손실로만 남기 때문이다. 메시지에 예외 이름을 드러낸다. 준비되지 않은 시도(``ready: false``,
-    ``may_not_ready``)도 실패다.
-
-    예외는 ``spec["defect_ok"]`` 하나다(#66 재개 2): ``known_defect_pids`` 가 센 워커의 읽기 루프
-    오류(워커 단위)와, 그런 워커가 있는 시도의 준비 실패(시도 단위)는 문제로 내지 않는다(호출자가
-    따로 기록한다). 중복·모르는 id·용량 드롭·합 > n·송수신 예외는 그 시도에서도 그대로 문제다.
+    워커 ``nats_log`` 에 nats-py 읽기 루프 오류(``nats: encountered error``)가 없고, 그 워커가 쓴
+    레이어 인스턴스의 읽기 루프가 끝나지 않았어야 한다(``read_loop_alive`` 가 False 가 아님) — 끝난
+    연결은 아무것도 읽지 않는데(#66) ``lossy``·``record`` 는 손실로만 남기 때문이다. 메시지에 예외
+    이름을 드러낸다. 준비되지 않은 시도(``ready: false``)도 실패다.
     """
     s = delivery_summary(spec, trial)
     n = spec["n"]
     expect = spec["expect"]
-    defect = set(known_defect_pids(spec, trial))
     problems = []
-    if trial.get("ready") is False and not defect:
+    if trial.get("ready") is False:
         problems.append(f"not ready after {trial.get('probes_sent')} probes")
     if len(s["workers"]) != spec.get("workers", 2):
         problems.append(f"{len(s['workers'])} workers reported")
@@ -479,8 +447,10 @@ def delivery_problems(spec: dict, trial: dict) -> list[str]:
         tag = f"pid {w['pid']}"
         if w["errors"]:
             problems.append(f"{tag}: receive errors {w['errors'][:3]}")
-        if w["nats_errors"] and w["pid"] not in defect:
+        if w["nats_errors"]:
             problems.append(f"{tag}: nats-py read loop error {w['nats_errors'][:3]}")
+        if w["read_loop_alive"] is False:
+            problems.append(f"{tag}: nats-py read loop stopped")
         if w["unknown"]:
             problems.append(f"{tag}: unknown ids {w['unknown']}")
         if w["dup"]:
@@ -509,3 +479,64 @@ def delivery_problems(spec: dict, trial: dict) -> list[str]:
         if any(w["received"] == 0 for w in s["workers"]):
             problems.append("a worker got no share of the queue group")
     return problems
+
+
+def compact_trial(spec: dict, trial: dict) -> dict:
+    """결과 기록용 시도 요약(원자료는 ``chan-<시각>.json`` 에 따로 남는다)."""
+    s = delivery_summary(spec, trial)
+    keys = ("received", "lost", "dup", "drops", "cancels", "cancels_near_send", "in_order",
+            "read_loop_alive")  # fmt: skip
+    return {
+        "workers": [{k: w[k] for k in ("pid", *keys)} for w in s["workers"]],
+        "total": s["total"],
+        "union_lost": s["union_lost"],
+        "lost_ids": s["lost_ids"][:20],
+        "ready": trial["ready"],
+        "ready_s": trial["ready_s"],
+        "probes_sent": trial["probes_sent"],
+        "send_s": round(trial["t1"] - trial["t0"], 3),
+        "senders": s["senders"],
+    }
+
+
+def runner_output(rc: int, out: str, text: str) -> tuple[dict | None, str | None]:
+    """``chanlab_run.py`` 실행 결과를 (원자료, 실패 사유)로. ``out`` 은 stdout, ``text`` 는
+    stdout+stderr.
+
+    러너는 시도가 실패해도(``TimeoutError``) 그때까지의 ``trials`` 와 ``error`` 를 마지막 줄
+    JSON 으로 내고 rc 1 로 끝난다(#88 리뷰 P2-1). rc≠0 이어도 그 JSON 이 있으면 원자료를
+    살린다 — 앞 시도의 ``read_loop_alive: False``·늦은 로그가 원인을 보여 준다. 실패 사유는
+    rc≠0 이면 언제나 있다.
+    """
+    data = None
+    lines = out.strip().splitlines()
+    if lines:
+        try:
+            data = json.loads(lines[-1])
+        except ValueError:
+            data = None
+    if not isinstance(data, dict) or not isinstance(data.get("trials"), list):
+        data = None
+    if rc != 0:
+        detail = data.get("error") if data and data.get("error") else text[-1500:]
+        return data, f"runner rc {rc}: {detail}"
+    if data is None:
+        return None, f"runner printed no result JSON: {text[-1500:]}"
+    return data, None
+
+
+def spec_outcome(spec: dict, data: dict | None, error: str | None) -> tuple[dict, list[str]]:
+    """시나리오 하나의 (결과 요약, 문제). 러너가 실패했어도 그때까지의 시도는 그대로 판정한다."""
+    problems = [error] if error else []
+    if data is None:
+        return {}, problems
+    trials = data["trials"]
+    result = {
+        "run_s": data.get("run_s"),
+        "close_s": data.get("close_s"),
+        "trials": [compact_trial(spec, t) for t in trials],
+    }
+    problems += [
+        f"trial {i}: {p}" for i, t in enumerate(trials) for p in delivery_problems(spec, t)
+    ]
+    return result, problems

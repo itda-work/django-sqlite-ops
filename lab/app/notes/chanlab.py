@@ -12,8 +12,8 @@ uvicorn 워커마다 수신 루프 하나를 띄우고(``listen``), 받은 것�
 - ``capacity``: 주면 그 값으로 만든 별도 레이어 인스턴스를 쓴다(D2 재현의 ``cap1000``). 문서
   설정의 레이어(``get_channel_layer()``)는 그대로다.
 - ``layer``: 이름을 주면 그 이름의 별도 레이어 인스턴스(자기 NATS 연결)를 쓴다. 같은 이름의
-  수신끼리 그 인스턴스를 나눈다. 알려진 결함(1ms 폴링이 연결의 읽기 루프를 끝냄,
-  ``docs/research/handoff-marco-nats-flush-cancel.md``)을 다른 시나리오와 떼어 재는 데 쓴다.
+  수신끼리 그 인스턴스를 나눈다. 폴링 시나리오(구독 확인을 취소할 수 있다)를 기본 레이어와 떼어
+  재는 데 쓴다(channels-nats 0.10.0 이하에서는 그 취소가 연결의 읽기 루프를 끝냈다, #66·#88).
 
 ``channels_nats``·``nats`` 로거의 경고·오류(용량 드롭, nats-py 읽기 루프 예외 등)를 프로세스
 안에 모아 ``state`` 로 돌려준다. 예외가 붙은 기록은 ``[예외 종류: 메시지]`` 를 덧붙인다.
@@ -73,7 +73,8 @@ def _layer(capacity: int | None, name: str | None = None):
 def _read_loop_alive(layer) -> bool | None:
     """진단: 이 워커 루프에서 그 레이어 연결의 nats-py 읽기 루프가 살아 있는가(연결이 없으면 None).
 
-    channels-nats(``_states``)·nats-py(``_reading_task``) 내부를 읽는다. 판정이 아니라 기록용이다.
+    channels-nats(``_states``)·nats-py(``_reading_task``) 내부를 읽는다.
+    ``_checks.delivery_problems`` 가 False 면 실패로 낸다(#88).
     """
     try:
         state = layer._states.get(asyncio.get_running_loop())

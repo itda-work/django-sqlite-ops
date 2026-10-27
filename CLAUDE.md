@@ -70,13 +70,12 @@
 - SeaweedFS 는 버킷마다 볼륨을 잡는다. 랩에서는 버킷 하나를 두고 prefix 로 나누며, `-volume.max` 를 올린다.
 - macOS 에는 `timeout` 명령이 없다.
 - `.work/issue-<N>/` 아래에서 `uv init`·`uv add` 를 하면 uv 가 상위의 이 저장소를 workspace 루트로 잡아 메인 `pyproject.toml` 에 `[tool.uv.workspace] members = [...]` 를 넣는다(#77 에서 재현됨, 2026-10-26 확인). 시험 프로젝트는 저장소 밖에 만들거나 `uv init --no-workspace` 를 쓰고, 브리프에 적는다.
-- aio 계열 채널 레이어는 `await layer.close()` 가 없으면 프로세스가 끝나지 않을 수 있다. channels-nats 0.10.0 은 `close()` 없이도 `asyncio.run` 이 끝나면 프로세스가 끝났다(#66).
+- aio 계열 채널 레이어는 `await layer.close()` 가 없으면 프로세스가 끝나지 않을 수 있다. channels-nats 0.10.0·0.10.1 은 `close()` 없이도 `asyncio.run` 이 끝나면 프로세스가 끝났다(#66·#88 의 NOCLOSE).
 - 랩은 앱을 `compose up --no-deps` 로 띄운다. 문서 compose 의 `depends_on`(P2 의 nats)은 시나리오가 따로 띄워야 한다. #66 전의 P2 는 nats 없이 돌았다.
 - channels-nats 의 용량 드롭 경고는 60초에 한 번이고, 합계("has room again after dropping N")는 자리가 난 뒤 다음 메시지가 들어올 때만 나온다. 버스트 뒤 손실을 로그로 셀 때는 메시지를 하나 더 보낸다(#66).
-- channels-nats 의 구독 확인(`new_channel`·`group_add`·일반 채널 첫 `receive`)이 취소되거나 시간 초과되면 nats-py 2.16.0 읽기 루프가 끝난다(`InvalidStateError`). 그 연결은 아무것도 받지 못하고, 이후 구독도 확인 없이 성공한다.
-  - 출처: 1ms `wait_for` 폴링은 재현함(#66). flush 타임아웃·`publish_deadline` 경로는 코드상 확인. 10ms 폴링에서도 재현함(2026-10-26 확인, P2 6회 중 1회) — 안전한 폴링 간격은 없다.
-  - 랩에서 이런 시나리오는 별도 레이어 인스턴스로 가둔다. 같은 레이어를 쓰는 뒤 시나리오가 모두 실패한다. 결함이 확률로 나는 시나리오(P-cancel·D2)는 `defect_ok` 로 결함만 기록하고, 판별은 `InvalidStateError` 로 끝난 읽기 루프로 좁힌다(`lab/README.md`).
-  - 상류: nats-py #1030 의 수정 PR #1031 이 2026-10-01 main 에 병합됐으나 미릴리스다(PyPI 최신 2.16.0, 2026-10-26 확인). 병합 커밋을 설치하면 세 경로(호출자 취소·nats-py flush 타임아웃·`publish_deadline`)가 모두 막힌다([channels-nats #41](https://github.com/itda-work/channels-nats/issues/41) 검토에서 재현함). channels-nats 는 고친 판이 나오면 하한을 올린다. 그때 랩의 `build_context.CHANNELS_NATS` 를 올리고, strict xfail `test_P2_nats_flush_cancel_known_defect` 가 XPASS 로 알리는지 본 뒤 xfail 과 P-cancel·D2 의 `defect_ok` 예외를 걷어 낸다(#86).
+- channels-nats **0.10.0 이하**에서는 구독 확인(`new_channel`·`group_add`·일반 채널 첫 `receive`)이 취소되거나 시간 초과되면 nats-py 2.16.0 이하의 읽기 루프가 끝난다(`InvalidStateError`). 그 연결은 아무것도 받지 못하고, 이후 구독도 확인 없이 성공한다. 1ms `wait_for` 폴링은 매번, 10ms 는 P2 6회 중 1회 재현함(#66, 2026-10-26).
+  - channels-nats 0.10.1(2026-10-27 PyPI)이 nats-py 2.16.0 이하일 때 `Client._process_pong` 을 상류 수정(nats-py PR #1031, 병합·미릴리스)과 같은 코드로 바꿔 막는다. 세 경로(호출자 취소·nats-py flush 타임아웃·`publish_deadline`)는 channels-nats 저장소의 회귀 테스트가 본다. 랩을 0.10.1 로 올리자 strict xfail 이 XPASS 로 알렸고, 결함 예외(`defect_ok`·xfail)를 걷어 낸 뒤 1ms·10ms 폴링과 D2 가 보통 단언으로 통과한다(#88, 2026-10-27 확인). 사용자 안내는 `channels-nats>=0.10.1` 이다.
+  - 랩의 폴링 시나리오(P-cancel·P-cancel-1ms·D2)는 별도 레이어 인스턴스를 쓰고, 같은 인스턴스로 바로 그룹 수신(`-after`)을 돌려 연결이 살아 있는지 단언한다. 판정은 읽기 루프 오류 줄과 `read_loop_alive` 둘 다 본다(`lab/README.md`). nats-py 가 고친 판을 내면 channels-nats 의 패치가 꺼진다 — 그때 랩의 nats-py 판이 바뀌므로 P2 를 다시 돌린다.
 - S3 가 연결을 **거부**해도 `litestream ltx` 는 바로 실패하지 않고 재시도하며 매달린다(0.5.17, toxiproxy 로 재현함 — boot 는 `--ltx-timeout` 30초 뒤 `remote_error`). 그래서 S3 전체 단절 중 헬스는 `backlog` 가 아니라 `unknown` 이다: 30초를 넘는 단절에서는 `stale` 과 `remote_error` 가 `REFRESH + 30` 초 주기로 번갈아 나온다(#65 L8c·L8d). `backlog` 는 업로드만 끊기고 조회가 될 때 나온다(#10 L8a·L8b). 갱신 스레드는 하나라 한 별칭의 매달림이 다른 별칭도 `stale` 로 만들 수 있다(매달림 > `2 × REFRESH`). 그 `stale` 사유에 조회 중인 별칭과 경과 초가, 쉬는 중이면 직전 라운드의 가장 느린 조회가 나온다(#72).
 - compose 는 어느 서비스도 쓰지 않거나 비활성 프로필 서비스만 쓰는 볼륨을 모델에서 빼고, `down -v` 도 그 볼륨을 지우지 않는다(Compose 5.5.1, 재현함). 랩은 모든 볼륨을 붙인 `volume-holder` 서비스와 `--profile app down -v` 로 지운다. 정리 뒤 `docker volume ls --filter label=io.itda.dso-lab=1` 로 확인한다.
 - `uv build --out-dir D` 는 D 에 `.gitignore` 도 남긴다. `rmdir` 이 실패한다.

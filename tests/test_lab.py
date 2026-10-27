@@ -531,109 +531,107 @@ def test_p2_nats_read_loop_error_fails_every_expectation():
 DEAD = "nats: encountered error [InvalidStateError: invalid state]"
 
 
-def test_p2_known_defect_is_excused_only_with_defect_ok():
-    """defect_ok 시나리오만 InvalidStateError 로 끝난 읽기 루프를 결함으로 세고 넘긴다(#66)."""
+def test_p2_late_nats_log_counts():
+    """stop 뒤에 늦게 온 읽기 루프 오류 줄(``late_nats_log``)도 실패다(#66 의 결함은 그때 났다)."""
     c = _checks()
     ch = "lab.plain.k"
-    for expect in ("lossy", "record"):
-        trial = _trial(_worker(1, ch, [0], nats_log=[DEAD], alive=False), _worker(2, ch, [1]))
-        ok = {"n": 4, "expect": expect, "defect_ok": True}
-        assert c.known_defect_pids(ok, trial) == [1]
-        assert c.delivery_problems(ok, trial) == []
-        # 같은 시도라도 defect_ok 가 없으면 실패다(기본 레이어 시나리오)
-        plain = {"n": 4, "expect": expect}
-        assert c.known_defect_pids(plain, trial) == []
-        assert any("read loop error" in p for p in c.delivery_problems(plain, trial))
-    # stop 뒤에 늦게 온 줄도 센다
-    late = _trial(_worker(1, ch, [], alive=False), _worker(2, ch, [1]))
+    late = _trial(_worker(1, ch, [0]), _worker(2, ch, [1]))
     late["workers"][0]["late_nats_log"] = [DEAD]
-    assert c.known_defect_pids({"n": 2, "expect": "lossy", "defect_ok": True}, late) == [1]
+    problems = c.delivery_problems({"n": 2, "expect": "lossy"}, late)
+    assert any(p.startswith("pid 1: nats-py read loop error") for p in problems), problems
 
 
-def test_p2_known_defect_needs_a_dead_read_loop():
-    """결함 줄이 있어도 그 워커의 레이어 인스턴스 읽기 루프가 살아 있으면 면제하지 않는다(#66 P3-2).
+def test_p2_stopped_read_loop_fails_even_without_a_log_line():
+    """워커가 쓴 레이어 인스턴스의 읽기 루프가 끝났으면 로그 줄이 없어도 실패다(#88).
 
-    nats 로그는 워커 프로세스 전역이라 다른 인스턴스의 늦은 줄이 시간 창에 섞일 수 있다.
+    ``read_loop_alive`` 가 None(연결 없음)·True 면 이 판정은 나지 않는다.
     """
     c = _checks()
     ch = "lab.plain.k"
-    spec = {"n": 4, "expect": "lossy", "defect_ok": True}
+    for expect in ("each", "split", "lossy", "drops", "record"):
+        spec = {"n": 2, "expect": expect}
+        dead = _trial(_worker(1, ch, [0], alive=False), _worker(2, ch, [1], alive=True))
+        problems = c.delivery_problems(spec, dead)
+        assert "pid 1: nats-py read loop stopped" in problems, (expect, problems)
+        assert not any(p.startswith("pid 2: nats-py") for p in problems), (expect, problems)
     for alive in (True, None):
-        trial = _trial(_worker(1, ch, [0], nats_log=[DEAD], alive=alive), _worker(2, ch, [1]))
-        assert c.known_defect_pids(spec, trial) == []
-        assert any("read loop error" in p for p in c.delivery_problems(spec, trial))
-    stuck = {**_trial(_worker(1, ch, [], nats_log=[DEAD], alive=True), _worker(2, ch, [])),
-             "ready": False, "probes_sent": 9}  # fmt: skip
-    assert any("not ready after 9" in p for p in c.delivery_problems(spec, stuck))
-    # 거꾸로 읽기 루프가 끝났어도 결함 줄이 없으면 원인을 모르므로 면제하지 않는다
-    stuck["workers"][0].update(nats_log=[], read_loop_alive=False)
-    assert c.known_defect_pids(spec, stuck) == []
-    assert any("not ready after 9" in p for p in c.delivery_problems(spec, stuck))
+        ok = _trial(_worker(1, ch, [0], alive=alive), _worker(2, ch, [1], alive=alive))
+        assert c.delivery_problems({"n": 2, "expect": "record"}, ok) == []
 
 
-def test_p2_known_defect_keeps_the_rest_of_the_contract():
-    """결함이 난 시도도 중복·용량 드롭·합 > n·다른 예외·결함 없는 준비 실패는 실패다."""
+def test_p2_not_ready_always_fails():
+    """준비되지 않은 시도는 언제나 실패다(#88 전의 ``defect_ok`` 면제는 없다)."""
     c = _checks()
     ch = "lab.plain.k"
-    spec = {"n": 4, "expect": "lossy", "defect_ok": True}
-    dup = _trial(_worker(1, ch, [0, 0], nats_log=[DEAD], alive=False), _worker(2, ch, [1]))
-    assert any("duplicate" in p for p in c.delivery_problems(spec, dup))
-    dropped = _trial(
-        _worker(1, ch, [0], nats_log=[DEAD, _full(ch, 2)], alive=False), _worker(2, ch, [])
-    )
-    assert any("mailbox drop" in p for p in c.delivery_problems(spec, dropped))
-    # 다른 예외로 끝난 읽기 루프는 결함이 아니다 — 줄 하나라도 섞이면 실패
-    other = "nats: encountered error [ValueError: bad]"
-    for log in ([other], [DEAD, other]):
-        trial = _trial(_worker(1, ch, [0], nats_log=log, alive=False), _worker(2, ch, [1]))
-        assert c.known_defect_pids(spec, trial) == []
-        assert any("read loop error" in p for p in c.delivery_problems(spec, trial))
-    # 한 워커의 결함 면제는 다른 워커의 다른 예외로 끝난 읽기 루프에 닿지 않는다(#66 P3-1)
-    mixed = _trial(_worker(1, ch, [0], nats_log=[DEAD], alive=False),
-                   _worker(2, ch, [1], nats_log=[other], alive=False))  # fmt: skip
-    assert c.known_defect_pids(spec, mixed) == [1]
-    problems = c.delivery_problems(spec, mixed)
-    assert any(p.startswith("pid 2: nats-py read loop error") for p in problems), problems
-    assert not any(p.startswith("pid 1:") for p in problems), problems
-    flush = ["FlushTimeoutError: x"]
-    recv = _trial(_worker(1, ch, [0], nats_log=[DEAD], errors=flush, alive=False),
-                  _worker(2, ch, [1]))  # fmt: skip
-    assert any("receive errors" in p for p in c.delivery_problems(spec, recv))
-    # 준비 실패: 결함이 있으면 기록만, 없으면 실패
-    stuck = {**_trial(_worker(1, ch, []), _worker(2, ch, [])), "ready": False, "probes_sent": 9}
-    assert any("not ready after 9" in p for p in c.delivery_problems(spec, stuck))
-    stuck["workers"][0]["nats_log"] = [DEAD]
-    stuck["workers"][0]["read_loop_alive"] = False
-    assert c.delivery_problems(spec, stuck) == []
-    stuck["workers"][0]["nats_log"] = [other]
-    assert any("not ready" in p for p in c.delivery_problems(spec, stuck))
+    stuck = {**_trial(_worker(1, ch, [], nats_log=[DEAD], alive=False), _worker(2, ch, [])),
+             "ready": False, "probes_sent": 9}  # fmt: skip
+    for spec in ({"n": 4, "expect": "lossy"}, {"n": 4, "expect": "lossy", "defect_ok": True}):
+        problems = c.delivery_problems(spec, stuck)
+        assert "not ready after 9 probes" in problems, problems
+        assert any("read loop error" in p for p in problems), problems
+        assert "pid 1: nats-py read loop stopped" in problems, problems
 
 
-def test_p2_defect_ok_needs_its_own_layer():
-    """defect_ok 면제는 별도 레이어 인스턴스에만 둔다(기본 레이어에 닿지 않게, #66 P3-1)."""
+def test_p2_late_check_is_for_cancel_mode_only():
+    """늦은 재조회(stop 1초 뒤)는 ``cancel`` 모드 시나리오에만 건다(#88 리뷰 P3-1)."""
     c = _checks()
-    specs = [
-        {"id": "OK", "defect_ok": True, "layer": "x"},
-        {"id": "PLAIN"},
-        {"id": "BAD", "defect_ok": True},
-        {"id": "EMPTY", "defect_ok": True, "layer": ""},
-    ]
-    assert c.channel_spec_problems(specs) == [
-        "BAD: defect_ok needs its own layer",
-        "EMPTY: defect_ok needs its own layer",
-    ]
+    assert c.wants_late_check({"kind": "plain", "mode": "cancel", "timeout": 0.5})
+    assert c.wants_late_check({"kind": "group", "mode": "cancel", "timeout": 0.001})
+    assert not c.wants_late_check({"kind": "group"})
+    assert not c.wants_late_check({"kind": "plain", "mode": "steady"})
 
 
-def test_p2_skip_after_only_on_a_known_defect_in_the_named_spec():
-    """P-cancel-after 는 P-cancel 에서 알려진 결함이 났을 때만 건너뛴다(#66 P3-3)."""
+def _ready_trial(*workers, ready=True):
+    return {**_trial(*workers), "ready": ready, "ready_s": 0.1 if ready else None,
+            "probes_sent": 3}  # fmt: skip
+
+
+def test_p2_runner_output_keeps_trials_when_the_runner_fails():
+    """rc≠0 이어도 마지막 줄 JSON 이 있으면 원자료를 살리고, 실패 사유는 그대로 둔다(#88 P2-1)."""
     c = _checks()
-    spec = {"id": "P-cancel-after", "after": "P-cancel"}
-    hit = [{"trial": 0, "pids": [40]}]
-    assert c.skip_after(spec, {"P-cancel": hit}) == "known defect in P-cancel"
-    assert c.skip_after(spec, {}) is None
-    assert c.skip_after(spec, {"P-cancel": []}) is None
-    assert c.skip_after(spec, {"D2-cap100": hit}) is None
-    assert c.skip_after({"id": "LIVE"}, {"P-cancel": hit}) is None
+    data = {"spec": {}, "trials": [], "error": "trial 3: not ready after 9 probes: {}"}
+    out = "noise\n" + json.dumps(data) + "\n"
+    got, error = c.runner_output(1, out, out + "stderr tail")
+    assert got == data
+    assert error == "runner rc 1: trial 3: not ready after 9 probes: {}"
+    # JSON 이 없으면(예: timeout 300 이 죽임) 출력 꼬리를 사유로
+    got, error = c.runner_output(124, "", "Traceback ... boom")
+    assert got is None
+    assert error == "runner rc 124: Traceback ... boom"
+    # rc 0 인데 JSON 이 없거나 trials 가 없으면 실패다
+    for bad in ("", "not json", json.dumps({"spec": {}})):
+        got, error = c.runner_output(0, bad, bad)
+        assert got is None and error.startswith("runner printed no result JSON"), bad
+    ok = {"spec": {}, "trials": [], "run_s": 1.0}
+    assert c.runner_output(0, json.dumps(ok), "") == (ok, None)
+
+
+def test_p2_spec_outcome_judges_trials_before_a_runner_failure():
+    """D2 처럼 한 인스턴스를 쓰는 시도 k 에서 연결이 죽고 k+1 이 준비 실패로 러너가 끝나도,
+    시도 0..k 의 요약·판정과 러너 실패 사유가 함께 남는다(#88 리뷰 P2-1)."""
+    c = _checks()
+    ch = "lab.plain.k"
+    spec = {"id": "D2-cap100", "n": 4, "expect": "record", "mode": "cancel"}
+    alive = _ready_trial(_worker(1, ch, [0, 1], alive=True), _worker(2, ch, [2], alive=True))
+    dead = _ready_trial(_worker(1, ch, [0], alive=False), _worker(2, ch, [1, 2], alive=True))
+    dead["workers"][0]["late_nats_log"] = [DEAD]
+    runner = {"spec": spec, "trials": [alive, dead], "run_s": 9.0,
+              "error": "trial 2: not ready after 40 probes: {}"}  # fmt: skip
+    out = "x\n" + json.dumps(runner)
+    data, error = c.runner_output(1, out, out)
+    result, problems = c.spec_outcome(spec, data, error)
+    assert problems[0] == "runner rc 1: trial 2: not ready after 40 probes: {}"
+    assert "trial 1: pid 1: nats-py read loop stopped" in problems, problems
+    assert any(p.startswith("trial 1: pid 1: nats-py read loop error") for p in problems), problems
+    assert not any(p.startswith("trial 0:") for p in problems), problems
+    assert [t["workers"][0]["read_loop_alive"] for t in result["trials"]] == [True, False]
+    assert result["run_s"] == 9.0
+    # 원자료가 없으면 사유만 남는다
+    assert c.spec_outcome(spec, None, "runner rc 124: x") == ({}, ["runner rc 124: x"])
+    # 러너가 성공하고 시도가 계약대로면 문제가 없다
+    data, error = c.runner_output(0, json.dumps({"trials": [alive], "run_s": 1.0}), "")
+    result, problems = c.spec_outcome(spec, data, error)
+    assert problems == [] and len(result["trials"]) == 1
 
 
 def test_p2_split_queue_group_needs_union_once_and_both_workers():
