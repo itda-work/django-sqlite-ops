@@ -47,7 +47,7 @@ PID 1 boot → exec → litestream replicate -exec "..."            nats-server
 
 ## 3. 설정 조각
 
-`litestream.yml`, Dockerfile 은 [`single-server` §3](single-server.md#3-설정-조각) 과 같다(Dockerfile 은 회귀 랩에서 종단 검증함). `requirements.txt` 에 채널 레이어 패키지를 더한다(`channels-nats` 또는 `channels-redis`). 이 패키지의 `[nats]` extra 로 넣어도 된다. channels-nats 는 `channels-nats>=0.10.1` 로 적는다 — 0.10.0 이하는 구독 확인이 취소되면 그 워커의 연결이 읽기를 멈춘다(§5). 다음 릴리스부터 `[nats]` extra 가 이 하한을 요구한다(#91). 0.1.0a1 의 `[nats]` 는 하한이 없으므로 함께 적는다.
+`litestream.yml`, Dockerfile 은 [`single-server` §3](single-server.md#3-설정-조각) 과 같다(Dockerfile 은 회귀 랩에서 종단 검증함). `requirements.txt` 에 채널 레이어 패키지를 더한다(`channels-nats` 또는 `channels-redis`). 이 패키지의 `[nats]` extra 로 넣어도 된다. channels-nats 는 `channels-nats>=0.10.1` 로 적는다 — 0.10.0 이하는 구독 확인이 취소되면 그 워커의 연결이 읽기를 멈춘다(§5). 0.1.0a2 부터 `[nats]` extra 가 이 하한을 요구한다(#91). 0.1.0a1 을 쓴다면 `[nats]` 에 하한이 없으므로 함께 적는다.
 
 ### `settings.py` — channels-nats (추천)
 

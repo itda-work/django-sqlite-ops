@@ -51,7 +51,7 @@ Litestream 만 쓰면 옛 볼륨으로 재부팅했을 때 최신 복제본이 �
 
 ## 현재 상태
 
-PyPI 에 **실험적 사전 릴리스**로 배포한다([D-28](docs/DECISIONS.md), 2026-10-26 결정). 첫 버전은 `0.1.0a1` 이다. 사전 릴리스는 버전을 명시해 설치한다(아래 [설치](#설치)). 바뀐 점은 [CHANGELOG](CHANGELOG.md) 에 적는다. 외부 홍보는 하지 않는다. 패키지 이름 `django-sqlite-ops` 는 확정이다(D-28 이 D-6 을 갱신).
+PyPI 에 **실험적 사전 릴리스**로 배포한다([D-28](docs/DECISIONS.md), 2026-10-26 결정). 첫 버전은 `0.1.0a1`(2026-10-26), 지금은 `0.1.0a2` 다. 사전 릴리스는 버전을 명시해 설치한다(아래 [설치](#설치)). 바뀐 점은 [CHANGELOG](CHANGELOG.md) 에 적는다. 외부 홍보는 하지 않는다. 패키지 이름 `django-sqlite-ops` 는 확정이다(D-28 이 D-6 을 갱신).
 
 | 기능 | 상태 | 이슈·근거 |
 |---|---|---|
@@ -73,16 +73,16 @@ PyPI 에 **실험적 사전 릴리스**로 배포한다([D-28](docs/DECISIONS.md
 PyPI 에서 설치한다. 사전 릴리스는 버전을 명시해 설치한다. 실험적 프로젝트이므로 그 버전으로 고정해 둔다.
 
 ```bash
-pip install "django-sqlite-ops==0.1.0a1"
+pip install "django-sqlite-ops==0.1.0a2"
 # 또는
-uv add "django-sqlite-ops==0.1.0a1"
+uv add "django-sqlite-ops==0.1.0a2"
 ```
 
-필수 의존성은 Django 하나다. 채널 레이어는 extra 로 고른다: `[nats]`(channels-nats), `[channels-lite]`(channels-lite 만. aio 레이어에 필요한 의존성은 [channels-lite 패치 '함정'](#channels-lite-패치)). **channels-nats 는 0.10.1 이상을 쓴다** — 0.10.0 이하는 구독 확인이 취소되면 그 워커가 채널 메시지를 더 받지 못한다([문제 해결 '채널 레이어'](#채널-레이어)). 다음 릴리스부터 `[nats]` 가 `channels-nats>=0.10.1` 을 요구한다(#91). 0.1.0a1 의 `[nats]` 는 하한이 없으므로 `channels-nats>=0.10.1` 을 함께 적는다. lock 파일에 0.10.0 이하가 잠겨 있으면 `uv lock --upgrade-package channels-nats` 처럼 그 패키지를 올린다.
+필수 의존성은 Django 하나다. 채널 레이어는 extra 로 고른다: `[nats]`(channels-nats), `[channels-lite]`(channels-lite 만. aio 레이어에 필요한 의존성은 [channels-lite 패치 '함정'](#channels-lite-패치)). **channels-nats 는 0.10.1 이상을 쓴다** — 0.10.0 이하는 구독 확인이 취소되면 그 워커가 채널 메시지를 더 받지 못한다([문제 해결 '채널 레이어'](#채널-레이어)). 0.1.0a2 부터 `[nats]` 가 `channels-nats>=0.10.1` 을 요구한다(#91). 0.1.0a1 을 쓴다면 `[nats]` 에 하한이 없으므로 `channels-nats>=0.10.1` 을 함께 적는다. lock 파일에 0.10.0 이하가 잠겨 있으면 `uv lock --upgrade-package channels-nats` 처럼 그 패키지를 올린다.
 
 ```bash
-pip install "django-sqlite-ops[nats]==0.1.0a1" "channels-nats>=0.10.1"
-uv add "django-sqlite-ops[channels-lite]==0.1.0a1"
+pip install "django-sqlite-ops[nats]==0.1.0a2"
+uv add "django-sqlite-ops[channels-lite]==0.1.0a2"
 ```
 
 `pip install --pre` 나 `uv add --prerelease=allow` 는 쓰지 않는다. 이 패키지뿐 아니라 Django 를 비롯한 **모든 의존성**의 사전 릴리스까지 허용한다(`uv add --prerelease=allow` 는 `uv.lock` 에 `prerelease-mode = "allow"` 로 남아 이후의 해석에도 적용된다). 버전을 지정자에 명시하면 그 사전 릴리스만 받아들여진다. 정식 릴리스가 나온 뒤에는 명시하지 않으면 사전 릴리스를 고르지 않는다.
@@ -977,7 +977,7 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 | channels-lite aio 레이어에서 한 메시지가 두 수신자에게 배달된다 | 선점 성공을 누적 `total_changes` 로 판정한다 | `SQLITE_OPS["PATCH_CHANNELS_LITE_AIO"] = True`([channels-lite 패치](#channels-lite-패치)) | 재현함(#8) |
 | 새 채널 DB 에 여러 프로세스가 처음 붙을 때 `database is locked` | 여러 연결이 동시에 처음 `journal_mode=WAL` 로 바꾸면 일부가 실패한다(원인 미확정) | `migrate` 직후 채널 DB 를 미리 WAL 로 바꿔 둔다 | 재현함(#8) |
 | 버스트로 보낸 메시지 일부가 사라지는데 경고는 "1 message(s) dropped so far" 한 줄뿐이다 | channels-nats 는 받는 쪽 mailbox 가 `capacity`(기본 100)를 넘치면 버린다(`ChannelFull` 없음). 경고는 60초에 한 번으로 묶이고 합계는 자리가 난 뒤 다음 메시지가 올 때 "has room again after dropping N" 으로 나온다 — 첫 줄만 보면 과소평가한다(실측 1줄 / 실제 1–16건) | 합계 줄을 본다. 한 번에 몰아 보내는 양이 `capacity` 를 넘으면 `capacity` 를 올리거나 나눠 보낸다. channels-nats D2 실측의 196/200 도 같은 모양이라 이것으로 본다(추론) | 재현함(#66) |
-| 한 워커가 채널 메시지를 하나도 받지 못한다. 로그에 `nats: encountered error … InvalidStateError` | channels-nats 0.10.0 이하: 구독 확인(`new_channel`·`group_add`·일반 채널 첫 `receive`)이 취소되거나 시간 초과되면 nats-py 2.16.0 의 읽기 루프가 끝나 그 연결이 그룹 메시지까지 받지 못한다. 그 뒤의 `new_channel`·`group_add` 도 예외 없이 성공한다. 일반 채널을 `wait_for` 로 폴링하는 것(1ms 매번, 10ms 도 6회 중 1회), 브로커가 10초 넘게 멈췄다 살아나는 것(nats-py flush 타임아웃·레이어 `publish_deadline`)이 그 예다 | **channels-nats 0.10.1 이상으로 올린다.** 0.1.0a1 의 `[nats]` 는 하한이 없어 0.10.0 을 그대로 둘 수 있다. 다음 릴리스부터는 `[nats]` 가 `>=0.10.1` 을 요구한다. 0.10.0 이하로 고정했거나 lock 에 잠겼으면 그 고정을 풀어 올린다. 0.10.1 은 nats-py 2.16.0 이하일 때 상류 수정(nats-py PR #1031, 병합·미릴리스)과 같은 패치를 넣는다. 올리기 전에는 로그에 위 줄이 있는 워커를 재시작한다. 일반 채널 폴링은 0.10.1 에서도 두 폴링 사이의 메시지를 잃는다(계약) | 0.10.0 의 1ms·10ms 폴링: 재현함(#66). 0.10.1 에서 사라짐: 재현함(랩 P2, #88, 2026-10-27). 타임아웃·deadline 경로: channels-nats 회귀 테스트(이 저장소에서는 코드상 확인) |
+| 한 워커가 채널 메시지를 하나도 받지 못한다. 로그에 `nats: encountered error … InvalidStateError` | channels-nats 0.10.0 이하: 구독 확인(`new_channel`·`group_add`·일반 채널 첫 `receive`)이 취소되거나 시간 초과되면 nats-py 2.16.0 의 읽기 루프가 끝나 그 연결이 그룹 메시지까지 받지 못한다. 그 뒤의 `new_channel`·`group_add` 도 예외 없이 성공한다. 일반 채널을 `wait_for` 로 폴링하는 것(1ms 매번, 10ms 도 6회 중 1회), 브로커가 10초 넘게 멈췄다 살아나는 것(nats-py flush 타임아웃·레이어 `publish_deadline`)이 그 예다 | **channels-nats 0.10.1 이상으로 올린다.** 0.1.0a2 부터 `[nats]` 가 `>=0.10.1` 을 요구한다. 0.1.0a1 의 `[nats]` 는 하한이 없어 0.10.0 을 그대로 둘 수 있다. 0.10.0 이하로 고정했거나 lock 에 잠겼으면 그 고정을 풀어 올린다. 0.10.1 은 nats-py 2.16.0 이하일 때 상류 수정(nats-py PR #1031, 병합·미릴리스)과 같은 패치를 넣는다. 올리기 전에는 로그에 위 줄이 있는 워커를 재시작한다. 일반 채널 폴링은 0.10.1 에서도 두 폴링 사이의 메시지를 잃는다(계약) | 0.10.0 의 1ms·10ms 폴링: 재현함(#66). 0.10.1 에서 사라짐: 재현함(랩 P2, #88, 2026-10-27). 타임아웃·deadline 경로: channels-nats 회귀 테스트(이 저장소에서는 코드상 확인) |
 | HTTP 는 되는데 웹소켓 연결이 안 된다 | `uvicorn` 만 설치하면 웹소켓 구현이 없다 | `uvicorn[standard]` 를 설치한다([single-server §3](docs/profiles/single-server.md#dockerfile)) | 출처(uvicorn 0.54.0 메타데이터) |
 
 ## 개발
