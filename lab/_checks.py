@@ -6,8 +6,8 @@
   유지되는지(``full_outage_problems``). 표본 인덱스가 아니라 경과 시간과 결과의 age 로 본다.
 - P2(#66): 워커 사이 채널 레이어 전달의 손실·중복·용량 드롭(``delivery_summary``·
   ``delivery_problems``). 입력은 ``lab_tools/chanlab_run.py`` 의 시도 원자료다. 러너 출력 해석과
-  시나리오 하나의 판정(``runner_output``·``spec_outcome``), 늦은 재조회 여부(``wants_late_check``)도
-  여기 둔다(#88).
+  시나리오 하나의 판정(``runner_output``·``spec_outcome``), 늦은 재조회 여부(``wants_late_check``)와
+  러너에 넘기는 spec(``runner_spec``)도 여기 둔다(#88·#94).
 
 입력은 ``lab_tools/inspect_data.py`` 의 스냅샷(``{"entries": {상대경로: {...}}}``)과 헬스 표본이다.
 표준 라이브러리만 쓴다.
@@ -361,10 +361,20 @@ def wants_late_check(spec: dict) -> bool:
     """stop 1초 뒤 다시 물어 늦은 nats 로그와 읽기 루프 상태를 붙일 시나리오인가(``cancel`` 모드).
 
     취소된 구독 확인의 PONG 은 stop 뒤에 올 수 있다(#66 의 결함은 그때 났다). P2 가 이 값을
-    ``spec["late"]`` 로 넣어 러너에 넘긴다 — 러너는 Django 를 불러 단위 테스트가 닿지 않는다
-    (#88 리뷰 P3-1).
+    ``runner_spec`` 으로 ``spec["late"]`` 에 넣어 러너에 넘긴다 — 러너는 Django 를 불러 단위
+    테스트가 닿지 않는다(#88 리뷰 P3-1).
     """
     return spec.get("mode") == "cancel"
+
+
+def runner_spec(spec: dict) -> dict:
+    """P2 가 ``chanlab_run.py`` 에 넘기는 spec. 기본 ``n`` 200 과 ``late``(``wants_late_check``)를
+    넣는다.
+
+    러너는 ``late`` 키가 없으면 실패한다(#94). 예전에는 ``spec.get("late")`` 라 이 배선이 빠져도
+    늦은 재조회를 조용히 건너뛰었다.
+    """
+    return {"n": 200, **spec, "late": wants_late_check(spec)}
 
 
 def nats_drops(lines: list[str], channel: str) -> int:
