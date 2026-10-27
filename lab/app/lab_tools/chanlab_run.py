@@ -10,9 +10,14 @@
    보낸다(``sender: worker``, 수신 워커가 아닌 쪽).
 4. 수신이 멈출 때까지 기다리고, 꼬리 probe(용량 드롭 합계 로그용)를 보내 다시 기다린 뒤
    ``stop``(``keep`` 이면 남겨 둔다).
-   ``mode: cancel`` 이면 stop 1초 뒤 다시 물어 stop 뒤의 nats 로그(``late_nats_log``)와 읽기 루프
-   상태를 붙인다. 취소된 구독 확인의 PONG 은 stop 뒤에 올 수 있다(#66 의 결함은 그때 났다).
+   ``late`` 면 stop 1초 뒤 다시 물어 stop 뒤의 nats 로그(``late_nats_log``)와 읽기 루프 상태를
+   붙인다. P2 가 ``_checks.wants_late_check``(``cancel`` 모드)로 정해 넘긴다. 취소된 구독 확인의
+   PONG 은 stop 뒤에 올 수 있다(#66 의 결함은 그때 났다).
 5. ``close`` 면 ``await layer.close()`` 시간을 잰다. 아니면 닫지 않고 ``asyncio.run`` 을 끝낸다.
+
+시도가 ``TimeoutError`` 로 끝나면(준비 실패 등) 뒤 시도는 돌리지 않고, 그때까지의 ``trials`` 와
+``error`` 를 마지막 줄 JSON 으로 낸 뒤 rc 1 로 끝난다(#88 리뷰 P2-1). 같은 레이어 인스턴스를
+쓰는 앞 시도의 ``read_loop_alive``·늦은 로그가 원인을 보여 주므로 버리지 않는다.
 
 판정은 하지 않는다(``lab/_checks.py`` 의 ``delivery_problems``).
 
@@ -88,6 +93,7 @@ async def ready(layer, spec, key, channels, workers) -> dict:
                     "cancels": st["cancels"],
                     "errors": st["errors"][-3:],
                     "nats_log": st["nats_log"][-5:],
+                    "read_loop_alive": st["read_loop_alive"],
                 }
                 for pid, st in states.items()
             }
@@ -197,7 +203,7 @@ async def trial(layer, spec, index: int) -> dict:
     states = await settle(key, workers)
     if not spec.get("keep"):
         states = await each_worker("POST", "stop", workers, 60, key=key)
-        if spec.get("mode") == "cancel":
+        if spec.get("late"):
             states = await late(key, workers, states)
     return {"key": key, **readiness, **sent, "workers": list(states.values())}
 
@@ -209,7 +215,8 @@ async def main(spec: dict) -> dict:
         try:
             out["trials"].append(await trial(layer, spec, index))
         except TimeoutError as exc:
-            raise TimeoutError(f"trial {index}: {exc}") from None
+            out["error"] = f"trial {index}: {exc}"
+            break
     if spec.get("close", True):
         t0 = time.monotonic()
         await layer.close()
@@ -222,3 +229,5 @@ if __name__ == "__main__":
     result = asyncio.run(main(json.loads(sys.argv[1])))
     result["run_s"] = round(time.monotonic() - t0, 3)
     print(json.dumps(result))
+    if "error" in result:
+        sys.exit(1)

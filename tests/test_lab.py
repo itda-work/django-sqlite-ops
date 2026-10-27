@@ -572,6 +572,68 @@ def test_p2_not_ready_always_fails():
         assert "pid 1: nats-py read loop stopped" in problems, problems
 
 
+def test_p2_late_check_is_for_cancel_mode_only():
+    """늦은 재조회(stop 1초 뒤)는 ``cancel`` 모드 시나리오에만 건다(#88 리뷰 P3-1)."""
+    c = _checks()
+    assert c.wants_late_check({"kind": "plain", "mode": "cancel", "timeout": 0.5})
+    assert c.wants_late_check({"kind": "group", "mode": "cancel", "timeout": 0.001})
+    assert not c.wants_late_check({"kind": "group"})
+    assert not c.wants_late_check({"kind": "plain", "mode": "steady"})
+
+
+def _ready_trial(*workers, ready=True):
+    return {**_trial(*workers), "ready": ready, "ready_s": 0.1 if ready else None,
+            "probes_sent": 3}  # fmt: skip
+
+
+def test_p2_runner_output_keeps_trials_when_the_runner_fails():
+    """rc≠0 이어도 마지막 줄 JSON 이 있으면 원자료를 살리고, 실패 사유는 그대로 둔다(#88 P2-1)."""
+    c = _checks()
+    data = {"spec": {}, "trials": [], "error": "trial 3: not ready after 9 probes: {}"}
+    out = "noise\n" + json.dumps(data) + "\n"
+    got, error = c.runner_output(1, out, out + "stderr tail")
+    assert got == data
+    assert error == "runner rc 1: trial 3: not ready after 9 probes: {}"
+    # JSON 이 없으면(예: timeout 300 이 죽임) 출력 꼬리를 사유로
+    got, error = c.runner_output(124, "", "Traceback ... boom")
+    assert got is None
+    assert error == "runner rc 124: Traceback ... boom"
+    # rc 0 인데 JSON 이 없거나 trials 가 없으면 실패다
+    for bad in ("", "not json", json.dumps({"spec": {}})):
+        got, error = c.runner_output(0, bad, bad)
+        assert got is None and error.startswith("runner printed no result JSON"), bad
+    ok = {"spec": {}, "trials": [], "run_s": 1.0}
+    assert c.runner_output(0, json.dumps(ok), "") == (ok, None)
+
+
+def test_p2_spec_outcome_judges_trials_before_a_runner_failure():
+    """D2 처럼 한 인스턴스를 쓰는 시도 k 에서 연결이 죽고 k+1 이 준비 실패로 러너가 끝나도,
+    시도 0..k 의 요약·판정과 러너 실패 사유가 함께 남는다(#88 리뷰 P2-1)."""
+    c = _checks()
+    ch = "lab.plain.k"
+    spec = {"id": "D2-cap100", "n": 4, "expect": "record", "mode": "cancel"}
+    alive = _ready_trial(_worker(1, ch, [0, 1], alive=True), _worker(2, ch, [2], alive=True))
+    dead = _ready_trial(_worker(1, ch, [0], alive=False), _worker(2, ch, [1, 2], alive=True))
+    dead["workers"][0]["late_nats_log"] = [DEAD]
+    runner = {"spec": spec, "trials": [alive, dead], "run_s": 9.0,
+              "error": "trial 2: not ready after 40 probes: {}"}  # fmt: skip
+    out = "x\n" + json.dumps(runner)
+    data, error = c.runner_output(1, out, out)
+    result, problems = c.spec_outcome(spec, data, error)
+    assert problems[0] == "runner rc 1: trial 2: not ready after 40 probes: {}"
+    assert "trial 1: pid 1: nats-py read loop stopped" in problems, problems
+    assert any(p.startswith("trial 1: pid 1: nats-py read loop error") for p in problems), problems
+    assert not any(p.startswith("trial 0:") for p in problems), problems
+    assert [t["workers"][0]["read_loop_alive"] for t in result["trials"]] == [True, False]
+    assert result["run_s"] == 9.0
+    # 원자료가 없으면 사유만 남는다
+    assert c.spec_outcome(spec, None, "runner rc 124: x") == ({}, ["runner rc 124: x"])
+    # 러너가 성공하고 시도가 계약대로면 문제가 없다
+    data, error = c.runner_output(0, json.dumps({"trials": [alive], "run_s": 1.0}), "")
+    result, problems = c.spec_outcome(spec, data, error)
+    assert problems == [] and len(result["trials"]) == 1
+
+
 def test_p2_split_queue_group_needs_union_once_and_both_workers():
     c = _checks()
     spec = {"n": 4, "expect": "split"}

@@ -107,7 +107,7 @@ P2 채널 시나리오(`CHANNEL_SPECS`, N=200, 수신 워커 2). 준비 확인: 
 | D2-cap100·D2-cap1000 | D2 와 같은 꼴(일반 채널, 0.5초 폴링, 버스트 200) × `LAB_D2_TRIALS`(20), 수신 `capacity` 100 / 1000. 시도 전부가 한 레이어 인스턴스(`d2cap100`·`d2cap1000`, 연결 하나)를 쓴다 | `record`: 중복·모르는 id 0. 손실은 기록. 한 시도에서 연결이 죽으면 뒤 시도가 준비 실패로 드러난다 |
 | LIVE | 그룹, 수신을 남겨 둔다 | `each`, 이어서 `docker stop` |
 
-모든 시나리오는 송신·수신 예외 0 이고 준비가 끝나야 한다. 워커마다 nats-py 읽기 루프 오류 줄(`nats: encountered error`)이 없고, 그 워커가 쓴 레이어 인스턴스의 읽기 루프가 살아 있어야 한다(`read_loop_alive` 가 False 면 실패 — 로그 줄 없이 끝난 경우도 잡는다. 값은 `notes/chanlab.py` 가 channels-nats·nats-py 내부를 읽어 낸다). `mode: cancel` 시나리오는 stop 1초 뒤 다시 물어 늦게 온 줄(`late_nats_log`)과 읽기 루프 상태를 본다 — 취소된 구독 확인의 PONG 은 stop 뒤에 올 수 있다. 원자료는 `lab/.out/chan-<시각>.json`.
+모든 시나리오는 송신·수신 예외 0 이고 준비가 끝나야 한다. 워커마다 nats-py 읽기 루프 오류 줄(`nats: encountered error`)이 없고, 그 워커가 쓴 레이어 인스턴스의 읽기 루프가 살아 있어야 한다(`read_loop_alive` 가 False 면 실패 — 로그 줄 없이 끝난 경우도 잡는다. 값은 `notes/chanlab.py` 가 channels-nats·nats-py 내부를 읽어 낸다). `mode: cancel` 시나리오는 stop 1초 뒤 다시 물어 늦게 온 줄(`late_nats_log`)과 읽기 루프 상태를 본다(`_checks.wants_late_check`) — 취소된 구독 확인의 PONG 은 stop 뒤에 올 수 있다. 원자료는 `lab/.out/chan-<시각>.json`. 러너가 시도 중간에 실패해도(준비 실패 등, rc 1) 그때까지의 시도 원자료와 판정이 남는다(`_checks.runner_output`·`spec_outcome`). D2 처럼 한 인스턴스를 여러 시도가 쓰면 앞 시도의 `read_loop_alive`·늦은 로그가 뒤 시도 실패의 원인을 보여 준다. 준비 실패 메시지에도 워커별 `read_loop_alive` 가 들어간다.
 
 면제는 없다. #88 전(channels-nats 0.10.0)에는 구독 확인이 취소되면 nats-py 읽기 루프가 `InvalidStateError` 로 끝나는 결함([이관 문서](../docs/research/handoff-marco-nats-flush-cancel.md))이 있어, 1ms 판을 strict xfail 로, P-cancel·D2 를 `defect_ok`(결함 기록만, 시도마다 새 인스턴스)로 두었다. 0.10.1 로 올리자 xfail 이 XPASS 로 알렸고(2026-10-27) 그 장치를 걷어 냈다. 폴링 시나리오는 여전히 별도 레이어 인스턴스를 쓴다 — 회귀가 나도 기본 레이어를 쓰는 시나리오(LIVE 등)로 번지지 않고 그 시나리오의 `-after` 에서 드러난다.
 

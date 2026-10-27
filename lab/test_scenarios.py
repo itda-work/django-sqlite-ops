@@ -17,8 +17,6 @@ import urllib.request
 import pytest
 from _checks import (
     COARSE_SAMPLE_GAP,
-    delivery_problems,
-    delivery_summary,
     error_episodes,
     full_outage_deadline,
     full_outage_problems,
@@ -27,8 +25,11 @@ from _checks import (
     ltx_process_problems,
     max_sample_gap,
     quarantine_problems,
+    runner_output,
+    spec_outcome,
     stale_dirs,
     template_fingerprint,
+    wants_late_check,
 )
 from _lab import OUT, RUN_ID, Stack, boot_lines, decision, http_json, log
 
@@ -247,25 +248,11 @@ CHANNEL_SPECS = [
 ]  # fmt: skip
 
 
-def _compact(spec: dict, trial: dict) -> dict:
-    s = delivery_summary(spec, trial)
-    keys = ("received", "lost", "dup", "drops", "cancels", "cancels_near_send", "in_order",
-            "read_loop_alive")  # fmt: skip
-    return {
-        "workers": [{k: w[k] for k in ("pid", *keys)} for w in s["workers"]],
-        "total": s["total"],
-        "union_lost": s["union_lost"],
-        "lost_ids": s["lost_ids"][:20],
-        "ready": trial["ready"],
-        "ready_s": trial["ready_s"],
-        "probes_sent": trial["probes_sent"],
-        "send_s": round(trial["t1"] - trial["t0"], 3),
-        "senders": s["senders"],
-    }
-
-
 def _run_channel_spec(stack: Stack, spec: dict) -> tuple[dict | None, float, str | None]:
-    """앱 컨테이너 안에서 lab_tools/chanlab_run.py 를 돌린다. (결과, 초, 실패 사유)."""
+    """앱 컨테이너 안에서 lab_tools/chanlab_run.py 를 돌린다. (원자료, 초, 실패 사유).
+
+    러너가 실패해도(rc≠0) 마지막 줄 JSON 이 있으면 그때까지의 원자료를 돌려준다(``runner_output``).
+    """
     t0 = time.monotonic()
     res = stack.compose(
         "exec", "-T", "app", "timeout", "300", "python", "/app/lab_tools/chanlab_run.py",
@@ -273,9 +260,8 @@ def _run_channel_spec(stack: Stack, spec: dict) -> tuple[dict | None, float, str
     )  # fmt: skip
     took = round(time.monotonic() - t0, 2)
     log(f"P2 channels {spec['id']}: rc {res.rc} in {took}s")
-    if res.rc != 0:
-        return None, took, f"runner rc {res.rc}: {res.text[-1500:]}"
-    return json.loads(res.out.strip().splitlines()[-1]), took, None
+    out, error = runner_output(res.rc, res.out, res.text)
+    return out, took, error
 
 
 def _p2_channels(stack: Stack, rec: dict) -> None:
@@ -290,21 +276,12 @@ def _p2_channels(stack: Stack, rec: dict) -> None:
     raw, results, problems = {}, {}, {}
     for spec in CHANNEL_SPECS:
         spec = {"n": 200, **spec}
+        spec["late"] = wants_late_check(spec)
         out, took, error = _run_channel_spec(stack, spec)
-        if error:
-            problems[spec["id"]] = [error]
-            continue
-        raw[spec["id"]] = out
-        trials = out["trials"]
-        results[spec["id"]] = {
-            "runner_s": took,
-            "run_s": out["run_s"],
-            "close_s": out.get("close_s"),
-            "trials": [_compact(spec, t) for t in trials],
-        }
-        found = [
-            f"trial {i}: {p}" for i, t in enumerate(trials) for p in delivery_problems(spec, t)
-        ]
+        if out is not None:
+            raw[spec["id"]] = out
+        result, found = spec_outcome(spec, out, error)
+        results[spec["id"]] = {"runner_s": took, **result}
         if found:
             problems[spec["id"]] = found
     OUT.mkdir(parents=True, exist_ok=True)

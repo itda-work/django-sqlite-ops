@@ -73,7 +73,8 @@ def _layer(capacity: int | None, name: str | None = None):
 def _read_loop_alive(layer) -> bool | None:
     """진단: 이 워커 루프에서 그 레이어 연결의 nats-py 읽기 루프가 살아 있는가(연결이 없으면 None).
 
-    channels-nats(``_states``)·nats-py(``_reading_task``) 내부를 읽는다. 판정이 아니라 기록용이다.
+    channels-nats(``_states``)·nats-py(``_reading_task``) 내부를 읽는다.
+    ``_checks.delivery_problems`` 가 False 면 실패로 낸다(#88).
     """
     try:
         state = layer._states.get(asyncio.get_running_loop())
