@@ -621,6 +621,8 @@ DB 파일이 0바이트면 도입할 데이터가 없으므로 `--adopt-existing
 
 로그의 `decision: ... reason_code=...` 와 그 아래 `hint:` 줄을 본다.
 
+원격 조회가 실패했으면(사유에 `remote lookup failed` 또는 `remote error:`) 사유 코드가 무엇이든 `hint:` 줄이 조회 실패의 원인과 대처(버전 게이트 실패면 판·바이너리 안내, 아니면 복제본 접근 안내)로 시작한다. 사유 코드가 `remote_error` 가 아니면(`stale_meta`·`empty_db`·`orphan_sidecars`) 같은 줄의 `then:` 뒤에 조회가 된 뒤 할 일이 온다. 조회가 실패한 동안은 `--on-unknown restore` 로 다시 돌려도 같은 거부다([D-12](docs/DECISIONS.md)) — 조회부터 고친다.
+
 | 사유 코드 | 뜻 | 대처 |
 |---|---|---|
 | `no_replica_no_local` | 볼륨도 복제본도 비었다 | 첫 배포면 `--init-new` 를 한 번. 아니면 설정의 복제본 경로·prefix 를 확인한다 |

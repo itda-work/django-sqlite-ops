@@ -11,6 +11,7 @@
 
 import fcntl
 import hashlib
+import itertools
 import json
 import os
 import shutil
@@ -28,6 +29,7 @@ from _nodjango import ROOT, assert_runs_without_django
 
 from django_sqlite_ops.boot import cli
 from django_sqlite_ops.boot import litestream as ls
+from django_sqlite_ops.boot.decide import Action, LookupFailure, RemoteError
 
 # 격리 순서대로 놓은 볼륨 파일(-journal 은 WAL 볼륨에 없다).
 VOLUME_NAMES = ("app.db", "app.db-wal", "app.db-shm", ".app.db-litestream")
@@ -1835,6 +1837,131 @@ def test_access_failure_keeps_access_hint(lab, fake, no_exec, capsys):
         "hint: fix replica access (endpoint needs http:// for plain HTTP, credentials, network) "
         "and retry; boot refuses on lookup failure regardless of --on-unknown (D-12)"
     )
+
+
+# --- 원격 조회 실패와 겹친 사유 코드의 힌트 (#100 검수 1) ---------------------------------
+
+# 원격이 RemoteError 일 때 나올 수 있는 사유 코드 전부. decide() 의 셋은
+# test_lookup_failure_reason_codes_are_all_covered 가 입력 전 조합으로 확인한다.
+LOOKUP_FAILURE_CODES = ("remote_error", "stale_meta", "empty_db", "orphan_sidecars")
+ON_UNKNOWN = ("refuse", "restore", "keep-local")
+
+
+def test_lookup_failure_reason_codes_are_all_covered():
+    seen = set()
+    for exists, empty, txid, policy, adopt, init in itertools.product(
+        (True, False), (True, False), (None, 7), ON_UNKNOWN, (True, False), (True, False)
+    ):
+        if empty and not exists:
+            continue
+        d = cli.decide(
+            local_exists=exists,
+            local_empty=empty,
+            local_txid=txid,
+            remote=RemoteError("x"),
+            on_unknown=policy,
+            adopt_existing=adopt,
+            init_new=init,
+        )
+        assert d.action is Action.REFUSE  # D-12
+        seen.add(d.reason_code.value)
+    # orphan_sidecars 는 decide() 앞에서 cli 가 정한다.
+    assert seen | {cli.ORPHAN_SIDECARS} == set(LOOKUP_FAILURE_CODES)
+
+
+def _setup_local(lab: Path, code: str) -> None:
+    db = lab / "app.db"
+    if code == "remote_error":
+        make_db(db, 1)
+        write_meta(db)
+    elif code == "stale_meta":
+        write_meta(db)
+    elif code == "empty_db":
+        db.touch()
+        write_meta(db)
+    else:
+        assert code == "orphan_sidecars"
+        (lab / "app.db-wal").write_bytes(b"x")
+
+
+def _set_failure(fake: Fake, args: list[str], failure: str, tmp_path: Path) -> str:
+    """원격 조회를 그 종류로 실패시키고, 힌트 앞에 나와야 할 조회 안내의 앞부분을 돌려준다."""
+    if failure == "access":
+        fake.remote_error()
+        return "fix replica access (endpoint needs http:// for plain HTTP"
+    if failure == "version_unsupported":
+        fake.set_version("0.5.19")
+        return f"{fake.binary} is litestream 0.5.19, which is not verified"
+    if failure == "version_parse":
+        fake.set_version("litestream development build")
+        return f"'{fake.binary} version' printed 'litestream development build'"
+    assert failure == "version_run"
+    missing = tmp_path / "nope" / "litestream"
+    args[args.index("--litestream") + 1] = str(missing)
+    return f"cannot run '{missing} version'"
+
+
+@pytest.mark.parametrize("failure", [f.value for f in LookupFailure])
+@pytest.mark.parametrize("code", LOOKUP_FAILURE_CODES)
+def test_lookup_failure_hint_comes_first_for_every_reason_code(
+    lab, fake, no_exec, capsys, tmp_path, code, failure
+):
+    """조회가 실패했으면 사유 코드가 무엇이든 힌트가 조회 안내로 시작한다(#100).
+
+    버전 게이트 실패면 어디에도 replica access 가 없다. 힌트가 권하는 --on-unknown restore 로 다시
+    돌려도 같은 거부·같은 힌트이고, remote_error 가 아닌 사유 코드에서는 힌트가 그렇다고 말한다.
+    """
+    _setup_local(lab, code)
+    before = snapshot(lab)
+    hints = []
+    for policy in ON_UNKNOWN:
+        args = boot_args(lab, fake, "--on-unknown", policy)
+        prefix = _set_failure(fake, args, failure, tmp_path)
+        assert main_inproc(args, no_exec) == cli.EXIT_REFUSE
+        err = capsys.readouterr().err
+        assert f"reason_code={code} " in err
+        hints.append(hint_line(err))
+    assert len(set(hints)) == 1
+    hint = hints[0]
+    assert hint.startswith(f"hint: {prefix}"), hint
+    assert "regardless of --on-unknown" in hint and "(D-12)" in hint
+    if failure != "access":
+        assert "replica access" not in hint
+    if code == "remote_error":
+        assert "then:" not in hint
+    else:
+        assert "rerunning with --on-unknown restore returns here (D-12); then: " in hint
+        assert hint.endswith(cli._HINTS[code])
+    assert "restore" not in fake.calls()
+    assert snapshot(lab, skip=("app.db.boot.lock",)) == before
+
+
+@pytest.mark.parametrize("code", ["stale_meta", "empty_db", "orphan_sidecars"])
+def test_following_the_hint_after_fixing_the_version_restores(lab, fake, no_exec, capsys, code):
+    """힌트대로 하면 되돌아오지 않는다: 판을 맞춘 뒤 --on-unknown restore 로 복원된다(#100)."""
+    _setup_local(lab, code)
+    fake.set_version("0.5.19")
+    fake.remote_txid(0x20)
+    args = boot_args(lab, fake, "--on-unknown", "restore")
+    assert main_inproc(args, no_exec) == cli.EXIT_REFUSE
+    assert "then: " in hint_line(capsys.readouterr().err)
+    fake.set_version("0.5.17")  # 힌트의 앞부분: 검증한 판으로 맞춘다
+    assert main_inproc(args, no_exec) == "exec"  # 힌트의 뒷부분: --on-unknown restore
+    assert count_rows(lab / "app.db") == 7
+    s = state(lab)
+    assert (s["action"], s["reason_code"]) == ("quarantine_and_restore", code)
+
+
+@pytest.mark.parametrize("code", ["stale_meta", "empty_db", "orphan_sidecars"])
+def test_local_state_hint_unchanged_when_lookup_succeeds(lab, fake, no_exec, capsys, code):
+    """조회가 성공하면 로컬 상태 힌트는 표의 문구 그대로다(조회 안내가 붙지 않는다)."""
+    _setup_local(lab, code)
+    fake.remote_txid(None)
+    assert main_inproc(boot_args(lab, fake), no_exec) == cli.EXIT_REFUSE
+    err = capsys.readouterr().err
+    assert f"reason_code={code} " in err
+    assert hint_line(err) == f"hint: {cli._HINTS[code]}"
+    assert "replica access" not in cli._HINTS[code]
 
 
 def test_remote_error_refuses_even_with_restore_policy(lab, fake, no_exec, capsys):

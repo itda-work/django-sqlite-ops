@@ -14,6 +14,7 @@
 ### Fixed
 
 - **Litestream 버전 게이트에서 거부할 때 boot 의 힌트가 그 원인을 말한다.** 지금까지는 검증하지 않은 판·바이너리 없음·버전 출력을 읽을 수 없음도 복제본 접근(endpoint·자격 증명·네트워크)을 고치라고 안내했다. 이제 설치된 판과 검증한 판 목록, 바이너리 경로와 설치 안내, 받은 출력을 보여 주고 검증한 판을 설치하거나 `--litestream` 으로 가리키라고 한다. 사유 코드(`remote_error`)·종료 코드(2)·판정은 그대로다. `check_version()` 은 사유 문자열 대신 `VersionProblem`(종류·사유·세부)을 돌려주고, `RemoteError` 에 실패 종류(`failure`)와 세부(`detail`)가 붙는다 (#100)
+- **원격 조회가 실패한 채 `stale_meta`·`empty_db`·`orphan_sidecars` 로 거부될 때 힌트가 조회부터 고치라고 한다.** 지금까지는 조회가 실패한 동안에도 `--on-unknown restore` 를 권해 그대로 다시 돌리면 같은 거부로 돌아왔다. 이제 조회 실패의 원인과 대처가 먼저, `then:` 뒤에 조회가 된 뒤 할 일이 나온다. `empty_db` 힌트 끝의 "if the remote lookup failed, fix replica access first" 는 이 앞부분으로 옮겨 지웠다 (#100)
 
 ## [0.1.0a2] - 2026-10-27
 

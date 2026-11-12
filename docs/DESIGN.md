@@ -61,7 +61,7 @@ python -m django_sqlite_ops.boot \
     [--litestream BIN] [--ltx-timeout S] [--restore-timeout S]   # 기본 litestream, 30, 600
     -- <다음 명령...>                          # 예: litestream replicate -exec "uvicorn ..."
 ```
-구현은 `boot/cli.py`(진입점 `boot/__main__.py`)다. 표준 라이브러리만 쓴다. 단계마다 stderr 에 `[boot] ...` 한 줄을 남긴다(입력, 판정의 state·action·reason_code·reason, 조치, 결과). 거부하면 사유 코드별로 다음에 할 일을 `[boot] hint: ...` 한 줄로 안내한다. `remote_error` 의 힌트는 실패 종류(`RemoteError.failure`, `LookupFailure`)로 가른다: 버전 게이트 실패 셋(검증하지 않은 판 → 설치된 판·검증한 판 목록·`--litestream`, 실행 실패 → 바이너리 경로·설치 안내 주소, 출력 파싱 실패 → 받은 출력·검증한 판 목록)과 그 밖의 접근 실패(endpoint·자격 증명·네트워크). 사유 코드·종료 코드·판정은 종류와 무관하게 같다(#100, 2026-11-12). 사유 코드를 나누지 않은 까닭은 헬스·경보가 `code` 가 아니라 `status` 로 걸리고 0.1.0a2 사용자의 로그 파싱을 깨지 않기 위해서다.
+구현은 `boot/cli.py`(진입점 `boot/__main__.py`)다. 표준 라이브러리만 쓴다. 단계마다 stderr 에 `[boot] ...` 한 줄을 남긴다(입력, 판정의 state·action·reason_code·reason, 조치, 결과). 거부하면 사유 코드별로 다음에 할 일을 `[boot] hint: ...` 한 줄로 안내한다. 원격 조회가 실패했으면(`RemoteError`) 사유 코드가 무엇이든 힌트는 조회 안내로 시작하고, 그 안내는 실패 종류(`RemoteError.failure`, `LookupFailure`)로 가른다: 버전 게이트 실패 셋(검증하지 않은 판 → 설치된 판·검증한 판 목록·`--litestream`, 실행 실패 → 바이너리 경로·설치 안내 주소, 출력 파싱 실패 → 받은 출력·검증한 판 목록)과 그 밖의 접근 실패(endpoint·자격 증명·네트워크). `RemoteError` 와 함께 나오는 사유 코드는 `remote_error`·`stale_meta`·`empty_db`(`decide()`)와 `orphan_sidecars`(cli) 넷이고, 앞의 것이 아니면 '조회가 될 때까지 어떤 `--on-unknown` 으로도 같은 거부(D-12)' 다음 `then:` 뒤에 그 사유 코드의 로컬 상태 안내를 붙인다. 힌트는 거부마다 한 줄(`[boot] hint:` 하나)이다. 사유 코드·종료 코드·판정은 종류와 무관하게 같다(#100, 2026-11-12). 사유 코드를 나누지 않은 까닭은 헬스·경보가 `code` 가 아니라 `status` 로 걸리고 0.1.0a2 사용자의 로그 파싱을 깨지 않기 위해서다.
 
 **경로 계약: 실제 경로만 받는다**(D-15, `real_path()`). `--db`·`--meta-path` 는 다음을 모두 만족해야 하고, 아니면 exit 64 와 함께 실제 경로를 쓰라고 안내한다.
 - 원문에 `..` 구성요소가 없다.
