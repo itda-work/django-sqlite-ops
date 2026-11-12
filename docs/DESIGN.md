@@ -212,7 +212,7 @@ django_sqlite_ops/
 └── vfs.py           (2단계) 확장 로드 우회 — 옵션
 ```
 - 의존성: Django ≥ 5.2(LTS)만 필수다. extra 로 `[nats]` → channels-nats, `[channels-lite]` → channels-lite 를 둔다.
-- 지원 범위(CI `.github/workflows/ci.yml` 이 정본): Python 3.13+, Django 5.2 / 6.1, SQLite 3.37+ (Django 하한). Litestream 은 검증한 판 0.5.17·0.5.18 만 받는다(`VERIFIED_VERSIONS`, 2026-11-12 확인 #99). 판마다 실측 fixture(`tests/fixtures/litestream-<판>/`)와 CI `litestream` 잡의 매트릭스 칸이 하나씩 있고, 게이트·fixture 폴더·매트릭스가 같은 집합인지 테스트가 본다. 범위(`>=`)로 열지 않는다 — 재지 않은 판은 판정할 수 없다. 플랫폼은 POSIX(Linux·macOS)다. 매트릭스는 Linux 이고, macOS 는 `macos` 잡(`macos-latest`, Python 3.14, Django 6.1) 하나가 전체 테스트를 돈다. 이 잡은 `REQUIRE_CASE_INSENSITIVE_FS=1` 이라 대소문자 무시 볼륨 전용 테스트가 skip 되면 실패한다(#50, 2026-10-14 추가). act(`scripts/ci-local.sh`)로는 돌지 않는다.
+- 지원 범위(CI `.github/workflows/ci.yml` 이 정본): Python 3.13·3.14·3.15, Django 5.2 / 6.1(Python 3.15 는 Django 6.1 과만 — Django 5.2 는 3.14 까지, 3.15 는 Django 6.1.3 부터 지원. 2026-11-12 확인 #101), SQLite 3.37+ (Django 하한). classifier(`pyproject.toml`)의 Python·Django 판 집합과 CI `test` 매트릭스가 같은지 테스트(`tests/test_support_matrix.py`)가 본다. Litestream 은 검증한 판 0.5.17·0.5.18 만 받는다(`VERIFIED_VERSIONS`, 2026-11-12 확인 #99). 판마다 실측 fixture(`tests/fixtures/litestream-<판>/`)와 CI `litestream` 잡의 매트릭스 칸(Python 3.14·3.15 두 칸)이 있고, 게이트·fixture 폴더·매트릭스가 같은 집합인지 테스트가 본다. 범위(`>=`)로 열지 않는다 — 재지 않은 판은 판정할 수 없다. 플랫폼은 POSIX(Linux·macOS)다. 매트릭스는 Linux 이고, macOS 는 `macos` 잡(`macos-latest`, Python 3.14, Django 6.1) 하나가 전체 테스트를 돈다. 이 잡은 `REQUIRE_CASE_INSENSITIVE_FS=1` 이라 대소문자 무시 볼륨 전용 테스트가 skip 되면 실패한다(#50, 2026-10-14 추가). act(`scripts/ci-local.sh`)로는 돌지 않는다.
 
 ## 6. 권장 설정, 진단과 체크
 
