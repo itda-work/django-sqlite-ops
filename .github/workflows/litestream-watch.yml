@@ -1,0 +1,30 @@
+# Litestream 의 새 정식 릴리스가 버전 게이트(VERIFIED_VERSIONS)에 없으면 이 저장소에 이슈를 연다(#104).
+# 로직은 scripts/litestream_watch.py 에 있다. 판 번호는 코드(VERIFIED_VERSIONS)만 정본이다.
+# 상대 저장소(benbjohnson/litestream)는 읽기만 한다(D-5). 같은 제목의 이슈가 있으면 만들지 않는다.
+#
+#   gh workflow run litestream-watch.yml
+name: Litestream watch
+
+on:
+  schedule:
+    - cron: "17 0 * * 1" # 매주 월요일 00:17 UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  watch:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: read
+      issues: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+      # 의존성 없이 돈다(boot 는 Django 를 import 하지 않는다). gh 는 러너에 있다
+      - name: Check the latest Litestream release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: uv run --no-project --python 3.14 python scripts/litestream_watch.py
