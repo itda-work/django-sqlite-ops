@@ -33,6 +33,7 @@ from urllib.parse import quote
 from . import litestream as ls
 from .decide import (
     Action,
+    LookupFailure,
     OnUnknown,
     ReasonCode,
     RemoteEmpty,
@@ -875,10 +876,6 @@ _HINTS = {
         "if this is the very first deploy, run once with --init-new and remove it afterwards "
         "(D-13); otherwise check the replica path/prefix in the litestream config"
     ),
-    ReasonCode.REMOTE_ERROR: (
-        "fix replica access (endpoint needs http:// for plain HTTP, credentials, network) and "
-        "retry; boot refuses on lookup failure regardless of --on-unknown (D-12)"
-    ),
     ReasonCode.NO_LOCAL_META: (
         "if the previous boot restored this db and litestream died before writing its first "
         "L0 (D-14), rerun once with --on-unknown restore; to put an existing db on an empty "
@@ -902,7 +899,7 @@ _HINTS = {
         "really empty, then if the replica has data rerun with --on-unknown restore to "
         "quarantine the empty file, sidecars and meta and restore from it; if the replica is "
         "empty, inspect and remove the empty file, sidecars and meta yourself and boot once "
-        "with --init-new (D-13); if the remote lookup failed, fix replica access first (D-12)"
+        "with --init-new (D-13)"
     ),
     ORPHAN_SIDECARS: (
         "-wal/-shm/-journal exist without the db file; inspect them, or rerun with "
@@ -928,6 +925,54 @@ _EMPTY_NO_META_HINTS = {
 }
 
 
+# 원격 조회가 실패했을 때의 힌트(#100). 사유 코드가 무엇이든 조회 실패의 원인과 대처를 먼저
+# 말하고, 사유 코드가 remote_error 가 아니면 조회가 된 뒤 할 일(로컬 상태 안내)을 뒤에 붙인다.
+# 한 줄로 낸다: 운영자가 grep 하는 `[boot] hint:` 가 거부마다 하나라는 형식을 지킨다.
+_ACCESS_FIX = (
+    "fix replica access (endpoint needs http:// for plain HTTP, credentials, network) and retry"
+)
+
+
+def _lookup_fix(remote: RemoteError, binary: str) -> str:
+    """조회 실패의 원인과 대처(실패 종류별). D-12 꼬리말은 붙이지 않는다."""
+    verified = ls.verified_versions_text()
+    shown = " ".join(binary.split())
+    if remote.failure is LookupFailure.VERSION_UNSUPPORTED:
+        return (
+            f"{shown} is litestream {remote.detail}, which is not verified "
+            f"(verified: {verified}); install a verified version or point --litestream at a "
+            "verified binary"
+        )
+    if remote.failure is LookupFailure.VERSION_RUN:
+        return (
+            f"cannot run '{shown} version' (missing, not executable, timed out or failed); "
+            "install litestream (https://litestream.io/install/) or point --litestream at the "
+            "binary"
+        )
+    if remote.failure is LookupFailure.VERSION_PARSE:
+        return (
+            f"'{shown} version' printed {remote.detail!r}, not a version number "
+            f"(verified: {verified}); check that --litestream points at the litestream binary "
+            "and install a verified version"
+        )
+    return _ACCESS_FIX
+
+
+def _lookup_failed_hint(reason_code: str, remote: RemoteError, binary: str) -> str:
+    """원격 조회 실패로 거부할 때의 힌트. 조회 안내가 먼저, 로컬 상태 안내가 뒤다."""
+    fix = _lookup_fix(remote, binary)
+    what = "lookup failure" if remote.failure is LookupFailure.ACCESS else "a version-gate failure"
+    if reason_code == ReasonCode.REMOTE_ERROR:
+        return f"{fix}; boot refuses on {what} regardless of --on-unknown (D-12)"
+    # 조회가 실패한 동안은 어떤 --on-unknown 으로도 같은 거부다(D-12). 뒤의 안내는 그다음 일이다.
+    hint = (
+        f"{fix}; until the lookup succeeds boot refuses on {what} regardless of --on-unknown, "
+        "so rerunning with --on-unknown restore returns here (D-12)"
+    )
+    local = _HINTS.get(reason_code)
+    return f"{hint}; then: {local}" if local else hint
+
+
 def _plan(args: argparse.Namespace) -> _Plan:
     db, meta = args.db, args.meta_path
     local_exists, local_empty = local_db_state(db)
@@ -951,7 +996,10 @@ def _plan(args: argparse.Namespace) -> _Plan:
         reason = f"no local db but {', '.join(orphans)} exist; remote {remote_text}"
         if args.on_unknown == OnUnknown.RESTORE.value and type(remote) is RemoteTxid:
             return _Plan(State.UNKNOWN, Action.QUARANTINE_AND_RESTORE, ORPHAN_SIDECARS, reason)
-        return _Plan(State.UNKNOWN, Action.REFUSE, ORPHAN_SIDECARS, reason)
+        hint = None
+        if type(remote) is RemoteError:
+            hint = _lookup_failed_hint(ORPHAN_SIDECARS, remote, args.litestream)
+        return _Plan(State.UNKNOWN, Action.REFUSE, ORPHAN_SIDECARS, reason, hint)
 
     d = decide(
         local_exists=local_exists,
@@ -971,6 +1019,9 @@ def _plan(args: argparse.Namespace) -> _Plan:
     hint = None
     if local_empty and d.reason_code is ReasonCode.NO_LOCAL_META:
         hint = _EMPTY_NO_META_HINTS.get(type(remote))
+    elif type(remote) is RemoteError:
+        # 사유 코드가 무엇이든(remote_error·stale_meta·empty_db) 조회 실패를 먼저 안내한다.
+        hint = _lookup_failed_hint(d.reason_code, remote, args.litestream)
     return _Plan(d.state, d.action, d.reason_code, reason, hint)
 
 

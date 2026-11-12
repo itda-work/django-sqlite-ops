@@ -14,6 +14,7 @@ from _nodjango import assert_runs_without_django
 from django_sqlite_ops.boot.decide import (
     Action,
     Decision,
+    LookupFailure,
     OnUnknown,
     ReasonCode,
     RemoteEmpty,
@@ -550,6 +551,42 @@ class _Str(str):
 def test_invalid_remote_error_message(message):
     with pytest.raises(ValueError, match="message"):
         RemoteError(message)
+
+
+@pytest.mark.parametrize("failure", [None, "access", 1])
+def test_invalid_remote_error_failure(failure):
+    with pytest.raises(ValueError, match="failure"):
+        RemoteError("x", failure)
+
+
+@pytest.mark.parametrize("detail", [None, 3, b"x", _Str("x")])
+def test_invalid_remote_error_detail(detail):
+    with pytest.raises(ValueError, match="detail"):
+        RemoteError("x", LookupFailure.ACCESS, detail)
+
+
+@pytest.mark.parametrize(("field", "value"), [("failure", "access"), ("detail", _Str("x"))])
+def test_remote_error_mutated_kind_is_rejected(field, value):
+    remote = RemoteError("x")
+    object.__setattr__(remote, field, value)
+    with pytest.raises(ValueError, match=field):
+        decide(local_exists=True, local_txid=5, remote=remote)
+
+
+@pytest.mark.parametrize("failure", list(LookupFailure))
+@pytest.mark.parametrize("policy", POLICIES)
+@pytest.mark.parametrize(("local", "txid"), [(True, 5), (False, None), (True, None)])
+def test_decision_ignores_lookup_failure_kind(failure, policy, local, txid):
+    """실패 종류는 안내용이다. 판정은 종류와 무관하게 같다(#100)."""
+    base = decide(local_exists=local, local_txid=txid, remote=ERR, on_unknown=policy)
+    got = decide(
+        local_exists=local,
+        local_txid=txid,
+        remote=RemoteError("timeout", failure, "0.5.19"),
+        on_unknown=policy,
+    )
+    assert got == base
+    assert got.reason_code is ReasonCode.REMOTE_ERROR and got.action is Action.REFUSE
 
 
 def test_remote_txid_mutated_after_creation_is_rejected():

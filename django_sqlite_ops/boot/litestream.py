@@ -23,7 +23,7 @@ import subprocess
 from dataclasses import dataclass
 from pathlib import Path
 
-from .decide import Remote, RemoteEmpty, RemoteError, RemoteTxid
+from .decide import LookupFailure, Remote, RemoteEmpty, RemoteError, RemoteTxid
 
 __all__ = [
     "DEFAULT_LTX_TIMEOUT",
@@ -32,6 +32,7 @@ __all__ = [
     "LtxWalRange",
     "VERIFIED_VERSIONS",
     "RestoreResult",
+    "VersionProblem",
     "check_version",
     "config_databases",
     "default_meta_path",
@@ -43,6 +44,7 @@ __all__ = [
     "parse_version",
     "remote_max_txid",
     "restore",
+    "verified_versions_text",
     "version",
 ]
 
@@ -182,21 +184,47 @@ def version(*, binary: str = "litestream", timeout: float = DEFAULT_VERSION_TIME
     return parse_version(run.stdout)
 
 
+@dataclass(frozen=True, slots=True)
+class VersionProblem:
+    """버전 게이트 실패. ``message`` 는 사유 한 줄, ``failure`` 는 그 종류(#100).
+
+    ``detail`` 은 ``VERSION_UNSUPPORTED`` 면 설치된 판, ``VERSION_PARSE`` 면 받은 출력 한 줄이고,
+    ``VERSION_RUN`` 이면 빈 문자열이다.
+    """
+
+    failure: LookupFailure
+    message: str
+    detail: str = ""
+
+
+def verified_versions_text() -> str:
+    """검증한 판 목록 한 줄(``0.5.17, 0.5.18``)."""
+    return ", ".join(sorted(VERIFIED_VERSIONS))
+
+
 def check_version(
     *, binary: str = "litestream", timeout: float = DEFAULT_VERSION_TIMEOUT
-) -> str | None:
-    """검증한 버전이면 ``None``, 아니면(읽지 못한 경우 포함) 사유 한 줄."""
+) -> VersionProblem | None:
+    """검증한 버전이면 ``None``, 아니면(읽지 못한 경우 포함) ``VersionProblem``."""
     run = _run([binary, "version"], timeout)
     if isinstance(run, str):
-        return run
+        return VersionProblem(LookupFailure.VERSION_RUN, run)
     if run.rc != 0:
-        return _failure("version", run)
+        return VersionProblem(LookupFailure.VERSION_RUN, _failure("version", run))
     version = parse_version(run.stdout)
     if version is None:
-        return f"cannot parse litestream version output: {_one_line(run.stdout)!r}"
+        output = _one_line(run.stdout)
+        return VersionProblem(
+            LookupFailure.VERSION_PARSE,
+            f"cannot parse litestream version output: {output!r}",
+            output,
+        )
     if version not in VERIFIED_VERSIONS:
-        verified = ", ".join(sorted(VERIFIED_VERSIONS))
-        return f"unsupported litestream version {version}; verified: {verified}"
+        return VersionProblem(
+            LookupFailure.VERSION_UNSUPPORTED,
+            f"unsupported litestream version {version}; verified: {verified_versions_text()}",
+            version,
+        )
     return None
 
 
@@ -260,7 +288,7 @@ def remote_max_txid(
     """
     problem = check_version(binary=binary, timeout=version_timeout)
     if problem is not None:
-        return RemoteError(problem)
+        return RemoteError(problem.message, problem.failure, problem.detail)
     argv = [
         binary,
         "ltx",
@@ -322,7 +350,7 @@ def config_databases(
     """
     problem = check_version(binary=binary, timeout=version_timeout)
     if problem is not None:
-        return problem
+        return problem.message
     run = _run([binary, "databases", "-config", os.fspath(config), "-json"], timeout, cwd=cwd)
     if isinstance(run, str):
         return run
@@ -513,7 +541,7 @@ def restore(
         return RestoreResult(False, f"invalid integrity_check {integrity_check!r}")
     problem = check_version(binary=binary, timeout=version_timeout)
     if problem is not None:
-        return RestoreResult(False, problem)
+        return RestoreResult(False, problem.message)
     argv = [
         binary,
         "restore",

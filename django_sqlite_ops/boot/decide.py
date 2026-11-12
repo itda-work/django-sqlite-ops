@@ -16,6 +16,7 @@ from typing import Any
 __all__ = [
     "Action",
     "Decision",
+    "LookupFailure",
     "OnUnknown",
     "ReasonCode",
     "Remote",
@@ -69,14 +70,38 @@ class OnUnknown(StrEnum):
     KEEP_LOCAL = "keep-local"
 
 
+class LookupFailure(StrEnum):
+    """원격 조회 실패의 종류. 판정은 보지 않고 운영자 안내(boot 힌트)만 가른다(#100).
+
+    사유 코드는 모두 ``remote_error`` 다. 버전 게이트(``check_version()``) 실패 셋과 그 밖의
+    조회 실패(접근·타임아웃·출력 파싱)를 나눈다.
+    """
+
+    # 버전 게이트를 지난 뒤의 조회 실패(endpoint·자격 증명·네트워크·타임아웃·설정에 없는 경로).
+    ACCESS = "access"
+    # `litestream version` 이 검증한 판이 아니다. detail 은 설치된 판.
+    VERSION_UNSUPPORTED = "version_unsupported"
+    # `litestream version` 을 실행하지 못했다(없음·권한·타임아웃·rc≠0).
+    VERSION_RUN = "version_run"
+    # `litestream version` 출력이 X.Y.Z 가 아니다. detail 은 받은 출력 한 줄.
+    VERSION_PARSE = "version_parse"
+
+
 @dataclass(frozen=True, slots=True)
 class RemoteError:
-    """원격 조회 실패(타임아웃·인증·파싱 실패 모두)."""
+    """원격 조회 실패(타임아웃·인증·파싱 실패 모두).
+
+    ``failure`` 와 ``detail`` 은 안내용이다. ``decide()`` 의 판정은 이 둘과 무관하다.
+    """
 
     message: str
+    failure: LookupFailure = LookupFailure.ACCESS
+    detail: str = ""
 
     def __post_init__(self) -> None:
         _check_message(self.message)
+        _check_failure(self.failure)
+        _check_detail(self.detail)
 
 
 @dataclass(frozen=True, slots=True)
@@ -129,6 +154,18 @@ def _check_message(value: Any) -> str:
     return value
 
 
+def _check_failure(value: Any) -> LookupFailure:
+    if type(value) is not LookupFailure:
+        raise ValueError(f"invalid remote error failure {_show(value)}; must be a LookupFailure")
+    return value
+
+
+def _check_detail(value: Any) -> str:
+    if type(value) is not str:
+        raise ValueError(f"invalid remote error detail {_show(value)}; must be a str")
+    return value
+
+
 def _check_bool(label: str, value: Any) -> bool:
     if type(value) is not bool:
         raise ValueError(f"invalid {label} {_show(value)}; must be a bool")
@@ -177,6 +214,9 @@ def _normalize_remote(remote: Any) -> _Remote:
     kind = type(remote)
     if kind is RemoteError:
         message = _check_message(remote.message)
+        # 판정에는 쓰지 않지만 공개 입력이므로 같은 규칙으로 본다.
+        _check_failure(remote.failure)
+        _check_detail(remote.detail)
         # reason 은 한 줄이어야 한다. str.splitlines 의 줄 구분자를 모두 공백으로 바꾼다.
         return _Remote(_Kind.ERROR, message=" ".join(message.splitlines()))
     if kind is RemoteEmpty:
