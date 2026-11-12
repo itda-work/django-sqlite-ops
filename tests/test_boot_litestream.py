@@ -30,7 +30,7 @@ from _litestream import (
 from _nodjango import assert_runs_without_django
 
 from django_sqlite_ops.boot import litestream as ls
-from django_sqlite_ops.boot.decide import RemoteEmpty, RemoteError, RemoteTxid
+from django_sqlite_ops.boot.decide import LookupFailure, RemoteEmpty, RemoteError, RemoteTxid
 
 
 def fake_binary(tmp_path: Path, body: str, *, version: str = "0.5.17") -> str:
@@ -197,8 +197,10 @@ def test_gate_accepts_verified_version(tmp_path, version):
 @pytest.mark.parametrize("version", ["0.5.16", "0.5.19", "0.6.0"])
 def test_gate_rejects_other_versions(tmp_path, version):
     binary = fake_binary(tmp_path, "echo '[]'", version=version)
-    assert ls.check_version(binary=binary) == (
-        f"unsupported litestream version {version}; verified: 0.5.17, 0.5.18"
+    assert ls.check_version(binary=binary) == ls.VersionProblem(
+        LookupFailure.VERSION_UNSUPPORTED,
+        f"unsupported litestream version {version}; verified: 0.5.17, 0.5.18",
+        version,
     )
     assert type(ls.remote_max_txid("app.db", config="c.yml", binary=binary)) is RemoteError
     assert argv_log(tmp_path) == ["version", "version"]
@@ -420,7 +422,8 @@ def test_remote_query_bad_path_is_remote_error(tmp_path, field):
 def test_check_version_bad_binary_path_is_message():
     problem = ls.check_version(binary="bad\0binary")
     assert problem is not None
-    assert "embedded null byte" in problem
+    assert problem.failure is LookupFailure.VERSION_RUN
+    assert "embedded null byte" in problem.message
 
 
 @pytest.mark.parametrize("field", ["binary", "config", "db_path", "output"])
@@ -441,12 +444,17 @@ def test_missing_binary_is_remote_error(tmp_path):
     result = ls.remote_max_txid("app.db", config="c.yml", binary=str(tmp_path / "nope"))
     assert type(result) is RemoteError
     assert "cannot run" in result.message
+    assert (result.failure, result.detail) == (LookupFailure.VERSION_RUN, "")
 
 
 def test_unsupported_version_is_remote_error(tmp_path):
     binary = fake_binary(tmp_path, "echo '[]'", version="0.5.19")
     result = ls.remote_max_txid("app.db", config="c.yml", binary=binary)
-    assert result == RemoteError("unsupported litestream version 0.5.19; verified: 0.5.17, 0.5.18")
+    assert result == RemoteError(
+        "unsupported litestream version 0.5.19; verified: 0.5.17, 0.5.18",
+        LookupFailure.VERSION_UNSUPPORTED,
+        "0.5.19",
+    )
     # 버전이 맞지 않으면 ltx 를 부르지 않는다.
     assert argv_log(tmp_path) == ["version"]
 
@@ -462,6 +470,24 @@ def test_unparseable_version_is_remote_error(tmp_path):
     result = ls.remote_max_txid("app.db", config="c.yml", binary=binary)
     assert type(result) is RemoteError
     assert "cannot parse litestream version" in result.message
+    assert (result.failure, result.detail) == (LookupFailure.VERSION_PARSE, "development build")
+
+
+def test_version_rc_nonzero_is_run_failure(tmp_path):
+    binary = fake_binary(tmp_path, "echo '[]'")
+    Path(binary).write_text("#!/bin/sh\necho 'Error: boom' >&2\nexit 4\n")
+    result = ls.remote_max_txid("app.db", config="c.yml", binary=binary)
+    assert result == RemoteError(
+        "litestream version exited with 4: Error: boom", LookupFailure.VERSION_RUN
+    )
+
+
+def test_ltx_failure_after_gate_is_access_failure(tmp_path):
+    """버전 게이트를 지난 뒤의 실패는 접근 실패다(#100 — 힌트가 그대로)."""
+    binary = fake_binary(tmp_path, "echo 'Error: database not found in config' >&2; exit 1")
+    result = ls.remote_max_txid("app.db", config="c.yml", binary=binary)
+    assert type(result) is RemoteError
+    assert (result.failure, result.detail) == (LookupFailure.ACCESS, "")
 
 
 def test_nonzero_rc_uses_last_stderr_line(tmp_path):

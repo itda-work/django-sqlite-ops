@@ -33,6 +33,7 @@ from urllib.parse import quote
 from . import litestream as ls
 from .decide import (
     Action,
+    LookupFailure,
     OnUnknown,
     ReasonCode,
     RemoteEmpty,
@@ -928,6 +929,35 @@ _EMPTY_NO_META_HINTS = {
 }
 
 
+# 버전 게이트 실패의 힌트(#100). 사유 코드는 remote_error 그대로이고 거부도 D-12 그대로다.
+_VERSION_GATE_TAIL = "boot refuses on a version-gate failure regardless of --on-unknown (D-12)"
+
+
+def _version_hint(remote: RemoteError, binary: str) -> str | None:
+    """버전 게이트 실패면 그 원인과 대처를, 접근 실패면 ``None``(기본 힌트)을 돌려준다."""
+    verified = ls.verified_versions_text()
+    shown = " ".join(binary.split())
+    if remote.failure is LookupFailure.VERSION_UNSUPPORTED:
+        return (
+            f"{shown} is litestream {remote.detail}, which is not verified "
+            f"(verified: {verified}); install a verified version or point --litestream at a "
+            f"verified binary; {_VERSION_GATE_TAIL}"
+        )
+    if remote.failure is LookupFailure.VERSION_RUN:
+        return (
+            f"cannot run '{shown} version' (missing, not executable, timed out or failed); "
+            "install litestream (https://litestream.io/install/) or point --litestream at the "
+            f"binary; {_VERSION_GATE_TAIL}"
+        )
+    if remote.failure is LookupFailure.VERSION_PARSE:
+        return (
+            f"'{shown} version' printed {remote.detail!r}, not a version number "
+            f"(verified: {verified}); check that --litestream points at the litestream binary "
+            f"and install a verified version; {_VERSION_GATE_TAIL}"
+        )
+    return None
+
+
 def _plan(args: argparse.Namespace) -> _Plan:
     db, meta = args.db, args.meta_path
     local_exists, local_empty = local_db_state(db)
@@ -971,6 +1001,8 @@ def _plan(args: argparse.Namespace) -> _Plan:
     hint = None
     if local_empty and d.reason_code is ReasonCode.NO_LOCAL_META:
         hint = _EMPTY_NO_META_HINTS.get(type(remote))
+    elif d.reason_code is ReasonCode.REMOTE_ERROR and type(remote) is RemoteError:
+        hint = _version_hint(remote, args.litestream)
     return _Plan(d.state, d.action, d.reason_code, reason, hint)
 
 

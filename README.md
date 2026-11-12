@@ -624,7 +624,7 @@ DB 파일이 0바이트면 도입할 데이터가 없으므로 `--adopt-existing
 | 사유 코드 | 뜻 | 대처 |
 |---|---|---|
 | `no_replica_no_local` | 볼륨도 복제본도 비었다 | 첫 배포면 `--init-new` 를 한 번. 아니면 설정의 복제본 경로·prefix 를 확인한다 |
-| `remote_error` | 복제본 조회 실패·타임아웃 | 네트워크·자격 증명·endpoint(평문 HTTP 면 `http://` 를 붙인다)를 고친다. 이 경우는 `--on-unknown` 과 무관하게 거부한다([D-12](docs/DECISIONS.md)) |
+| `remote_error` | 복제본 조회 실패·타임아웃. Litestream 버전 게이트 실패(검증하지 않은 판, 바이너리를 실행할 수 없음, `litestream version` 출력을 읽을 수 없음)도 여기 든다 | 네트워크·자격 증명·endpoint(평문 HTTP 면 `http://` 를 붙인다)를 고친다. 버전 게이트 실패면 `hint:` 줄이 그 원인(설치된 판·검증한 판·바이너리 경로)을 말하니 검증한 판을 설치하거나 `--litestream` 으로 그 바이너리를 가리킨다([문제 해결 boot](#boot)). 이 경우는 `--on-unknown` 과 무관하게 거부한다([D-12](docs/DECISIONS.md)) |
 | `remote_ahead` | 복제본이 이 볼륨보다 새롭다(옛 볼륨으로 재부팅) | 복제본이 정본이면 `--on-unknown restore` 로 한 번 부팅한다. 로컬은 `<db>.stale-<ts>/` 에 남는다 |
 | `no_local_meta` | DB 는 있는데 Litestream 메타가 없다 | 아래 '복원 직후 크래시 복구'. 기존 DB 를 처음 올리는 중이고 복제본이 비었으면 `--adopt-existing`. 사유에 `local db is 0 bytes` 가 있으면 아래 '0바이트 DB 복구'의 '메타가 없을 때'([D-18](docs/DECISIONS.md)) |
 | `stale_meta` | DB 없이 메타만 남았다 | `--on-unknown restore` 로 메타를 격리하고 복원한다 |
@@ -947,6 +947,9 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 | 첫 배포에서 exit 2, `no_replica_no_local` | Litestream 은 복제본 경로·prefix 오타와 "복제본 없음"을 똑같이 rc 0·`[]` 로 돌려준다 | 경로를 확인하고 `--init-new` 를 한 번만([생애 첫 배포](#생애-첫-배포---init-new-를-한-번-쓰고-끈다)) | 재현함(Litestream 0.5.17, #3) |
 | exit 2, `remote_error` 이고 사유에 `timed out` (평문 HTTP S3 호환 서버) | `endpoint` 에 스킴이 없으면 Litestream 이 HTTPS 로 접속해 끝없이 기다리고, boot 가 `--ltx-timeout`(기본 30초)에서 끊는다 | `endpoint: http://…` 로 스킴을 붙인다 | 재현함(평범한 HTTP 서버로) |
 | S3 가 내려가 연결을 거부해 exit 2, `remote_error`. 0.5.17 은 30초 걸리고 사유 `timed out`, 0.5.18 은 약 8초에 사유 `exited with 1: … exceeded maximum number of attempts` | Litestream 0.5.17 의 `ltx` 는 연결 거부에도 곧바로 실패하지 않고 재시도하며 기다린다. 0.5.18 은 S3 재시도를 다 쓰면 스스로 실패한다 | S3 를 복구한 뒤 다시 띄운다. 0.5.17 에서 더 빨리 거부하려면 `--ltx-timeout` 을 줄인다 | 재현함(회귀 랩 L4: toxiproxy 로 끊음 → 0.5.17 30.5초, 0.5.18 7.7초, [#99](docs/research/lab-2026-11-12-litestream-0.5.18.md)) |
+| exit 2, `remote_error` 이고 사유에 `unsupported litestream version` | 설치된 Litestream 이 검증한 판이 아니다. boot 는 출력 형식을 재지 않은 판으로 판정하지 않는다. `hint:` 줄에 설치된 판과 검증한 판 목록이 나온다 | 검증한 판을 설치하거나 `--litestream` 으로 그 바이너리를 가리킨다. 새 판을 받으려면 이 패키지의 새 릴리스를 기다린다([지원 범위](docs/DESIGN.md#5-django-쪽-구성)) | 재현함(`version` 에 다른 판을 답하는 대역, #100) |
+| exit 2, `remote_error` 이고 사유에 `cannot run`(`No such file or directory`·`Permission denied`) 또는 `litestream version exited with` | `--litestream`(기본 `litestream`, `PATH` 에서 찾는다)을 실행할 수 없다. `hint:` 줄에 그 경로가 나온다 | Litestream 을 설치하거나(<https://litestream.io/install/>) `--litestream` 에 실행 가능한 절대 경로를 준다 | 재현함(없는 경로, #100) |
+| exit 2, `remote_error` 이고 사유에 `cannot parse litestream version output` | `--litestream` 이 Litestream 이 아니거나 개발 빌드라 `litestream version` 이 `X.Y.Z` 가 아니다. `hint:` 줄에 받은 출력이 나온다 | `--litestream` 이 릴리스 바이너리를 가리키는지 확인하고 검증한 판을 설치한다 | 재현함(대역, #100) |
 | exit 2, `remote_error` 이고 사유에 `database not found in config` | `--db` 가 `litestream.yml` 의 `path` 와 다르다 | 세 곳을 같은 실제 경로로([경로 규칙](#경로-규칙)) | 재현함(fixture `ltx_db_not_in_config`) |
 | exit 64, 실제 경로 안내 | `--db`·`--meta-path` 의 부모에 심볼릭 링크·`..`·없는 디렉터리 | 안내된 실제 경로를 쓰고, 이미지에서 부모 디렉터리를 만든다([경로 규칙](#경로-규칙)) | 코드상 확인([D-15](docs/DECISIONS.md)) |
 | exit 64, `--meta-path ... overlaps the boot lock`(또는 db·state file·`--config`·restore/quarantine area) | `--meta-path` 가 boot 소유 경로와 같거나 조상·자손이다. 그대로 두면 복원 때 boot 가 잠금·상태 파일을 격리해 잠금 보호가 사라진다 | Litestream 설정의 `meta-path` 와 같은 자기만의 디렉터리를 준다([함정](#함정)) | 재현함(#39, 실제 litestream 으로 두 번째 잠금 획득) |
