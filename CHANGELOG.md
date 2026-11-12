@@ -10,6 +10,7 @@
 
 - **Python 3.15 를 지원한다.** Django 6.1(3.15 를 지원하는 6.1.3 이상)과 함께다. Django 5.2 는 Python 3.14 까지 지원하므로 3.15 × Django 5.2 는 지원 범위가 아니다. CI 가 3.15 에서 전체 테스트와 실제 Litestream(0.5.17·0.5.18)·channels-lite 통합 테스트를 돌고, classifier 에 `Programming Language :: Python :: 3.15` 를 넣었다 (#101)
 - **시스템 체크 `sqlite_ops.W006`: `ATOMIC_REQUESTS` 와 `transaction_mode` `IMMEDIATE`(또는 `EXCLUSIVE`)를 함께 쓰면 알린다.** 이 조합에서는 뷰마다 `BEGIN IMMEDIATE` 가 쓰기 잠금을 뷰 끝까지 쥐어 읽기만 하는 뷰도 직렬로 돈다(0.3초 뷰 4개 동시 호출에 0.32·0.67·0.99·1.31초, 끄면 모두 0.32초 — 재현함). 항상 도는 체크이고 DB 를 열지 않는다. 읽기 전용·VFS·메모리 DB 별칭에는 내지 않는다. 힌트는 `ATOMIC_REQUESTS` 를 끄고 쓰는 뷰에만 `transaction.atomic()` 을 쓰거나 읽기 뷰에 `transaction.non_atomic_requests` 를 붙이라고 안내한다. 설정은 바꾸지 않는다. 의도한 구성이면 `SILENCED_SYSTEM_CHECKS` 로 끈다. `check --fail-level WARNING` 을 쓰는 CI 는 이 조합에서 실패로 바뀐다 (#102)
+- **`sqlite_doctor` 가 SQLite WAL-reset 버그의 영향 범위인 판을 알린다.** SQLite 공식 문서(https://sqlite.org/wal.html#the_wal_reset_bug, 2026-11-12 확인)의 범위(3.7.0~3.51.2, 3.51.3 에서 수정, 3.44.6·3.50.7 로 백포트)에 들면 `sqlite_version` 줄에 메시지를 적는다. 판 번호만 보므로 배포판이 판 번호를 바꾸지 않고 패치했을 수 있다. **수준은 `ok` 이고 종료 코드는 바뀌지 않는다**(프로필 이미지 `python:3.13-slim` 의 3.46.1 도 범위 안이다). `--json` 의 키는 그대로다. 판정 함수 `doctor.wal_reset_affected()` 를 둔다 (#103)
 
 ### Changed
 

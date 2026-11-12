@@ -138,6 +138,8 @@ Litestream 은 공식 설치 방법(릴리스 `.deb` + `dpkg`, https://litestrea
 
 > **종단 검증함**(회귀 랩 P1, [`lab-2026-10-08.md`](../research/lab-2026-10-08.md)). 이 Dockerfile 을 그대로 빌드해(`python:3.13-slim`, linux/arm64 와 linux/amd64) 아래 compose 로 띄우고 첫 배포·`check --deploy`·`sqlite_doctor`·정지·재부팅을 확인했다. 랩은 `requirements.txt` 의 패키지 줄만 작업 트리 wheel 로 바꾼다.
 
+> **이 이미지의 SQLite 와 WAL-reset 버그.** `python:3.13-slim`(Debian 기반)의 Python 은 SQLite 3.46.1 을 쓴다(랩 기록, 2026-10). SQLite 공식 문서가 적은 [WAL-reset 버그](https://sqlite.org/wal.html#the_wal_reset_bug)의 영향 범위(3.7.0~3.51.2, 3.51.3 에서 수정, 3.44.6·3.50.7 로 백포트) 안이다. 이 프로필(WAL + Litestream 의 체크포인트)은 버그의 조건(연결 둘 이상이 쓰기·체크포인트를 같은 순간에)에 해당한다. SQLite 는 발생률이 매우 낮고 긴급하지 않다고 평가한다. `sqlite_doctor` 는 `sqlite_version` 줄에 이 사실을 메시지로 적지만 수준은 `ok` 이고 종료 코드(exit 0)는 그대로다. Debian 의 백포트 여부는 미확인이다(2026-11-12, [README](../../README.md#sqlite-wal-reset-버그)).
+
 ```dockerfile
 FROM python:3.13-slim
 
