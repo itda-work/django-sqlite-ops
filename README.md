@@ -315,7 +315,7 @@ python manage.py check --deploy   # W001·W002·W004 는 --deploy 일 때만 나
 | `sqlite_ops.W002` | `OPTIONS["init_command"]` 에서 `journal_mode` 가 `WAL` 로 설정되지 않음, 또는 `journal_mode` 를 언급하는 문장의 형식을 판정할 수 없음 | `--deploy` | `sqlite_database()` 를 쓰거나 `init_command` 에 `PRAGMA journal_mode=WAL` 을 넣는다 |
 | `sqlite_ops.W003` | 이름이 Litestream VFS(`vfs=litestream` 이 든 `file:` URI)인 별칭의 `CONN_MAX_AGE` 가 `None` 이 아님, 그리고 [ASGI 근거](#asgi-판단)가 없음(WSGI 로 본다) | 항상 | 그 별칭에 `"CONN_MAX_AGE": None`. WSGI 실측에서 요청당 1,008ms → 1.7ms |
 | `sqlite_ops.W005` | VFS 가 아닌 SQLite 별칭의 `CONN_MAX_AGE` 가 `None`, 그리고 [ASGI 근거](#asgi-판단)가 있음 | 항상 | 그 별칭의 `"CONN_MAX_AGE"` 를 `0` 으로 하거나 키를 지운다. ASGI 동기 뷰에서는 연결이 재사용되지 않고 닫히지도 않는다([문제 해결](#설정체크)) |
-| `sqlite_ops.W006` | SQLite 별칭의 `ATOMIC_REQUESTS` 가 참이고 `OPTIONS["transaction_mode"]` 가 `IMMEDIATE` 또는 `EXCLUSIVE`(대소문자 무시). 읽기 전용·VFS 별칭은 건너뛰고, 역할을 판정할 수 없는 별칭(W004)에는 낸다 | 항상 | 그 별칭의 `ATOMIC_REQUESTS` 를 끄고 쓰는 뷰에만 `transaction.atomic()` 을 쓰거나, 읽기 뷰에 `@transaction.non_atomic_requests(using="<별칭>")` 를 붙인다. 의도한 구성이면 `sqlite_ops.W006` 을 끈다([아래](#atomic_requests-와-immediate)) |
+| `sqlite_ops.W006` | SQLite 별칭의 `ATOMIC_REQUESTS` 가 참이고 `OPTIONS["transaction_mode"]` 가 `IMMEDIATE` 또는 `EXCLUSIVE`(대소문자 무시). 읽기 전용·VFS·메모리 DB 별칭은 건너뛰고, 역할을 판정할 수 없는 별칭(W004)에는 낸다 | 항상 | 그 별칭의 `ATOMIC_REQUESTS` 를 끄고 쓰는 뷰에만 `transaction.atomic()` 을 쓰거나, 읽기 뷰에 `@transaction.non_atomic_requests(using="<별칭>")` 를 붙인다. 의도한 구성이면 `sqlite_ops.W006` 을 끈다([아래](#atomic_requests-와-immediate)) |
 | `sqlite_ops.W004` | `NAME` 의 URI 로 별칭 역할(쓰기·읽기 전용·메모리·VFS)을 판정할 수 없음. 이때 W001·W002 는 내지 않는다 | `--deploy` | authority 는 비우거나 `localhost` 로(`file:///path`), `%00` 을 빼고, URI 쿼리 키 `mode`·`immutable`·`vfs` 를 한 번씩, 표준 표기(`mode=ro\|rw\|rwc\|memory`, `immutable=1\|0`)로 쓴다 |
 
 - 기준값은 `sqlite_database()` 와 같은 권장값 표에서 읽는다. 프로필은 `SQLITE_OPS["PROFILE"]` 이고 없으면 `"single-server"` 다.
@@ -348,6 +348,8 @@ W003 과 W005 는 같은 규칙으로 ASGI 인지 판단한다. 한 설정에서
 #### `ATOMIC_REQUESTS` 와 `IMMEDIATE`
 
 W006 은 `ATOMIC_REQUESTS=True` 를 권장 `transaction_mode=IMMEDIATE` 와 함께 쓴 경우다. Django 는 그 별칭의 뷰마다 `atomic()` 을 씌우고, `IMMEDIATE` 에서는 그 `atomic()` 이 `BEGIN IMMEDIATE` 로 시작해 뷰가 끝날 때까지 쓰기 잠금을 쥔다. SQLite 의 쓰기 잠금은 하나라서 **읽기만 하는 뷰도 서로를 기다린다.** 읽기만 하고 0.3초 쉬는 뷰 4개를 동시에 부르면 요청별 0.32·0.67·0.99·1.31초가 걸렸다(`ATOMIC_REQUESTS` 를 끄면 모두 0.32초, Django 6.1.2·SQLite 3.53.1·WAL, 테스트 클라이언트 스레드 4개, #102 재현함). `transaction_mode` 를 `DEFERRED` 로 바꾸는 것은 대처로 권하지 않는다. 쓰기 경합에서 `database is locked` 를 피하려는 권장값이고, 바꾸면 W001 이 난다. 대처는 `ATOMIC_REQUESTS` 를 끄고 쓰는 뷰에만 `transaction.atomic()` 을 쓰거나, 읽기 뷰에 `@transaction.non_atomic_requests(using="<별칭>")` 를 붙이는 것이다. 의도한 구성이면 `SILENCED_SYSTEM_CHECKS = ["sqlite_ops.W006"]` 로 끈다. `check --fail-level WARNING` 을 쓰는 CI 는 이 조합에서 실패한다.
+
+메모리 DB 별칭에는 W006 을 내지 않는다. `:memory:` 는 연결마다 DB 가 따로라 잠금을 다투지 않고(같은 측정에서 4개 모두 0.32초), 공유 캐시 메모리 DB(`file::memory:?cache=shared`, `mode=memory&cache=shared`)는 기다리지 않고 바로 실패했다(4개 중 3개가 500, 재현함). 후자는 직렬화와 다른 현상이라 이 경고로 다루지 않는다. 읽기 전용·VFS 별칭은 쓰지 않으므로 내지 않는다.
 
 ```python
 # settings.py — 직접 쓴 설정도 같은 기준으로 검사된다

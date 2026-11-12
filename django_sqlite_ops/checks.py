@@ -332,8 +332,10 @@ def _atomic_requests_warning(alias: str, config: Mapping[str, Any]) -> checks.Wa
     """W006: ``ATOMIC_REQUESTS`` 가 켜지고 ``transaction_mode`` 가 IMMEDIATE·EXCLUSIVE 면 낸다.
 
     Django 는 이 별칭의 뷰마다 ``atomic()`` 을 씌우고, 그 ``BEGIN IMMEDIATE`` 가 뷰가 끝날 때까지
-    쓰기 잠금을 쥐므로 읽기만 하는 뷰도 직렬로 돈다(#102 재현). 쓰지 않는 별칭(read-only·vfs)은
-    잠금을 다투지 않으므로 내지 않고, 역할을 판정할 수 없는 별칭에는 낸다.
+    쓰기 잠금을 쥐므로 읽기만 하는 파일 DB 뷰도 직렬로 돈다(#102 재현). 파일 쓰기 잠금을 다투지
+    않는 별칭에는 내지 않는다: read-only·vfs 는 쓰지 않고, memory 는 직렬화되지 않는다(``:memory:``
+    는 연결마다 DB 가 따로다. 공유 캐시는 기다리지 않고 바로 실패한다 — 둘 다 재현함, #102 검수 1).
+    역할을 판정할 수 없는 별칭에는 낸다.
     """
     if not config.get("ATOMIC_REQUESTS"):
         return None
@@ -341,7 +343,7 @@ def _atomic_requests_warning(alias: str, config: Mapping[str, Any]) -> checks.Wa
     if not isinstance(mode, str) or mode.upper() not in _LOCKING_MODES:
         return None
     role, _ = _role(config.get("NAME"))
-    if role in ("read-only", "vfs"):
+    if role in ("read-only", "vfs", "memory"):
         return None
     return checks.Warning(
         f"Database {alias!r} runs every request serially: ATOMIC_REQUESTS is on and "

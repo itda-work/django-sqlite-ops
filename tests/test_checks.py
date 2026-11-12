@@ -988,11 +988,14 @@ def test_vfs_alias_skips_w001_w002_keeps_w003(deploy):
 
 W006 = "sqlite_ops.W006"
 
-# (역할, NAME) — 역할 판정은 W001 과 같다(_role). 쓰지 않는 별칭(read-only·vfs)에는 내지 않고,
-# 판정할 수 없는 별칭(W004 대상)에는 낸다
+# (역할, NAME) — 역할 판정은 W001 과 같다(_role). 파일 쓰기 잠금을 다투지 않는 별칭(read-only·
+# vfs·memory)에는 내지 않고, 판정할 수 없는 별칭(W004 대상)에는 낸다. 메모리 DB 는 직렬화되지 않는다
+# (#102 검수 1 재현: ":memory:" 는 연결마다 DB 가 따로라 4개 모두 0.32초, 공유 캐시는 즉시 500)
 W006_ROLES = [
     ("write", "/srv/app/app.sqlite3", True),
-    ("memory", ":memory:", True),
+    ("memory", ":memory:", False),
+    ("memory-shared", "file:w006mem?mode=memory&cache=shared", False),
+    ("memory-uri", "file::memory:?cache=shared", False),
     ("read-only", "file:/srv/app/app.sqlite3?mode=ro", False),
     ("vfs", VFS, False),
     ("unknown", "file:/srv/app/app.sqlite3?mode=rwc&mode=ro", True),
@@ -1033,7 +1036,7 @@ def test_w006_table(deploy):
     got = run_checks(databases, deploy=deploy)
     warned = {obj for ident, obj in got if ident == W006}
     assert warned == {alias for alias, _, expected in cells if expected}
-    assert len(warned) == 3 * 2 * 4  # 역할 3 × ATOMIC_REQUESTS 참 2 × 잠그는 모드 4
+    assert len(warned) == 2 * 2 * 4  # 역할 2(write·unknown) × ATOMIC_REQUESTS 참 2 × 잠그는 모드 4
 
 
 def test_w006_only_the_matching_alias():
