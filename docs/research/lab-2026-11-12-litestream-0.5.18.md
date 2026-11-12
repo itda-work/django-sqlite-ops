@@ -104,8 +104,24 @@ time=2026-11-12T04:52:23.702Z level=ERROR msg="monitor error" system=store db=ap
 
 P1·P2(채널 시나리오 포함), L1, L2, L3, L5, L6(kill 지점 전부), L7, L8a, L8b 는 0.5.17 때와 같은 단언으로 통과했다(옛·판별 두 `run all` 모두).
 
+### amd64 실행 (GitHub Actions)
+
+`lab.yml` run `43159688920`, 브랜치 `issue-99-litestream-0518`(커밋 `22e613e`), ubuntu-latest amd64, `scenarios=all`. 오케스트레이터가 실행했다(재현함).
+
+- 결과: `13 passed, 5 deselected in 808.16s`. 이미지 안 판 로그는 `image litestream version: 0.5.18` 이고, 결과 줄 13개 모두 `litestream_version` 이 0.5.18 이다.
+- L4: 연결 거부 7.7초 `exit1`(exit 2), 무응답 5.6초 `timeout`(exit 2).
+- L8c(연결 거부 90초)
+  - `remote_error` 구간 시작 8.0·17.0·26.1·35.1·44.1·53.1·63.2·72.2·81.2초(9개, 간격 9.0–10.1초).
+  - 조회 실패 종류 `exit1`. 단절 중 Litestream 로그 7줄.
+  - 복구 1.0초 뒤 `caught_up`. 쓰기 484건·오류 0. 복제본 504행·integrity ok.
+  - `ltx` 는 동시에 1개 이하, 서로 다른 PID 10개.
+- L8d(양방향 무응답 90초)
+  - `remote_error` 구간 시작 31.1·63.1초. 종류 `timeout`. 단절 중 Litestream 로그 0줄.
+  - 복구 2.0초 뒤 `caught_up`. 쓰기 489건·오류 0. 복제본 509행·integrity ok.
+- arm64 와 같은 꼴이다(첫 `remote_error` 8.0초 대 8.1초, 간격 9.0–10.1초 대 9.1–9.2초). 정한 경계(첫 2–21초, 간격 11±8초) 안이다.
+
 ## 판정과 남은 것
 
 - 원인: 상류 0.5.18 의 어느 변경(#1528 LTX 스트림 읽기 시간 제한, #1572 복제 클라이언트 오류 로그 등) 때문인지는 **미검증**이다. 동작은 재현했다.
 - 판정할 수 없는 출력은 나오지 않았다. 패키지의 파서·판정 코드는 그대로 맞았다(rc 1 + stderr → `RemoteError` → `unknown`·exit 2).
-- 남은 것: 다른 함정의 0.5.18 재측정(VFS 확장 로드 #1506 등)은 #105 다. amd64(GitHub Actions `lab.yml`)에서는 0.5.18 을 돌리지 않았다.
+- 남은 것: 다른 함정의 0.5.18 재측정(VFS 확장 로드 #1506 등)은 #105 다.
