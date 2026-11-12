@@ -16,15 +16,19 @@ import urllib.request
 
 import pytest
 from _checks import (
+    BLACKHOLE_LOOKUP,
     COARSE_SAMPLE_GAP,
     error_episodes,
     full_outage_deadline,
     full_outage_problems,
     long_outage_bounds,
     long_outage_problems,
+    lookup_failure_kind,
+    lookup_kind_problems,
     ltx_process_problems,
     max_sample_gap,
     quarantine_problems,
+    refused_lookup,
     runner_output,
     runner_spec,
     spec_outcome,
@@ -383,8 +387,17 @@ def test_L3_meta_deleted_refused(stack, run_id, rec):
     assert db_entry(after)["rows"] == 30
 
 
-def test_L4_s3_down_at_boot_refused(stack, run_id, rec):
-    """S3 끊김 중 부팅 → unknown(remote_error) → 거부. 끊김(연결 거부)과 양방향 무응답 둘 다."""
+def test_L4_s3_down_at_boot_refused(stack, run_id, rec, litestream_version):
+    """S3 끊김 중 부팅 → unknown(remote_error) → 거부. 끊김(연결 거부)과 양방향 무응답 둘 다.
+
+    거부까지의 시간은 단언하지 않고 기록한다. 사유의 종류는 판별로 단언한다(#99,
+    ``_checks.REFUSED_LOOKUP``): 연결 거부는 0.5.17 이 ``timed out``, 0.5.18 이 ``exited with 1``.
+    무응답은 두 판 모두 ``timed out``.
+    """
+    refused = refused_lookup(litestream_version)
+    rec["litestream_version"] = litestream_version
+    rec["refused_expected"] = refused
+    assert refused is not None, f"no L4 expectation for litestream {litestream_version}"
     prefix = f"l4-{run_id}"
     v = Volumes.take()
     seed_volume(stack, v, prefix, 20)
@@ -396,8 +409,10 @@ def test_L4_s3_down_at_boot_refused(stack, run_id, rec):
         rec["refused_exit_code"] = res.rc
         rec["refused_seconds"] = round(time.monotonic() - t0, 1)
         rec["refused_boot_lines"] = boot_lines(res.text)
+        rec["refused_reason_kind"] = lookup_failure_kind(decision(res.text) or "")
         assert res.rc == 2
         assert "reason_code=remote_error" in decision(res.text)
+        assert rec["refused_reason_kind"] == refused["kind"], decision(res.text)
         stack.proxy_enabled("s3", True)
 
         # 무응답: 연결은 받고 데이터를 양방향 모두 버린다. boot 의 --ltx-timeout 이 끊는다.
@@ -419,8 +434,10 @@ def test_L4_s3_down_at_boot_refused(stack, run_id, rec):
         rec["hang_exit_code"] = res.rc
         rec["hang_seconds"] = round(time.monotonic() - t0, 1)
         rec["hang_boot_lines"] = boot_lines(res.text)
+        rec["hang_reason_kind"] = lookup_failure_kind(decision(res.text) or "")
         assert res.rc == 2
         assert "reason_code=remote_error" in decision(res.text)
+        assert rec["hang_reason_kind"] == BLACKHOLE_LOOKUP["kind"], decision(res.text)
     finally:
         stack.reset_proxies()
     after = stack.inspect_volume(v)
@@ -748,8 +765,19 @@ def _log_summary(text: str) -> dict:
     }
 
 
-def _l8_long(stack: Stack, run_id: str, rec: dict, label: str, cut, restore) -> None:
-    """조회 타임아웃보다 긴 단절. ``cut``·``restore`` 가 단절을 넣고 푼다."""
+_HEALTH_LOOKUP_FAILED = "health 'default': remote lookup failed"
+
+
+def _l8_long(
+    stack: Stack, run_id: str, rec: dict, label: str, cut, restore, lookup: dict | None
+) -> None:
+    """조회 타임아웃보다 긴 단절. ``cut``·``restore`` 가 단절을 넣고 푼다.
+
+    ``lookup`` 은 그 판에서 실패하는 조회의 종류·소요(``_checks.REFUSED_LOOKUP`` 등). ``None``
+    (기대값 표에 없는 판)이면 실패한다.
+    """
+    rec["lookup_expected"] = lookup
+    assert lookup is not None, "no expectation for this litestream version (_checks.REFUSED_LOOKUP)"
     prefix = f"{label}-{run_id}"
     v = Volumes.take()
     e = env(v, prefix, "--init-new", LAB_HEALTH_REFRESH="2", LAB_HEALTH_GRACE="10")
@@ -807,7 +835,7 @@ def _l8_long(stack: Stack, run_id: str, rec: dict, label: str, cut, restore) -> 
     stack.stop_app()
 
     rec["outage_s"] = LONG_OUTAGE
-    rec["bounds"] = long_outage_bounds(2)
+    rec["bounds"] = long_outage_bounds(2, lookup["min"], lookup["max"])
     rec["outage_timeline"] = timeline
     gap = max_sample_gap(timeline)
     rec["max_sample_gap_s"] = round(gap, 2)
@@ -824,13 +852,25 @@ def _l8_long(stack: Stack, run_id: str, rec: dict, label: str, cut, restore) -> 
     rec["writes_ok_errors"] = (writer.ok, writer.errors)
     rec["log_before_outage"] = _log_summary(logs_boot)
     rec["log_outage"] = _log_summary(logs_outage[logs_before:])
+    failure_lines = [
+        ln for ln in logs_outage[logs_before:].splitlines() if _HEALTH_LOOKUP_FAILED in ln
+    ]
+    rec["lookup_failure_lines"] = len(failure_lines)
+    rec["lookup_failure_kinds"] = sorted({str(lookup_failure_kind(ln)) for ln in failure_lines})
     rec["log_after_recovery"] = _log_summary(logs_all[len(logs_outage) :])
     rec["replica_after_stop"] = wait_replica_rows(stack, prefix, final)
     rec["final_rows"] = final
 
+    # 실패의 종류(타임아웃인가 rc 1 인가)를 시간보다 먼저 본다(#99)
+    problems = lookup_kind_problems(failure_lines, lookup["kind"])
     # 시각 판정의 표본 여유는 실제 최대 표본 간격으로 둔다(1초보다 좁히지 않는다)
-    problems = long_outage_problems(
-        timeline, refresh=2, outage=LONG_OUTAGE, sample_interval=max(1.0, gap)
+    problems += long_outage_problems(
+        timeline,
+        refresh=2,
+        outage=LONG_OUTAGE,
+        lookup_min=lookup["min"],
+        lookup_max=lookup["max"],
+        sample_interval=max(1.0, gap),
     )
     problems += ltx_process_problems(sampler.samples, after_procs)
     if sampler.failures:
@@ -854,13 +894,17 @@ def _l8_long(stack: Stack, run_id: str, rec: dict, label: str, cut, restore) -> 
     assert not harness and not problems, {"harness": harness, "problems": problems}
 
 
-def test_L8c_health_long_refused_outage(stack, run_id, rec):
+def test_L8c_health_long_refused_outage(stack, run_id, rec, litestream_version):
     """S3 를 조회 타임아웃(30초)보다 길게(90초) 끊음 — 연결 거부(toxiproxy 끔).
 
-    기대(_checks.long_outage_bounds, 랩 가정): 10초 안에 ``stale``, 29~36초에 첫 ``remote_error``,
-    그 뒤 ``remote_error``(약 6초)와 ``stale``(약 26초)이 약 32초 주기로 번갈아 나온다. 단절 내내
-    strict 503. 매달린 ``ltx`` 는 1개 이하이고 복구 뒤 남지 않는다. 복구 후 ``caught_up``.
+    기대는 이미지 안 Litestream 판으로 고른다(_checks.REFUSED_LOOKUP·long_outage_bounds, 랩 가정,
+    #99). 두 판 모두 10초 안에 ``stale``, 단절 내내 ``unknown``·strict 503, 복구 후 ``caught_up``.
+    - 0.5.17: 조회가 매달려 30초 타임아웃(사유 ``timed out``). 29~36초에 첫 ``remote_error``, 그 뒤
+      ``remote_error``(약 6초)와 ``stale``(약 26초)이 약 32초 주기로 번갈아 나온다.
+    - 0.5.18: 조회가 약 7초 뒤 rc 1(사유 ``exited with 1``). ``remote_error`` 구간이 약 9초 주기.
+    매달린 ``ltx`` 는 1개 이하이고 복구 뒤 남지 않는다.
     """
+    rec["litestream_version"] = litestream_version
     _l8_long(
         stack,
         run_id,
@@ -868,15 +912,17 @@ def test_L8c_health_long_refused_outage(stack, run_id, rec):
         "l8c",
         cut=lambda: stack.proxy_enabled("s3", False),
         restore=lambda: stack.proxy_enabled("s3", True),
+        lookup=refused_lookup(litestream_version),
     )
 
 
-def test_L8d_health_long_blackhole_outage(stack, run_id, rec):
+def test_L8d_health_long_blackhole_outage(stack, run_id, rec, litestream_version):
     """같은 90초 단절을 양방향 무응답으로: toxiproxy ``timeout`` toxic 을 두 방향에.
 
     ``timeout`` 0 은 연결을 받고 데이터를 버린다(닫지 않는다). toxic 의 ``stream`` 기본값은
     ``downstream``(server → client)이라 그것만 넣으면 요청은 S3 에 닿는다(toxiproxy 2.12.0
-    README). ``upstream``(client → server)도 넣는다. 기대는 L8c 와 같다. 복구는 reset.
+    README). ``upstream``(client → server)도 넣는다. 기대는 두 판 모두 0.5.17 의 L8c 와 같다
+    (30초 타임아웃, 사유 ``timed out`` — 0.5.18 도 무응답에는 매달린다, #99). 복구는 reset.
     """
 
     def cut():
@@ -891,4 +937,7 @@ def test_L8d_health_long_blackhole_outage(stack, run_id, rec):
                 },
             )
 
-    _l8_long(stack, run_id, rec, "l8d", cut=cut, restore=stack.reset_proxies)
+    rec["litestream_version"] = litestream_version
+    # 무응답은 판과 관계없이 타임아웃이 끊는다(0.5.17·0.5.18 실측). 표에 없는 판은 실패시킨다.
+    lookup = BLACKHOLE_LOOKUP if refused_lookup(litestream_version) is not None else None
+    _l8_long(stack, run_id, rec, "l8d", cut=cut, restore=stack.reset_proxies, lookup=lookup)

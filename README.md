@@ -43,7 +43,7 @@ Litestream 만 쓰면 옛 볼륨으로 재부팅했을 때 최신 복제본이 �
 | L1 볼륨 없는 새 컨테이너 | 복제본에서 복원, 행 수 일치 |
 | L2 옛 볼륨으로 재부팅(복제본이 더 앞섬) | exit 2 `remote_ahead`, 복제본 손상 0 |
 | L3 로컬 메타만 사라짐 | exit 2 `no_local_meta`, DB 무변경 |
-| L4 부팅 중 S3 끊김(거부·무응답) | 타임아웃 뒤 exit 2 `remote_error` |
+| L4 부팅 중 S3 끊김(거부·무응답) | 원격 조회 실패 뒤 exit 2 `remote_error`(무응답은 타임아웃. 연결 거부는 0.5.17 이 타임아웃, 0.5.18 이 약 8초에 rc 1, #99) |
 | L5 복제되지 않은 로컬 커밋 | 그대로 진행, 커밋 보존 |
 | L6 복원 도중 kill | 반쯤 옮겨진 상태 없음, 재실행으로 완료 |
 | L7 복제본 객체 손상 | exit 4, 로컬 파일 무변경 |
@@ -682,7 +682,7 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 
 ### 복제 헬스
 
-"지금 복제가 따라오는가"를 `caught_up / backlog / unknown` 으로 보고하는 JSON 엔드포인트다. Litestream 은 S3 가 끊겨도 로그·`status`·메트릭에 아무것도 남기지 않으므로(실측 D3), 헬스는 Litestream 의 자기 보고 대신 두 가지를 직접 본다.
+"지금 복제가 따라오는가"를 `caught_up / backlog / unknown` 으로 보고하는 JSON 엔드포인트다. Litestream 은 S3 가 끊겨도 로그·`status`·메트릭에 아무것도 남기지 않을 수 있으므로(실측 D3: 0.5.17 은 0줄. 0.5.18 은 연결 거부 때만 ERROR 줄을 남기고 응답 없는 S3 에는 0줄이다, #99), 헬스는 Litestream 의 자기 보고 대신 두 가지를 직접 본다.
 
 1. **TXID 비교 (로컬 L0 → 복제본)** — 로컬 메타의 최대 TXID(`.<db>-litestream/ltx/0/`)와 복제본의 최대 TXID(`litestream ltx -level all -json`). 업로드가 막히면(S3 끊김) 로컬이 앞선다.
 2. **WAL 위치 비교 (DB → 로컬 L0)** — 최신 로컬 L0 파일의 헤더에는 그 L0 가 원래 WAL 의 어디까지를 담았는지(WAL 오프셋·크기·salt)가 있다. 현재 `-wal` 파일의 헤더와 프레임 헤더를 읽어(salt·누적 체크섬이 맞는 프레임만) 그 위치 **뒤에 커밋이 있는지** 본다. Litestream 자신도 다음 동기화를 이 위치에서 이어 간다. `litestream replicate` 가 죽거나 멈추면 TXID 는 로컬·원격이 같은 채로 멈춰 1 만으로는 그 뒤의 쓰기가 보이지 않는데, 2 가 그것을 잡는다.
@@ -787,7 +787,7 @@ urlpatterns = [
 
 - **전체 `status` 는 별칭 중 가장 나쁜 것**이다(`unknown` > `backlog` > `caught_up`). `unknown` 이 가장 나쁜 이유: 복제가 따라오는지조차 말할 수 없다는 뜻이라, 뒤처진 것을 아는 `backlog` 보다 더 큰 문제를 감출 수 있다.
 - **요청마다 S3 를 부르지 않는다.** 프로세스마다 데몬 스레드 하나가 `REFRESH` 초마다 조회하고 뷰는 마지막 결과를 읽기만 한다. 스레드는 **첫 헬스 요청 때** 시작하므로 배포 직후 첫 응답은 `unknown`("not checked yet")이다. 관리 명령·마이그레이션에서는 스레드가 돌지 않는다. gunicorn `--preload` 처럼 포크하는 서버에서도 워커마다 PID 를 보고 다시 시작한다.
-- **S3 가 끊기면 `code` 가 `stale` 과 `remote_error` 를 오간다.** 원격 조회(`litestream ltx`)는 S3 가 연결을 거부해도 양방향으로 응답하지 않아도 30초 타임아웃까지 매달린다(바꿀 수 없다). 그동안 마지막 관측이 `REFRESH × 3` 보다 오래되면 `stale`, 타임아웃으로 끝난 직후에는 `remote_error` 이고, 단절이 이어지면 `REFRESH + 30` 초 주기로 번갈아 나온다(회귀 랩에서 재현함, [#65](https://github.com/itda-work/django-sqlite-ops/issues/65)). 둘 다 `unknown` 이므로 경보는 `code` 가 아니라 `status` 로 건다. 갱신 스레드는 하나라 **별칭이 여럿이면 한 별칭의 매달림이 다른 별칭도 `stale` 로 만들 수 있다**(매달린 시간 30초가 `2 × REFRESH` 를 넘을 때, 즉 `REFRESH` 를 15초보다 줄였을 때 뚜렷하다). 이때 `stale` 의 `reason` 끝에 원인 별칭과 조회 경과 초가 나온다: `the refresh thread has been checking alias 'slow' for 31s`(자기 자신이면 `this alias`). 매달림이 끝나고 스레드가 `REFRESH` 를 쉬는 동안에는 `the last refresh spent 30s on alias 'slow'` 처럼 직전 갱신에서 가장 오래 걸린 조회가 나온다. 그 조회도 `REFRESH` 보다 짧았다면 `the refresh thread may be stuck` 이다(#72).
+- **S3 가 끊기면 `code` 가 `stale` 과 `remote_error` 를 오간다.** 원격 조회(`litestream ltx`)는 S3 가 양방향으로 응답하지 않으면 30초 타임아웃까지 매달린다(바꿀 수 없다). S3 가 연결을 거부할 때는 판마다 다르다: 0.5.17 은 역시 30초 매달리고, 0.5.18 은 약 7초 뒤 스스로 실패한다(`exited with 1`). 조회가 끝나지 않은 동안 마지막 관측이 `REFRESH × 3` 보다 오래되면 `stale`, 실패로 끝난 직후에는 `remote_error` 이고, 단절이 이어지면 `REFRESH + 조회 시간`(30초 매달림이면 `REFRESH + 30`, 0.5.18 의 연결 거부면 약 `REFRESH + 7`) 초 주기로 번갈아 나온다(회귀 랩에서 재현함, [#65](https://github.com/itda-work/django-sqlite-ops/issues/65)·[#99](https://github.com/itda-work/django-sqlite-ops/issues/99)). 둘 다 `unknown` 이므로 경보는 `code` 가 아니라 `status` 로 건다. 갱신 스레드는 하나라 **별칭이 여럿이면 한 별칭의 매달림이 다른 별칭도 `stale` 로 만들 수 있다**(매달린 시간 30초가 `2 × REFRESH` 를 넘을 때, 즉 `REFRESH` 를 15초보다 줄였을 때 뚜렷하다). 이때 `stale` 의 `reason` 끝에 원인 별칭과 조회 경과 초가 나온다: `the refresh thread has been checking alias 'slow' for 31s`(자기 자신이면 `this alias`). 매달림이 끝나고 스레드가 `REFRESH` 를 쉬는 동안에는 `the last refresh spent 30s on alias 'slow'` 처럼 직전 갱신에서 가장 오래 걸린 조회가 나온다. 그 조회도 `REFRESH` 보다 짧았다면 `the refresh thread may be stuck` 이다(#72).
 - **지속 시간(`backlog_since`·`pending_since` 부터의 시간, `REFRESH × 3` 판정)은 프로세스 메모리에서 monotonic 시계로 잰다.** 주 근거(TXID·WAL 위치)는 벽시계를 쓰지 않으므로 벽시계가 NTP 로 뒤로 가도 판정이 되돌아가지 않는다. 보조 근거(파일 시각)는 벽시계를 쓰므로 역행을 보면 `unknown` 으로 둔다. 응답의 시각 문자열(UTC, 밀리초)은 표시용 벽시계다. 앱을 재시작하면 추적이 초기화되어, 재시작 직후에는 오래된 backlog 도 `BACKLOG_GRACE` 동안 `caught_up` 으로 보인다. 워커마다 따로 추적하므로 워커별 응답이 몇 초 다를 수 있다.
 - **`ATOMIC_REQUESTS` 를 켠 별칭이 있어도 헬스 요청은 트랜잭션으로 감싸지 않는다.** Django 는 감싸려고 뷰 실행 전에 연결을 연다(그러면 DB 파일이 생길 수 있다). `health_view` 는 모든 별칭에서 빠지도록 표시돼 있다. 헬스 뷰를 다른 데코레이터로 감쌀 때는 `functools.wraps` 로 이 표시(`_non_atomic_requests`)를 옮긴다.
 - **"마지막 업로드 시각"은 쓰지 않는다.** 쓰기가 없는 정상 DB 도 업로드 시각은 오래되기 때문이다.
@@ -946,7 +946,7 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 |---|---|---|---|
 | 첫 배포에서 exit 2, `no_replica_no_local` | Litestream 은 복제본 경로·prefix 오타와 "복제본 없음"을 똑같이 rc 0·`[]` 로 돌려준다 | 경로를 확인하고 `--init-new` 를 한 번만([생애 첫 배포](#생애-첫-배포---init-new-를-한-번-쓰고-끈다)) | 재현함(Litestream 0.5.17, #3) |
 | exit 2, `remote_error` 이고 사유에 `timed out` (평문 HTTP S3 호환 서버) | `endpoint` 에 스킴이 없으면 Litestream 이 HTTPS 로 접속해 끝없이 기다리고, boot 가 `--ltx-timeout`(기본 30초)에서 끊는다 | `endpoint: http://…` 로 스킴을 붙인다 | 재현함(평범한 HTTP 서버로) |
-| S3 가 내려가 연결을 거부하는데 boot 가 30초 걸려 exit 2, `remote_error`(사유 `timed out`) | Litestream 0.5.17 의 `ltx` 는 연결 거부에도 곧바로 실패하지 않고 재시도하며 기다린다 | S3 를 복구한 뒤 다시 띄운다. 더 빨리 거부하려면 `--ltx-timeout` 을 줄인다 | 재현함(회귀 랩 L4: toxiproxy 로 끊음 → 30.5초) |
+| S3 가 내려가 연결을 거부해 exit 2, `remote_error`. 0.5.17 은 30초 걸리고 사유 `timed out`, 0.5.18 은 약 8초에 사유 `exited with 1: … exceeded maximum number of attempts` | Litestream 0.5.17 의 `ltx` 는 연결 거부에도 곧바로 실패하지 않고 재시도하며 기다린다. 0.5.18 은 S3 재시도를 다 쓰면 스스로 실패한다 | S3 를 복구한 뒤 다시 띄운다. 0.5.17 에서 더 빨리 거부하려면 `--ltx-timeout` 을 줄인다 | 재현함(회귀 랩 L4: toxiproxy 로 끊음 → 0.5.17 30.5초, 0.5.18 7.7초, [#99](docs/research/lab-2026-11-12-litestream-0.5.18.md)) |
 | exit 2, `remote_error` 이고 사유에 `database not found in config` | `--db` 가 `litestream.yml` 의 `path` 와 다르다 | 세 곳을 같은 실제 경로로([경로 규칙](#경로-규칙)) | 재현함(fixture `ltx_db_not_in_config`) |
 | exit 64, 실제 경로 안내 | `--db`·`--meta-path` 의 부모에 심볼릭 링크·`..`·없는 디렉터리 | 안내된 실제 경로를 쓰고, 이미지에서 부모 디렉터리를 만든다([경로 규칙](#경로-규칙)) | 코드상 확인([D-15](docs/DECISIONS.md)) |
 | exit 64, `--meta-path ... overlaps the boot lock`(또는 db·state file·`--config`·restore/quarantine area) | `--meta-path` 가 boot 소유 경로와 같거나 조상·자손이다. 그대로 두면 복원 때 boot 가 잠금·상태 파일을 격리해 잠금 보호가 사라진다 | Litestream 설정의 `meta-path` 와 같은 자기만의 디렉터리를 준다([함정](#함정)) | 재현함(#39, 실제 litestream 으로 두 번째 잠금 획득) |
@@ -961,7 +961,7 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 | 증상 | 원인 | 대처 | 근거 |
 |---|---|---|---|
 | S3 가 끊겼는데 Litestream 로그·`status`·메트릭이 조용하다 | Litestream 은 업로드 실패를 드러내지 않는다 | 헬스 본문 `status` 로 알람을 건다([복제 헬스](#복제-헬스)) | 실측([docker D3](docs/research/litestream-django-docker.md#d3-관측-조용한-실패-위험)) |
-| S3 가 통째로 끊긴 동안 헬스가 `backlog` 가 아니라 `unknown`(`stale` 또는 `remote_error`) | 헬스의 원격 조회도 같은 S3 로 간다. 조회가 타임아웃(30초)까지 매달리면 결과가 `REFRESH × 3` 보다 오래되어 `stale`, 끝나면 `remote_error` 다. 업로드만 끊기고 조회가 되면 `backlog`(`local_ahead`)다 | 둘 다 알람 대상으로 둔다(`caught_up` 이 아니면 경보) | 재현함(회귀 랩 L8a·L8b) |
+| S3 가 통째로 끊긴 동안 헬스가 `backlog` 가 아니라 `unknown`(`stale` 또는 `remote_error`) | 헬스의 원격 조회도 같은 S3 로 간다. 조회가 끝나지 않는 동안(무응답이면 30초 타임아웃까지, 연결 거부는 0.5.17 30초·0.5.18 약 7초) 결과가 `REFRESH × 3` 보다 오래되어 `stale`, 끝나면 `remote_error` 다. 업로드만 끊기고 조회가 되면 `backlog`(`local_ahead`)다 | 둘 다 알람 대상으로 둔다(`caught_up` 이 아니면 경보) | 재현함(회귀 랩 L8a·L8b) |
 | 배포 직후 헬스가 `unknown`(`not_checked`) | 갱신 스레드는 첫 헬스 요청 때 시작한다 | `REFRESH`(기본 15초) 뒤 다시 본다 | 코드상 확인(`health.py`) |
 | 헬스가 `backlog` 인데 HTTP 200 이다 | 설계상 항상 200 이다. 복제 지연으로 로드밸런서가 앱을 빼면 안 된다 | 본문 `status` 로 알람. HTTP 코드만 보는 모니터는 `?strict=1`(로드밸런서에는 쓰지 않는다) | 코드상 확인(`health.py`) |
 | 헬스가 `unknown`(`no_wal_evidence`) | `-wal` 이 없거나 비어 WAL 위치로 판정할 수 없다. Litestream 이 돌면 `-wal` 이 남는다 | `litestream replicate` 가 도는지 본다 | 코드상 확인(`health.py`) |

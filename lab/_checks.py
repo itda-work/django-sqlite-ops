@@ -197,26 +197,79 @@ def full_outage_problems(timeline: list, refresh: float, sample_interval: float 
 LTX_TIMEOUT = 30.0
 KILL_GRACE = 5.0
 
+# --- S3 가 연결을 거부할 때 ``litestream ltx`` 조회가 끝나는 방식 (판별, #99) ---------------------
+# ``kind``: ``timeout`` = 매달려 boot/헬스의 타임아웃이 끊는다(사유 ``timed out after``),
+# ``exit1`` = Litestream 이 스스로 rc 1 로 끝낸다(사유 ``exited with 1``).
+# ``min``·``max``: 헬스 조회 하나가 실패로 끝나기까지의 초(랩 가정).
+# - 0.5.17: 연결 거부에도 재시도하며 매달린다(#65 L8c, 2026-10-25). 조회는 LTX_TIMEOUT(30초)에서
+#   끝난다 — 설정값.
+# - 0.5.18: 약 7초 뒤 rc 1(``operation error S3: ListObjectsV2, exceeded maximum number of
+#   attempts, 8``). 이 시간은 Litestream(AWS SDK)의 S3 재시도에서 나오는 **잰 값**이지 설정값이
+#   아니다. 2026-11-12 colima arm64(#99), REFRESH 2초·90초 단절의 헬스 표본:
+#     L8c 3회(경계 측정): 첫 ``remote_error`` 8.1·8.1·8.1초, 구간 간격 9.1~9.2초(구간 9개씩).
+#     앞선 run all 1회(옛 경계로 실패): 첫 8.1초, 간격 8.1~9.2초(구간 10개).
+#   → 조회 하나 = 간격 − REFRESH ≈ 6.1~7.2초. 여유를 크게 두어 3~15초로 잡는다(경계: 첫
+#   ``remote_error`` 2~21초, 간격 11±8초). 이 범위는 0.5.17 의 30초 매달림과 겹치지 않는다.
+#   원자료는 docs/research/lab-2026-11-12-litestream-0.5.18.md.
+# 표에 없는 판은 L8c·L4 의 기대가 없으므로 실패한다(통과시키지 않는다).
+REFUSED_LOOKUP: dict[str, dict] = {
+    "0.5.17": {"kind": "timeout", "min": LTX_TIMEOUT, "max": LTX_TIMEOUT},
+    "0.5.18": {"kind": "exit1", "min": 3.0, "max": 15.0},
+}
+# 양방향 무응답(L4 의 hang, L8d)은 두 판 모두 타임아웃이 끊는다.
+BLACKHOLE_LOOKUP = {"kind": "timeout", "min": LTX_TIMEOUT, "max": LTX_TIMEOUT}
+LOOKUP_KIND_TEXT = {"timeout": "timed out after", "exit1": "exited with 1"}
+
+
+def refused_lookup(version: str | None) -> dict | None:
+    """그 판에서 연결 거부 때의 조회 방식. 표에 없으면 ``None``(호출자가 실패로 다룬다)."""
+    return REFUSED_LOOKUP.get(version or "")
+
+
+def lookup_failure_kind(text: str) -> str | None:
+    """조회 실패 사유 한 줄의 종류(``timeout``·``exit1``), 둘 다 아니면 ``None``."""
+    for kind, needle in LOOKUP_KIND_TEXT.items():
+        if needle in text:
+            return kind
+    return None
+
+
+def lookup_kind_problems(lines: list[str], kind: str) -> list[str]:
+    """헬스·boot 의 원격 조회 실패 줄이 하나 이상 있고 모두 ``kind`` 인지. 시간보다 먼저 본다."""
+    if not lines:
+        return [f"no remote lookup failure line (expected {kind})"]
+    wrong = [ln for ln in lines if lookup_failure_kind(ln) != kind]
+    if wrong:
+        return [f"{len(wrong)} lookup failure line(s) not {kind}: {wrong[0][:200]}"]
+    return []
+
 
 def long_outage_bounds(
-    refresh: float, ltx_timeout: float = LTX_TIMEOUT, sample_interval: float = 1.0
+    refresh: float,
+    lookup_min: float = LTX_TIMEOUT,
+    lookup_max: float | None = None,
+    sample_interval: float = 1.0,
 ) -> dict[str, float]:
     """L8c·L8d 의 시간 경계(초). 모두 **랩의 허용 시간(가정)**이다(보장 상한 아님).
 
+    ``lookup_min``·``lookup_max`` 는 실패하는 조회 하나의 소요 범위다(``REFUSED_LOOKUP``·
+    ``BLACKHOLE_LOOKUP``). 타임아웃으로 끝나면 둘 다 ``LTX_TIMEOUT`` 이다.
+
     - ``stale_by``: L8a 와 같다(``full_outage_deadline``).
     - ``first_error_after``: 단절 시점에 진행 중이던 조회는 정상 조회 시간(1초 미만으로 가정) 안에
-      시작했으므로 ``ltx_timeout − 1`` 전에는 타임아웃으로 끝나지 않는다.
+      시작했으므로 ``lookup_min − 1`` 전에는 실패로 끝나지 않는다.
     - ``first_error_by``: 단절 직후 성공으로 끝난 조회의 여유(REFRESH 로 가정) + 다음 조회까지의
-      REFRESH + 그 조회의 타임아웃 + 표본 간격 + 1초.
-    - ``period``: ``remote_error`` 관측 뒤 REFRESH 를 쉬고 시작한 조회가 다시 타임아웃으로
-      끝나기까지. ``period_slack`` 은 표본 간격 + 1초.
+      REFRESH + 그 조회의 최대 소요 + 표본 간격 + 1초.
+    - ``period``: ``remote_error`` 관측 뒤 REFRESH 를 쉬고 시작한 조회가 다시 실패로 끝나기까지
+      (소요 범위의 가운데). ``period_slack`` 은 소요 범위의 반 + 표본 간격 + 1초.
     """
+    hi = lookup_min if lookup_max is None else lookup_max
     return {
         "stale_by": full_outage_deadline(refresh, sample_interval),
-        "first_error_after": ltx_timeout - 1.0,
-        "first_error_by": refresh + refresh + ltx_timeout + sample_interval + 1.0,
-        "period": refresh + ltx_timeout,
-        "period_slack": sample_interval + 1.0,
+        "first_error_after": lookup_min - 1.0,
+        "first_error_by": refresh + refresh + hi + sample_interval + 1.0,
+        "period": refresh + (lookup_min + hi) / 2,
+        "period_slack": (hi - lookup_min) / 2 + sample_interval + 1.0,
     }
 
 
@@ -234,7 +287,8 @@ def long_outage_problems(
     timeline: list,
     refresh: float,
     outage: float,
-    ltx_timeout: float = LTX_TIMEOUT,
+    lookup_min: float = LTX_TIMEOUT,
+    lookup_max: float | None = None,
     sample_interval: float = 1.0,
 ) -> list[str]:
     """L8c·L8d 판정. ``timeline`` 은 ``(단절 뒤 초, status, code, age, strict HTTP 코드)`` 표본.
@@ -250,7 +304,7 @@ def long_outage_problems(
     - strict 응답: ``unknown`` 은 503, ``caught_up`` 은 200.
     """
     problems = full_outage_problems([row[:4] for row in timeline], refresh, sample_interval)
-    b = long_outage_bounds(refresh, ltx_timeout, sample_interval)
+    b = long_outage_bounds(refresh, lookup_min, lookup_max, sample_interval)
     limit = refresh * STALE_FACTOR
     starts = error_episodes(timeline)
     if not starts:

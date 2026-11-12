@@ -45,6 +45,23 @@ def stack():
     return s
 
 
+@pytest.fixture(scope="session")
+def litestream_version(request) -> str:
+    """이미지 안의 실제 Litestream 판(#99). LAB_LITESTREAM_VERSION 값은 믿지 않는다."""
+    from _lab import Stack, log
+
+    version = Stack("main").litestream_version()
+    log(f"image litestream version: {version}")
+    request.config._lab_litestream_version = version
+    return version
+
+
+@pytest.fixture(autouse=True)
+def _record_litestream_version(litestream_version):
+    """모든 시나리오 결과에 이미지 안의 판이 남도록 먼저 읽는다."""
+    return litestream_version
+
+
 @pytest.fixture
 def rec(request):
     """시나리오가 결과 문서에 남길 값을 담는다."""
@@ -65,6 +82,7 @@ def pytest_runtest_makereport(item, call):
         "outcome": report.outcome,
         "duration_s": round(report.duration, 1),
         "notes": getattr(item, "_lab_notes", {}),
+        "litestream_version": getattr(item.config, "_lab_litestream_version", None),
     }
     if report.failed:
         row["error"] = str(report.longrepr)[-2000:]
