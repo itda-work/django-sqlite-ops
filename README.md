@@ -315,6 +315,7 @@ python manage.py check --deploy   # W001·W002·W004 는 --deploy 일 때만 나
 | `sqlite_ops.W002` | `OPTIONS["init_command"]` 에서 `journal_mode` 가 `WAL` 로 설정되지 않음, 또는 `journal_mode` 를 언급하는 문장의 형식을 판정할 수 없음 | `--deploy` | `sqlite_database()` 를 쓰거나 `init_command` 에 `PRAGMA journal_mode=WAL` 을 넣는다 |
 | `sqlite_ops.W003` | 이름이 Litestream VFS(`vfs=litestream` 이 든 `file:` URI)인 별칭의 `CONN_MAX_AGE` 가 `None` 이 아님, 그리고 [ASGI 근거](#asgi-판단)가 없음(WSGI 로 본다) | 항상 | 그 별칭에 `"CONN_MAX_AGE": None`. WSGI 실측에서 요청당 1,008ms → 1.7ms |
 | `sqlite_ops.W005` | VFS 가 아닌 SQLite 별칭의 `CONN_MAX_AGE` 가 `None`, 그리고 [ASGI 근거](#asgi-판단)가 있음 | 항상 | 그 별칭의 `"CONN_MAX_AGE"` 를 `0` 으로 하거나 키를 지운다. ASGI 동기 뷰에서는 연결이 재사용되지 않고 닫히지도 않는다([문제 해결](#설정체크)) |
+| `sqlite_ops.W006` | SQLite 별칭의 `ATOMIC_REQUESTS` 가 참이고 `OPTIONS["transaction_mode"]` 가 `IMMEDIATE` 또는 `EXCLUSIVE`(대소문자 무시). 읽기 전용·VFS 별칭은 건너뛰고, 역할을 판정할 수 없는 별칭(W004)에는 낸다 | 항상 | 그 별칭의 `ATOMIC_REQUESTS` 를 끄고 쓰는 뷰에만 `transaction.atomic()` 을 쓰거나, 읽기 뷰에 `@transaction.non_atomic_requests(using="<별칭>")` 를 붙인다. 의도한 구성이면 `sqlite_ops.W006` 을 끈다([아래](#atomic_requests-와-immediate)) |
 | `sqlite_ops.W004` | `NAME` 의 URI 로 별칭 역할(쓰기·읽기 전용·메모리·VFS)을 판정할 수 없음. 이때 W001·W002 는 내지 않는다 | `--deploy` | authority 는 비우거나 `localhost` 로(`file:///path`), `%00` 을 빼고, URI 쿼리 키 `mode`·`immutable`·`vfs` 를 한 번씩, 표준 표기(`mode=ro\|rw\|rwc\|memory`, `immutable=1\|0`)로 쓴다 |
 
 - 기준값은 `sqlite_database()` 와 같은 권장값 표에서 읽는다. 프로필은 `SQLITE_OPS["PROFILE"]` 이고 없으면 `"single-server"` 다.
@@ -327,6 +328,7 @@ python manage.py check --deploy   # W001·W002·W004 는 --deploy 일 때만 나
   - Litestream VFS(`vfs=litestream`): W001·W002 를 건너뛴다. W003 은 그대로 본다.
   - **판정할 수 없음 → W004** — `mode`·`immutable`·`vfs` 가 두 번 이상 나오거나(`mode=rwc&mode=ro`), `mode` 가 `ro`·`rw`·`rwc`·`memory` 가 아니거나(`mode=RO`, `mode=ro%00x`), `immutable` 이 위 불리언 표기가 아닐 때(`immutable=2`), 디코딩한 파일명이나 쿼리 키·값에 NUL(`%00`)이 있을 때(`mode%00x=ro` — SQLite 는 NUL 앞까지만 읽어 역할 키가 숨는다. URI 가 아닌 일반 경로의 `%00` 은 글자 그대로라 해당 없다), `file://` 뒤 authority 가 빈 값이나 정확히 `localhost` 가 아닐 때(`file://example.com/…`, `file://LOCALHOST/…` — SQLite 는 연결 오류를 낸다. `file://localhost/srv/app.sqlite3`·`file:///srv/app.sqlite3` 는 로컬 파일이다). 이때는 W001·W002 를 내지 않는다. SQLite 는 중복 키를 순서에 따라 다르게 해석해서(`mode=rwc&mode=ro` 는 읽기 전용, `mode=ro&mode=rwc` 는 연결 오류) 쓰기 권고를 따르면 연결이 깨질 수 있기 때문이다. W004 는 쓰기 설정을 넣어도 사라지지 않는다. 쿼리 키를 한 번씩, 표준 표기로 고쳐 쓴다.
 - W003 은 ASGI 에서는 내지 않는다. ASGI 의 VFS 별칭 영속 연결은 아직 재지 않았고, Django 는 async 에서 영속 연결을 끄라고 권한다.
+- W006 은 `ATOMIC_REQUESTS` 와 `transaction_mode=IMMEDIATE` 를 함께 쓴 경우다. 읽기만 하는 뷰도 직렬로 돈다([아래](#atomic_requests-와-immediate)).
 - W005 는 ASGI 에서 일반(VFS 아닌) 별칭에 `CONN_MAX_AGE=None` 을 준 경우다. uvicorn·Django 6.1 동기 뷰 실측에서 DB 요청마다 연결이 새로 열렸고(재사용 없음), 요청이 끝나도 닫히지 않아 열린 DB 파일 디스크립터가 810–982개(한도 1024)까지 쌓이며 `unable to open database file` 500 이 났다. fd 고갈이 원인이라는 것은 추정이다([재측정](docs/research/bench-2026-10-08.md#결과-연결-재사용)).
 
 #### ASGI 판단
@@ -342,6 +344,10 @@ W003 과 W005 는 같은 규칙으로 ASGI 인지 판단한다. 한 설정에서
 - 놓치는 경우: `SQLITE_OPS["PROFILE"]` 도 `ASGI_APPLICATION` 도 없이 `uvicorn proj.asgi:application` 으로 띄우면 WSGI 로 본다. W005 가 나지 않고, VFS 별칭이면 W003 이 난다. 프로필을 적어 두면 ASGI 로 판단된다.
 - 잘못 잡는 경우: 프로필을 적었거나 `ASGI_APPLICATION` 이 있는데 실제로는 gunicorn(WSGI)으로 띄우면 ASGI 로 본다. W005 가 나고, VFS 별칭의 W003 은 나지 않는다. 이때는 `SILENCED_SYSTEM_CHECKS = ["sqlite_ops.W005"]` 로 끈다.
 - 경고를 끄려면 Django 표준 `SILENCED_SYSTEM_CHECKS` 를 쓴다. 이 앱의 체크만 돌리려면 `check --tag sqlite_ops`.
+
+#### `ATOMIC_REQUESTS` 와 `IMMEDIATE`
+
+W006 은 `ATOMIC_REQUESTS=True` 를 권장 `transaction_mode=IMMEDIATE` 와 함께 쓴 경우다. Django 는 그 별칭의 뷰마다 `atomic()` 을 씌우고, `IMMEDIATE` 에서는 그 `atomic()` 이 `BEGIN IMMEDIATE` 로 시작해 뷰가 끝날 때까지 쓰기 잠금을 쥔다. SQLite 의 쓰기 잠금은 하나라서 **읽기만 하는 뷰도 서로를 기다린다.** 읽기만 하고 0.3초 쉬는 뷰 4개를 동시에 부르면 요청별 0.32·0.67·0.99·1.31초가 걸렸다(`ATOMIC_REQUESTS` 를 끄면 모두 0.32초, Django 6.1.2·SQLite 3.53.1·WAL, 테스트 클라이언트 스레드 4개, #102 재현함). `transaction_mode` 를 `DEFERRED` 로 바꾸는 것은 대처로 권하지 않는다. 쓰기 경합에서 `database is locked` 를 피하려는 권장값이고, 바꾸면 W001 이 난다. 대처는 `ATOMIC_REQUESTS` 를 끄고 쓰는 뷰에만 `transaction.atomic()` 을 쓰거나, 읽기 뷰에 `@transaction.non_atomic_requests(using="<별칭>")` 를 붙이는 것이다. 의도한 구성이면 `SILENCED_SYSTEM_CHECKS = ["sqlite_ops.W006"]` 로 끈다. `check --fail-level WARNING` 을 쓰는 CI 는 이 조합에서 실패한다.
 
 ```python
 # settings.py — 직접 쓴 설정도 같은 기준으로 검사된다
@@ -928,6 +934,7 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 | DB 파일 옆에 `-wal`·`-shm` 이 생긴다 | WAL 모드의 정상 동작. 연결이 열린 동안 커밋 일부는 `-wal` 에만 있다 | 복사·백업할 때 DB 파일만 따로 옮기지 않는다 | 재현함(`tests/test_readme.py` 가 연결 중 두 파일을 확인) |
 | ASGI(uvicorn) 에서 부하가 몰리면 `OperationalError: unable to open database file` 로 500 이 난다 | `CONN_MAX_AGE=None` 을 줬다. ASGI 의 동기 뷰는 요청마다 새 스레드에서 돌아 연결이 재사용되지 않고, 닫히지 않은 연결이 파일 디스크립터를 쌓는다(동시 16·48 에서 DB fd 810–982개, 한도 1024). [시스템 체크](#시스템-체크) `sqlite_ops.W005` 가 이 설정을 알린다(ASGI 로 [판단](#asgi-판단)될 때) | 일반 별칭은 `CONN_MAX_AGE` 를 주지 않는다(기본 0). 재사용 이득도 없었다. fd 한도를 올리는 것은 대처가 아니다([fd 한도 가이드 §5](docs/profiles/fd-limits.md#5-한도를-올려도-해결되지-않는-것--conn_max_agenone--asgi)) | 재현함([재측정](docs/research/bench-2026-10-08.md#결과-연결-재사용). fd 고갈이 원인이라는 것은 추정). fd 한도를 1,048,576 으로 올리면 동시 16·30분에서 오류는 없었지만 fd 중앙값 1,370개·앱 RSS 중앙값 411.5 MiB 를 썼다(`0` 은 82개·73.2 MiB). 이득 없이 자원만 더 쓴다([장시간 실행](docs/research/fd-soak-2026-10-09.md)) |
 | 동시 접속(웹소켓·keep-alive)이 많을 때 `OSError: [Errno 24] Too many open files` 또는 `unable to open database file` | 프로세스의 열린 파일 한도(`RLIMIT_NOFILE` soft)에 닿았다. 한도를 주지 않은 컨테이너는 Docker 데몬 설정을 따른다(colima 에서 soft 1024) | `/proc/1/limits` 나 `sqlite_doctor` 의 `[process]` 로 현재 값을 보고, 피크 동시 접속으로 잰 fd 수에 여유를 더해 compose `ulimits`·`docker run --ulimit`·systemd `LimitNOFILE=` 로 올린다. hard 는 `fs.nr_open` 을 넘길 수 없다. 먼저 위 `CONN_MAX_AGE=None` 줄이 아닌지 본다([fd 한도 가이드](docs/profiles/fd-limits.md)) | 공식 문서([getrlimit(2)](https://man7.org/linux/man-pages/man2/getrlimit.2.html): 한도 초과는 `EMFILE`), 재현함(soft 를 64 로 낮춘 프로세스에서 `open` 은 `OSError(24, 'Too many open files')`, `sqlite3.connect` 는 `unable to open database file` — macOS. compose `ulimits` 적용·`nr_open` 초과 시 기동 실패 — colima, #32) |
+| 읽기만 하는 뷰인데 동시 요청이 하나씩 처리된다(요청 수만큼 응답이 늦어진다) | `ATOMIC_REQUESTS=True` 와 `transaction_mode=IMMEDIATE` 를 함께 썼다. 뷰마다 `BEGIN IMMEDIATE` 가 쓰기 잠금을 뷰 끝까지 쥔다. [시스템 체크](#시스템-체크) `sqlite_ops.W006` 이 알린다 | `ATOMIC_REQUESTS` 를 끄고 쓰는 뷰에만 `transaction.atomic()`, 또는 읽기 뷰에 `@transaction.non_atomic_requests(using="<별칭>")`. `transaction_mode` 는 그대로 둔다([W006](#atomic_requests-와-immediate)) | 재현함(`tests/test_checks.py::test_w006_combination_serializes_read_views`: 0.3초 뷰 4개가 1.35초, 끄면 0.32초) |
 | `manage.py check` 에 `sqlite_ops.*` 가 안 나온다 | 앱이 `INSTALLED_APPS` 에 없다. W001·W002·W004 는 `--deploy` 일 때만 나온다 | 앱을 넣고 `check --deploy` 로 돌린다([시스템 체크](#시스템-체크)) | 코드상 확인(`checks.py`) |
 
 ### 진단(`sqlite_doctor`)
