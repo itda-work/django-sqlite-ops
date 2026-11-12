@@ -5,6 +5,10 @@
 
 ## 다시 만드는 법
 
+이 폴더는 검증한 판의 기록이라 **다시 만들지 않는다**. 스크립트(`tests/fixtures/make_litestream_fixtures.sh`,
+#99 에서 이 폴더의 `make_fixtures.sh` 를 판별로 옮겼다)는 대상 폴더가 이미 있으면 거부한다. 2026-10-07 에
+만들 때의 명령은 다음과 같았다.
+
 ```sh
 # macOS: brew install benbjohnson/litestream/litestream  (https://litestream.io/install/mac/)
 litestream version   # 0.5.17 이어야 한다
@@ -14,7 +18,7 @@ tests/fixtures/litestream-0.5.17/make_fixtures.sh .work/issue-3/lab/run-fixtures
 인자는 아직 없는 새 디렉터리다(있으면 거부한다). `sqlite3` CLI 가 필요하다. 약 70초 걸린다
 (쓰기 20초 + 압축·L0 보존 정리 대기 45초). `LITESTREAM=/path/to/litestream` 으로 바이너리를
 바꿀 수 있다. 다시 만들면 TXID·크기·시각이 바뀔 수 있으므로 `tests/test_boot_litestream.py` 의
-기대값(현재 최대 TXID `0x19`)도 맞춘다.
+기대값(`tests/_litestream.py` 의 `FIXTURE_EXPECTED`, 현재 최대 TXID `0x19`)도 맞춘다.
 
 복제 설정(스크립트가 만든다): `file://` 복제본, `l0-retention: 5s`, 레벨 L1 5s·L2 10s,
 스냅샷 20s, `checkpoint-interval: 5s`. 기본값(L0 보존 5분 등)으로는 정리가 늦어 관찰이 오래 걸린다.

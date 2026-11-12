@@ -33,7 +33,6 @@ from django_sqlite_ops.doctor import (
 )
 
 ROOT = Path(__file__).resolve().parent.parent
-FIXTURES = ROOT / "tests" / "fixtures" / "litestream-0.5.17"
 
 RUN_DOCTOR_SCRIPT = """
 import json
@@ -496,13 +495,10 @@ def test_real_local_filesystem_is_not_network(tmp_path):
 # --- Litestream ------------------------------------------------------------------------
 
 
-def _fixture(name):
-    return (FIXTURES / name / "stdout").read_text(), int((FIXTURES / name / "rc").read_text())
-
-
-def test_parse_databases_fixture_paths():
-    # 저장된 fixture 는 랩 경로를 '$LAB' 으로 바꿨으므로 절대 경로로 되돌려 파싱한다
-    stdout, _ = _fixture("databases_json")
+def test_parse_databases_fixture_paths(lsfx):
+    # 검증한 판마다 본다(fixture lsfx). 저장된 fixture 는 랩 경로를 '$LAB' 으로 바꿨으므로
+    # 절대 경로로 되돌려 파싱한다
+    stdout, _, _ = lsfx.out("databases_json")
     paths = parse_databases_json(stdout.replace("$LAB", "/lab"))
     assert paths == [
         "/lab/app.db",
@@ -511,7 +507,7 @@ def test_parse_databases_fixture_paths():
         "/lab/cwd/relative.db",
         "/lab/cwd",
     ]
-    stdout, rc = _fixture("databases_empty")
+    stdout, _, rc = lsfx.out("databases_empty")
     assert (rc, parse_databases_json(stdout)) == (0, [])
 
 

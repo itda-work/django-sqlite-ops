@@ -1,12 +1,14 @@
 """``boot/litestream.py`` 테스트 (DESIGN §4-3, §4-4, §11).
 
-- fixture 파싱: ``tests/fixtures/litestream-0.5.17/`` 의 실측 출력(만든 방법은 그 폴더 README).
+- fixture 파싱: ``tests/fixtures/litestream-<판>/`` 의 실측 출력(만든 방법은 각 폴더 README).
+  검증한 판(``VERIFIED_VERSIONS``)마다 돈다(fixture ``lsfx``, ``tests/_litestream.py``).
 - 가짜 실행 파일: 테스트가 만든 셸 스크립트로 rc·stderr·타임아웃 처리를 본다.
 - 실제 바이너리: ``litestream`` 이 PATH 에 있을 때만 돈다. 없으면 skip 하지만
   ``REQUIRE_LITESTREAM=1`` 이면 실패한다(CI 의 litestream 잡).
 """
 
 import os
+import re
 import shutil
 import sqlite3
 import stat
@@ -16,18 +18,19 @@ import time
 from pathlib import Path
 
 import pytest
-from _litestream import LITESTREAM, SilentServer, needs_litestream, write_config
+from _litestream import (
+    FIXTURE_EXPECTED,
+    LITESTREAM,
+    LitestreamFixtures,
+    SilentServer,
+    fixture_versions,
+    needs_litestream,
+    write_config,
+)
 from _nodjango import assert_runs_without_django
 
 from django_sqlite_ops.boot import litestream as ls
 from django_sqlite_ops.boot.decide import RemoteEmpty, RemoteError, RemoteTxid
-
-FIXTURES = Path(__file__).parent / "fixtures" / "litestream-0.5.17"
-
-
-def fixture(name: str) -> tuple[str, str, int]:
-    d = FIXTURES / name
-    return (d / "stdout").read_text(), (d / "stderr").read_text(), int((d / "rc").read_text())
 
 
 def fake_binary(tmp_path: Path, body: str, *, version: str = "0.5.17") -> str:
@@ -42,10 +45,14 @@ def fake_binary(tmp_path: Path, body: str, *, version: str = "0.5.17") -> str:
     return str(path)
 
 
-def replay_binary(tmp_path: Path, name: str) -> str:
-    """fixture 의 stdout·stderr·rc 를 그대로 내는 가짜 litestream."""
-    d = FIXTURES / name
-    return fake_binary(tmp_path, f'cat "{d}/stdout"; cat "{d}/stderr" >&2; exit $(cat "{d}/rc")')
+def replay_binary(tmp_path: Path, fx: LitestreamFixtures, name: str) -> str:
+    """그 판 fixture 의 stdout·stderr·rc 를 그대로 내는 가짜 litestream(``version`` 도 그 판)."""
+    d = fx.dir / name
+    return fake_binary(
+        tmp_path,
+        f'cat "{d}/stdout"; cat "{d}/stderr" >&2; exit $(cat "{d}/rc")',
+        version=fx.version,
+    )
 
 
 def argv_log(tmp_path: Path) -> list[str]:
@@ -55,32 +62,32 @@ def argv_log(tmp_path: Path) -> list[str]:
 # --- fixture 파싱 -----------------------------------------------------------------------
 
 
-def test_fixture_all_levels_takes_max_over_every_level():
-    stdout, _, rc = fixture("ltx_all_levels")
+def test_fixture_all_levels_takes_max_over_every_level(lsfx):
+    stdout, _, rc = lsfx.out("ltx_all_levels")
     assert rc == 0
-    assert ls.parse_ltx_json(stdout) == RemoteTxid(0x19)
+    assert ls.parse_ltx_json(stdout) == RemoteTxid(lsfx.max_txid)
 
 
-def test_fixture_empty_list_is_remote_empty():
+def test_fixture_empty_list_is_remote_empty(lsfx):
     for name in ("ltx_replica_missing", "ltx_replica_empty_dir"):
-        stdout, _, rc = fixture(name)
+        stdout, _, rc = lsfx.out(name)
         assert rc == 0
         assert ls.parse_ltx_json(stdout) == RemoteEmpty(), name
 
 
-def test_spike_l0_only_misses_compacted_replica():
+def test_spike_l0_only_misses_compacted_replica(lsfx):
     """§4-4 스파이크 결함: L0 만 보면(``-level`` 생략) L0 가 사라진 복제본을 빈 목록으로 본다."""
-    l0_only, _, _ = fixture("ltx_no_l0_default")
-    all_levels, _, _ = fixture("ltx_no_l0_all_levels")
+    l0_only, _, _ = lsfx.out("ltx_no_l0_default")
+    all_levels, _, _ = lsfx.out("ltx_no_l0_all_levels")
     # 같은 복제본이다. 스파이크처럼 L0 만 보면 '복제본 없음' → 새 DB 로 시작해 원격을 덮는다.
     assert ls.parse_ltx_json(l0_only) == RemoteEmpty()
-    assert ls.parse_ltx_json(all_levels) == RemoteTxid(0x19)
+    assert ls.parse_ltx_json(all_levels) == RemoteTxid(lsfx.max_txid)
 
 
-def test_remote_query_passes_level_all(tmp_path):
-    binary = replay_binary(tmp_path, "ltx_no_l0_all_levels")
+def test_remote_query_passes_level_all(tmp_path, lsfx):
+    binary = replay_binary(tmp_path, lsfx, "ltx_no_l0_all_levels")
     assert ls.remote_max_txid("/data/app.db", config="/etc/ls.yml", binary=binary) == RemoteTxid(
-        0x19
+        lsfx.max_txid
     )
     assert argv_log(tmp_path) == [
         "version",
@@ -97,11 +104,11 @@ def test_remote_query_passes_level_all(tmp_path):
         ("ltx_permission_denied", "permission denied"),
     ],
 )
-def test_fixture_nonzero_rc_is_remote_error(tmp_path, name, needle):
-    _, _, rc = fixture(name)
+def test_fixture_nonzero_rc_is_remote_error(tmp_path, lsfx, name, needle):
+    _, _, rc = lsfx.out(name)
     assert rc == 1
     result = ls.remote_max_txid(
-        "/data/app.db", config="c.yml", binary=replay_binary(tmp_path, name)
+        "/data/app.db", config="c.yml", binary=replay_binary(tmp_path, lsfx, name)
     )
     assert type(result) is RemoteError
     assert result.message.startswith("litestream ltx exited with 1: Error: ")
@@ -133,10 +140,10 @@ def test_unexpected_ltx_output_is_remote_error(stdout):
     assert type(ls.parse_ltx_json(stdout)) is RemoteError
 
 
-def test_ltx_parse_skips_leading_log_lines():
-    stdout, _, _ = fixture("ltx_all_levels")
+def test_ltx_parse_skips_leading_log_lines(lsfx):
+    stdout, _, _ = lsfx.out("ltx_all_levels")
     noisy = 'time=2026-10-07T23:17:15.506+09:00 level=WARN msg="x"\n' + stdout
-    assert ls.parse_ltx_json(noisy) == RemoteTxid(0x19)
+    assert ls.parse_ltx_json(noisy) == RemoteTxid(lsfx.max_txid)
 
 
 def test_ltx_parse_ignores_unknown_fields():
@@ -146,21 +153,61 @@ def test_ltx_parse_ignores_unknown_fields():
     assert ls.parse_ltx_json(stdout) == RemoteTxid(0xFF)
 
 
-def test_fixture_version():
-    stdout, _, rc = fixture("version")
+def test_fixture_version(lsfx):
+    stdout, _, rc = lsfx.out("version")
     assert rc == 0
-    assert ls.parse_version(stdout) == "0.5.17"
+    assert ls.parse_version(stdout) == lsfx.version
+
+
+def test_parse_version_forms():
     assert ls.parse_version("v0.5.17\n") == "0.5.17"
     assert ls.parse_version("litestream 0.5.17") is None
 
 
+# --- 검증한 판 집합 ------------------------------------------------------------------------
+
+CI_WORKFLOW = Path(__file__).parents[1] / ".github" / "workflows" / "ci.yml"
+
+
+def test_verified_versions_match_fixture_dirs():
+    """게이트의 판 = fixture 폴더의 판 = 기대값 표. fixture 없이 게이트에 판을 넣으면 실패."""
+    assert set(fixture_versions()) == set(ls.VERIFIED_VERSIONS) == set(FIXTURE_EXPECTED)
+
+
+@pytest.mark.parametrize("version", fixture_versions())
+def test_fixture_dir_version_matches_its_name(version):
+    """``litestream-<판>/version/stdout`` 이 폴더 이름의 판이다(다른 판으로 만들지 않았다)."""
+    d = Path(__file__).parent / "fixtures" / f"litestream-{version}"
+    assert (d / "version" / "rc").read_text().strip() == "0"
+    assert ls.parse_version((d / "version" / "stdout").read_text()) == version
+
+
+def test_ci_litestream_matrix_matches_verified_versions():
+    """CI ``litestream`` 잡의 매트릭스가 검증한 판마다 실제 바이너리로 돈다."""
+    text = CI_WORKFLOW.read_text()
+    (line,) = re.findall(r"(?m)^\s+litestream: \[(.*)\]\s*$", text)
+    assert set(re.findall(r'"([^"]+)"', line)) == set(ls.VERIFIED_VERSIONS)
+
+
+@pytest.mark.parametrize("version", ["0.5.17", "0.5.18"])
+def test_gate_accepts_verified_version(tmp_path, version):
+    assert ls.check_version(binary=fake_binary(tmp_path, "exit 0", version=version)) is None
+
+
+@pytest.mark.parametrize("version", ["0.5.16", "0.5.19", "0.6.0"])
+def test_gate_rejects_other_versions(tmp_path, version):
+    binary = fake_binary(tmp_path, "echo '[]'", version=version)
+    assert ls.check_version(binary=binary) == (
+        f"unsupported litestream version {version}; verified: 0.5.17, 0.5.18"
+    )
+    assert type(ls.remote_max_txid("app.db", config="c.yml", binary=binary)) is RemoteError
+    assert argv_log(tmp_path) == ["version", "version"]
+
+
 # --- 로컬 메타 --------------------------------------------------------------------------
 
-# 실제 LTX 파일(make_fixtures.sh 가 복사한다). 최신 L0 는 0x19, 표본은 복제본 L1 의 첫 파일.
-META_FIXTURE = FIXTURES / "local_meta_after_replicate" / "meta"
-(LATEST_LTX,) = (META_FIXTURE / "ltx" / "0").iterdir()
-(SAMPLE_LTX,) = (FIXTURES / "ltx_sample").iterdir()
-SAMPLE_TXID = int(SAMPLE_LTX.name[17:33], 16)
+# 실제 LTX 파일(make_litestream_fixtures.sh 가 복사한다). 판마다 ``lsfx.latest_ltx``(최신 L0,
+# ``lsfx.max_txid``)와 ``lsfx.sample_ltx``(복제본 L1 의 첫 파일)다.
 
 
 def l0_dir(root: Path) -> Path:
@@ -183,23 +230,25 @@ def patched(src: Path, **fields: int) -> bytes:
     return bytes(data)
 
 
-def test_fixture_local_meta_after_replicate(tmp_path):
+def test_fixture_local_meta_after_replicate(tmp_path, lsfx):
     """업로드·L0 정리·종료 뒤에도 메타에 최신 L0 파일이 남는다(실측). 원격 최대와 같다."""
-    shutil.copytree(META_FIXTURE, tmp_path / ".app.db-litestream")
-    remote = ls.parse_ltx_json(fixture("ltx_all_levels")[0])
-    assert ls.local_max_txid(tmp_path / "app.db") == remote.txid == 0x19
+    shutil.copytree(
+        lsfx.dir / "local_meta_after_replicate" / "meta", tmp_path / ".app.db-litestream"
+    )
+    remote = ls.parse_ltx_json(lsfx.out("ltx_all_levels")[0])
+    assert ls.local_max_txid(tmp_path / "app.db") == remote.txid == lsfx.max_txid
 
 
-def test_fixture_ltx_files_are_real():
-    assert LATEST_LTX.name == ltx_name(0x19, 0x19)
-    assert LATEST_LTX.read_bytes()[:4] == b"LTX1"
-    assert SAMPLE_LTX.read_bytes()[:4] == b"LTX1"
-    assert SAMPLE_TXID < 0x19
+def test_fixture_ltx_files_are_real(lsfx):
+    assert lsfx.latest_ltx.name == ltx_name(lsfx.max_txid, lsfx.max_txid)
+    assert lsfx.latest_ltx.read_bytes()[:4] == b"LTX1"
+    assert lsfx.sample_ltx.read_bytes()[:4] == b"LTX1"
+    assert lsfx.sample_txid < lsfx.max_txid
 
 
-def test_local_meta_ignores_other_names_and_levels(tmp_path):
+def test_local_meta_ignores_other_names_and_levels(tmp_path, lsfx):
     l0 = l0_dir(tmp_path)
-    shutil.copy(LATEST_LTX, l0 / LATEST_LTX.name)
+    shutil.copy(lsfx.latest_ltx, l0 / lsfx.latest_ltx.name)
     for name in (
         "0000000000000001-00000000000000ff.ltx.tmp",
         "0000000000000001-00000000000000FF.ltx",
@@ -210,7 +259,7 @@ def test_local_meta_ignores_other_names_and_levels(tmp_path):
     l1 = l0.parent / "1"
     l1.mkdir()
     (l1 / ltx_name(1, 0xFFF)).write_bytes(b"x")
-    assert ls.local_max_txid(tmp_path / "app.db") == 0x19
+    assert ls.local_max_txid(tmp_path / "app.db") == lsfx.max_txid
 
 
 def test_local_meta_missing_or_empty_is_none(tmp_path):
@@ -220,11 +269,11 @@ def test_local_meta_missing_or_empty_is_none(tmp_path):
     assert ls.local_max_txid(db) is None
 
 
-def test_local_meta_custom_path(tmp_path):
+def test_local_meta_custom_path(tmp_path, lsfx):
     l0 = tmp_path / "meta" / "ltx" / "0"
     l0.mkdir(parents=True)
-    shutil.copy(LATEST_LTX, l0 / LATEST_LTX.name)
-    assert ls.local_max_txid(tmp_path / "app.db", meta_path=tmp_path / "meta") == 0x19
+    shutil.copy(lsfx.latest_ltx, l0 / lsfx.latest_ltx.name)
+    assert ls.local_max_txid(tmp_path / "app.db", meta_path=tmp_path / "meta") == lsfx.max_txid
     assert ls.local_max_txid(tmp_path / "app.db") is None
 
 
@@ -232,9 +281,9 @@ def test_local_meta_bad_path_is_none():
     assert ls.local_max_txid("bad\0path") is None
 
 
-def test_local_meta_unreadable_dir_is_none(tmp_path):
+def test_local_meta_unreadable_dir_is_none(tmp_path, lsfx):
     l0 = l0_dir(tmp_path)
-    shutil.copy(LATEST_LTX, l0 / LATEST_LTX.name)
+    shutil.copy(lsfx.latest_ltx, l0 / lsfx.latest_ltx.name)
     l0.chmod(0)
     try:
         if os.access(l0, os.R_OK):
@@ -248,85 +297,92 @@ def test_local_meta_unreadable_dir_is_none(tmp_path):
 # 낮은 후보로 내려가면 실제보다 오래된 위치를 '로컬 TXID' 로 믿게 된다(리뷰 1 지적 2).
 
 
-def with_valid_lower(tmp_path: Path) -> Path:
+def with_valid_lower(tmp_path: Path, fx: LitestreamFixtures) -> Path:
     l0 = l0_dir(tmp_path)
-    shutil.copy(SAMPLE_LTX, l0 / SAMPLE_LTX.name)
-    assert ls.local_max_txid(tmp_path / "app.db") == SAMPLE_TXID
+    shutil.copy(fx.sample_ltx, l0 / fx.sample_ltx.name)
+    assert ls.local_max_txid(tmp_path / "app.db") == fx.sample_txid
     return l0
 
 
-def test_local_meta_directory_candidate_is_none(tmp_path):
-    l0 = with_valid_lower(tmp_path)
+def test_local_meta_directory_candidate_is_none(tmp_path, lsfx):
+    l0 = with_valid_lower(tmp_path, lsfx)
     (l0 / ltx_name(1, 0xFF)).mkdir()
     assert ls.local_max_txid(tmp_path / "app.db") is None
 
 
-def test_local_meta_empty_file_candidate_is_none(tmp_path):
-    l0 = with_valid_lower(tmp_path)
-    (l0 / ltx_name(0x19, 0x19)).touch()
+def test_local_meta_empty_file_candidate_is_none(tmp_path, lsfx):
+    l0 = with_valid_lower(tmp_path, lsfx)
+    (l0 / ltx_name(lsfx.max_txid, lsfx.max_txid)).touch()
     assert ls.local_max_txid(tmp_path / "app.db") is None
 
 
-def test_local_meta_short_header_is_none(tmp_path):
-    l0 = with_valid_lower(tmp_path)
-    (l0 / LATEST_LTX.name).write_bytes(LATEST_LTX.read_bytes()[:99])
+def test_local_meta_short_header_is_none(tmp_path, lsfx):
+    l0 = with_valid_lower(tmp_path, lsfx)
+    (l0 / lsfx.latest_ltx.name).write_bytes(lsfx.latest_ltx.read_bytes()[:99])
     assert ls.local_max_txid(tmp_path / "app.db") is None
 
 
-def test_local_meta_bad_magic_is_none(tmp_path):
-    l0 = with_valid_lower(tmp_path)
-    (l0 / LATEST_LTX.name).write_bytes(b"LTX0" + LATEST_LTX.read_bytes()[4:])
+def test_local_meta_bad_magic_is_none(tmp_path, lsfx):
+    l0 = with_valid_lower(tmp_path, lsfx)
+    (l0 / lsfx.latest_ltx.name).write_bytes(b"LTX0" + lsfx.latest_ltx.read_bytes()[4:])
     assert ls.local_max_txid(tmp_path / "app.db") is None
 
 
-def test_local_meta_broken_latest_with_valid_lower_is_none(tmp_path):
-    l0 = with_valid_lower(tmp_path)
-    (l0 / ltx_name(0x19, 0x19)).write_bytes(b"broken")
+def test_local_meta_broken_latest_with_valid_lower_is_none(tmp_path, lsfx):
+    l0 = with_valid_lower(tmp_path, lsfx)
+    (l0 / ltx_name(lsfx.max_txid, lsfx.max_txid)).write_bytes(b"broken")
     assert ls.local_max_txid(tmp_path / "app.db") is None
 
 
 @pytest.mark.parametrize(
     "fields", [{"flags": 1}, {"flags": 4}, {"page_size": 1000}, {"page_size": 0}]
 )
-def test_local_meta_invalid_header_fields_are_none(tmp_path, fields):
-    l0 = with_valid_lower(tmp_path)
-    (l0 / LATEST_LTX.name).write_bytes(patched(LATEST_LTX, **fields))
+def test_local_meta_invalid_header_fields_are_none(tmp_path, lsfx, fields):
+    l0 = with_valid_lower(tmp_path, lsfx)
+    (l0 / lsfx.latest_ltx.name).write_bytes(patched(lsfx.latest_ltx, **fields))
     assert ls.local_max_txid(tmp_path / "app.db") is None
 
 
-def test_local_meta_reversed_range_is_none(tmp_path):
-    l0 = with_valid_lower(tmp_path)
-    data = patched(LATEST_LTX, min_txid=0x200, max_txid=0x1FF)
+def test_local_meta_reversed_range_is_none(tmp_path, lsfx):
+    l0 = with_valid_lower(tmp_path, lsfx)
+    data = patched(lsfx.latest_ltx, min_txid=0x200, max_txid=0x1FF)
     (l0 / ltx_name(0x200, 0x1FF)).write_bytes(data)
     assert ls.local_max_txid(tmp_path / "app.db") is None
 
 
-def test_local_meta_zero_min_txid_is_none(tmp_path):
-    l0 = with_valid_lower(tmp_path)
-    (l0 / ltx_name(0, 0x19)).write_bytes(patched(LATEST_LTX, min_txid=0))
+def test_local_meta_zero_min_txid_is_none(tmp_path, lsfx):
+    l0 = with_valid_lower(tmp_path, lsfx)
+    (l0 / ltx_name(0, lsfx.max_txid)).write_bytes(patched(lsfx.latest_ltx, min_txid=0))
     assert ls.local_max_txid(tmp_path / "app.db") is None
 
 
-@pytest.mark.parametrize(("min_txid", "max_txid"), [(1, 0xFF), (0x19, 0x1A), (0x18, 0x19)])
-def test_local_meta_header_name_mismatch_is_none(tmp_path, min_txid, max_txid):
-    # 헤더는 0x19-0x19 인데 이름은 다르다.
-    l0 = with_valid_lower(tmp_path)
-    shutil.copy(LATEST_LTX, l0 / ltx_name(min_txid, max_txid))
+@pytest.mark.parametrize(
+    "name_range",
+    [lambda m: (1, 0xFF), lambda m: (m, m + 1), lambda m: (m - 1, m)],
+    ids=["other", "max-plus-1", "min-minus-1"],
+)
+def test_local_meta_header_name_mismatch_is_none(tmp_path, lsfx, name_range):
+    # 헤더는 <max>-<max> 인데 이름은 다르다.
+    m = lsfx.max_txid
+    min_txid, max_txid = name_range(m)
+    assert (min_txid, max_txid) != (m, m)
+    l0 = with_valid_lower(tmp_path, lsfx)
+    shutil.copy(lsfx.latest_ltx, l0 / ltx_name(min_txid, max_txid))
     assert ls.local_max_txid(tmp_path / "app.db") is None
 
 
-def test_local_meta_symlink_candidate_is_none(tmp_path):
+def test_local_meta_symlink_candidate_is_none(tmp_path, lsfx):
     # Litestream 은 메타에 심볼릭 링크를 만들지 않는다. 링크는 따라가지 않는다.
-    l0 = with_valid_lower(tmp_path)
+    l0 = with_valid_lower(tmp_path, lsfx)
     target = tmp_path / "elsewhere.ltx"
-    shutil.copy(LATEST_LTX, target)
-    (l0 / LATEST_LTX.name).symlink_to(target)
+    shutil.copy(lsfx.latest_ltx, target)
+    (l0 / lsfx.latest_ltx.name).symlink_to(target)
     assert ls.local_max_txid(tmp_path / "app.db") is None
 
 
-def test_local_meta_fifo_candidate_is_none_without_blocking(tmp_path):
-    l0 = with_valid_lower(tmp_path)
-    os.mkfifo(l0 / LATEST_LTX.name)
+def test_local_meta_fifo_candidate_is_none_without_blocking(tmp_path, lsfx):
+    l0 = with_valid_lower(tmp_path, lsfx)
+    os.mkfifo(l0 / lsfx.latest_ltx.name)
     result: list[int | None] = []
     t = threading.Thread(target=lambda: result.append(ls.local_max_txid(tmp_path / "app.db")))
     t.daemon = True
@@ -336,10 +392,10 @@ def test_local_meta_fifo_candidate_is_none_without_blocking(tmp_path):
     assert result == [None]
 
 
-def test_local_meta_unreadable_file_is_none(tmp_path):
-    l0 = with_valid_lower(tmp_path)
-    latest = l0 / LATEST_LTX.name
-    shutil.copy(LATEST_LTX, latest)
+def test_local_meta_unreadable_file_is_none(tmp_path, lsfx):
+    l0 = with_valid_lower(tmp_path, lsfx)
+    latest = l0 / lsfx.latest_ltx.name
+    shutil.copy(lsfx.latest_ltx, latest)
     latest.chmod(0)
     try:
         if os.access(latest, os.R_OK):
@@ -388,9 +444,9 @@ def test_missing_binary_is_remote_error(tmp_path):
 
 
 def test_unsupported_version_is_remote_error(tmp_path):
-    binary = fake_binary(tmp_path, "echo '[]'", version="0.5.18")
+    binary = fake_binary(tmp_path, "echo '[]'", version="0.5.19")
     result = ls.remote_max_txid("app.db", config="c.yml", binary=binary)
-    assert result == RemoteError("unsupported litestream version 0.5.18; verified: 0.5.17")
+    assert result == RemoteError("unsupported litestream version 0.5.19; verified: 0.5.17, 0.5.18")
     # 버전이 맞지 않으면 ltx 를 부르지 않는다.
     assert argv_log(tmp_path) == ["version"]
 
@@ -465,13 +521,16 @@ def test_non_utf8_output_does_not_raise(tmp_path):
 # --- restore (가짜 실행 파일) --------------------------------------------------------------
 
 
-def test_restore_passes_expected_args_and_parses_summary(tmp_path):
+def test_restore_passes_expected_args_and_parses_summary(tmp_path, lsfx):
     out = tmp_path / "restored.db"
-    d = FIXTURES / "restore_ok_json"
+    d = lsfx.dir / "restore_ok_json"
     # 실측 stdout 은 integrity 로그 줄 뒤에 JSON 이 온다.
-    binary = fake_binary(tmp_path, f'cat "{d}/stdout"; printf "SQLite" > "{out}"; exit 0')
+    binary = fake_binary(
+        tmp_path, f'cat "{d}/stdout"; printf "SQLite" > "{out}"; exit 0', version=lsfx.version
+    )
     result = ls.restore("/data/app.db", out, config="/etc/ls.yml", binary=binary)
-    assert result == ls.RestoreResult(True, f"restored txid 25 to {out}", 0x19)
+    m = lsfx.max_txid
+    assert result == ls.RestoreResult(True, f"restored txid {m} to {out}", m)
     assert argv_log(tmp_path)[1] == (
         f"restore -config /etc/ls.yml -json -integrity-check quick -o {out} /data/app.db"
     )
@@ -490,27 +549,27 @@ def test_restore_refuses_existing_output_without_running(tmp_path):
 
 
 @pytest.mark.parametrize("name", ["restore_no_backups", "restore_output_exists"])
-def test_restore_fixture_failures(tmp_path, name):
+def test_restore_fixture_failures(tmp_path, lsfx, name):
     result = ls.restore(
-        "app.db", tmp_path / "out.db", config="c.yml", binary=replay_binary(tmp_path, name)
+        "app.db", tmp_path / "out.db", config="c.yml", binary=replay_binary(tmp_path, lsfx, name)
     )
     assert result.ok is False
     assert result.reason.startswith("litestream restore exited with 1: Error: ")
     assert result.txid is None
 
 
-def test_restore_rc0_without_file_is_failure(tmp_path):
-    d = FIXTURES / "restore_ok_json"
-    binary = fake_binary(tmp_path, f'cat "{d}/stdout"; exit 0')
+def test_restore_rc0_without_file_is_failure(tmp_path, lsfx):
+    d = lsfx.dir / "restore_ok_json"
+    binary = fake_binary(tmp_path, f'cat "{d}/stdout"; exit 0', version=lsfx.version)
     result = ls.restore("app.db", tmp_path / "out.db", config="c.yml", binary=binary)
     assert result.ok is False
     assert "missing" in result.reason
 
 
-def test_restore_rc0_with_empty_file_is_failure(tmp_path):
+def test_restore_rc0_with_empty_file_is_failure(tmp_path, lsfx):
     out = tmp_path / "out.db"
-    d = FIXTURES / "restore_ok_json"
-    binary = fake_binary(tmp_path, f'cat "{d}/stdout"; : > "{out}"; exit 0')
+    d = lsfx.dir / "restore_ok_json"
+    binary = fake_binary(tmp_path, f'cat "{d}/stdout"; : > "{out}"; exit 0', version=lsfx.version)
     result = ls.restore("app.db", out, config="c.yml", binary=binary)
     assert result.ok is False
     assert "empty" in result.reason
@@ -537,7 +596,7 @@ def test_restore_unsupported_version(tmp_path):
     binary = fake_binary(tmp_path, "exit 0", version="0.6.0")
     result = ls.restore("app.db", tmp_path / "o.db", config="c.yml", binary=binary)
     assert result == ls.RestoreResult(
-        False, "unsupported litestream version 0.6.0; verified: 0.5.17"
+        False, "unsupported litestream version 0.6.0; verified: 0.5.17, 0.5.18"
     )
 
 

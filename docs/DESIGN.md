@@ -132,7 +132,7 @@ python -m django_sqlite_ops.boot \
 - `--init-new` : 생애 첫 배포에서 새 DB 로 시작할 때 쓴다. 정확히 (로컬 DB 없음, 로컬 메타 없음, 원격 조회 성공·빈 목록) 일 때만 `fresh/new_db` 로 진행하고, 없으면 같은 조합을 `unknown/no_replica_no_local` 로 거부한다. Litestream 은 복제본 경로·prefix 오타와 "복제본 없음"을 같은 빈 목록(rc 0, `[]`)으로 돌려주므로(#3 실측) 빈 목록만으로 새 DB 를 시작하면 오타 난 경로에 새 DB 를 복제해 기존 복제본을 버리게 된다. 그 조합 밖에서는 무효과지만, 판정 함수는 '첫 배포였음'을 기억하지 않으므로 나중에 DB·메타가 함께 사라지고 복제본 경로까지 틀리면 같은 조합이 다시 성립한다. 그래서 **첫 배포 뒤에는 끈다**(D-13 정정).
 - **원격 TXID 조회**는 `litestream ltx -config <설정> -level all -json <db 경로>` 로 설정 파일의 복제본을 모든 레벨에 걸쳐 보고, 항목들의 `max_txid`(16자리 16진수) 최대값을 쓴다. 기본(`-level` 생략)은 L0 만 나열해 L0 가 사라진 복제본을 빈 목록으로 오판한다(0.5.17 `ltx -h` 와 실측). 구현은 `boot/litestream.py` 의 `remote_max_txid()`.
   - rc 0 + `[]` → `RemoteEmpty`. 0.5.17 은 복제본 경로가 없을 때와 비어 있을 때 모두 이 출력이라 둘을 구분할 수 없다(경로 오타도 빈 목록이다). 조회 모듈은 사실(빈 목록)만 돌려주고, 이를 어떻게 다룰지는 판정 정책이 정한다. 빈 목록의 처리는 아래 상태 규칙표를 따르며, 로컬 DB·메타가 모두 없을 때 새 DB 로 시작하려면 `--init-new` 가 필요하다(D-13).
-  - rc ≠ 0(설정에 없는 DB·설정 파일 없음·YAML 오류·접근 불가 모두 rc 1, stderr `Error: ...`), 타임아웃(기본 30초), JSON·스키마 이상, 검증하지 않은 Litestream 버전(`litestream version` 이 `VERIFIED_VERSIONS`, 현재 0.5.17 밖) → `RemoteError`.
+  - rc ≠ 0(설정에 없는 DB·설정 파일 없음·YAML 오류·접근 불가 모두 rc 1, stderr `Error: ...`), 타임아웃(기본 30초), JSON·스키마 이상, 검증하지 않은 Litestream 버전(`litestream version` 이 `VERIFIED_VERSIONS`, 현재 0.5.17·0.5.18 밖) → `RemoteError`.
 - **로컬 TXID 조회**는 로컬 메타 디렉터리(기본 `<db 디렉터리>/.<db 이름>-litestream/`, 설정의 `meta-path` 로 바뀜)의 `ltx/0/` 에서 고른 최신 LTX 파일 하나의 max TXID 를 쓴다. 구현은 `local_max_txid()`.
   - 후보: 파일 이름 `<min>-<max>.ltx`(16자리 소문자 16진수) 중 `max` 가 가장 큰 것. Litestream 0.5.17 이 자기 복제 위치를 정하는 `DB.MaxLTX()` 와 같은 선택이다. L0 보존 정리는 가장 새 L0 파일을 지우지 않으므로 업로드·압축·종료 뒤에도 남는다(소스 `EnforceL0RetentionByTime` 과 실측).
   - 검증: 그 후보 하나가 정규 파일(LTX 파일 자체의 심볼릭 링크는 거부하고, 상위 메타 디렉터리의 링크는 허용해 따라간다)이고 읽을 수 있으며, 이름이 1 ≤ min ≤ max 이고, LTX 헤더(superfly/ltx v0.5.2: 매직 `LTX1`, flags 는 `NoChecksum` 비트만, page size 512–65536 의 2의 거듭제곱, `[16:24]`·`[24:32]` 의 min/max)가 이름과 일치해야 한다. 어긋나면 낮은 후보로 내려가지 않고 `None`(로컬 메타 없음 → `unknown`)이다. 낮은 후보를 쓰면 실제보다 오래된 위치를 믿게 된다.
@@ -212,7 +212,7 @@ django_sqlite_ops/
 └── vfs.py           (2단계) 확장 로드 우회 — 옵션
 ```
 - 의존성: Django ≥ 5.2(LTS)만 필수다. extra 로 `[nats]` → channels-nats, `[channels-lite]` → channels-lite 를 둔다.
-- 지원 범위(CI `.github/workflows/ci.yml` 이 정본): Python 3.13+, Django 5.2 / 6.1, SQLite 3.37+ (Django 하한). Litestream 0.5.17 에 맞추고, CLI 출력 파싱은 버전 범위를 명시한다. 플랫폼은 POSIX(Linux·macOS)다. 매트릭스는 Linux 이고, macOS 는 `macos` 잡(`macos-latest`, Python 3.14, Django 6.1) 하나가 전체 테스트를 돈다. 이 잡은 `REQUIRE_CASE_INSENSITIVE_FS=1` 이라 대소문자 무시 볼륨 전용 테스트가 skip 되면 실패한다(#50, 2026-10-14 추가). act(`scripts/ci-local.sh`)로는 돌지 않는다.
+- 지원 범위(CI `.github/workflows/ci.yml` 이 정본): Python 3.13+, Django 5.2 / 6.1, SQLite 3.37+ (Django 하한). Litestream 은 검증한 판 0.5.17·0.5.18 만 받는다(`VERIFIED_VERSIONS`, 2026-11-12 확인 #99). 판마다 실측 fixture(`tests/fixtures/litestream-<판>/`)와 CI `litestream` 잡의 매트릭스 칸이 하나씩 있고, 게이트·fixture 폴더·매트릭스가 같은 집합인지 테스트가 본다. 범위(`>=`)로 열지 않는다 — 재지 않은 판은 판정할 수 없다. 플랫폼은 POSIX(Linux·macOS)다. 매트릭스는 Linux 이고, macOS 는 `macos` 잡(`macos-latest`, Python 3.14, Django 6.1) 하나가 전체 테스트를 돈다. 이 잡은 `REQUIRE_CASE_INSENSITIVE_FS=1` 이라 대소문자 무시 볼륨 전용 테스트가 skip 되면 실패한다(#50, 2026-10-14 추가). act(`scripts/ci-local.sh`)로는 돌지 않는다.
 
 ## 6. 권장 설정, 진단과 체크
 
@@ -596,7 +596,7 @@ SQLITE_OPS = {
 ## 11. 테스트·검증 원칙
 - `sqlite_database()` 출력은 프로필별 스냅샷 테스트로 고정한다. Django 를 막은 상태에서 import 되는지도 본다.
 - 판정 함수(`decide.py`)는 모든 입력 조합을 표 기반 단위 테스트로 고정한다.
-- Litestream CLI 출력 파싱은 실제 0.5.17 출력을 fixture 로 저장해 테스트한다.
+- Litestream CLI 출력 파싱은 검증한 판마다 실제 출력을 fixture 로 저장해(`tests/fixtures/litestream-<판>/`, `make_litestream_fixtures.sh`) 판마다 같은 테스트를 돌린다(0.5.17, 0.5.18 — #99).
 - 결함 수정은 "수정 전에 실패하는 테스트"로 증명한다.
 - "재현함 / 코드상 확인 / 미검증"을 구분해서 쓴다.
 
@@ -612,4 +612,4 @@ SQLITE_OPS = {
 - Windows 에서 boot CLI 의 파일 잠금과 디렉터리 rename 원자성 [확인 필요]. 그때까지 boot 는 `fcntl` 이 없으면 exit 64 로 거부한다
 - "같은 이력" 증명 방법(자동 판정의 전제) [확인 필요]
 - `--restore-test`(§6-2) 의 두 전제는 #54 에서 재현했다(2026-10-15): `restore -o` 는 `DB_PATH` 쪽을 읽지도 쓰지도 않고, `interrupt()` 는 707MB full 검사를 1ms 안에 멈춘다. 남은 것: 페이지 캐시가 차가운 상태·수십 GB DB·Linux 에서의 `interrupt()` 지연, S3 복제본에서의 불변 계약(file 복제본으로만 확인), litestream VFS 별칭에 로컬 캐시 경로가 있는지(있다면 보호 대상에 넣어야 한다 — 지금은 `vfs` 를 로컬 경로 없음으로 통과시킨다) (미검증)
-- Litestream 상류(2026-10-13 확인): #1506(VFS 확장 로드)은 2026-10-08 머지됐으나 v0.5.17 이후라 미릴리스 — 다음 릴리스에서 Linux 확장 로드 뒤 일반 connect 실패가 사라지는지 재검증한다. #1271(writable VFS 손상)은 열림, 수정 PR #1363 도 열림(§3-3 유지)
+- Litestream 상류: #1506(VFS 확장 로드)은 v0.5.18(2026-11-03)에 들어갔다(릴리스 노트, 2026-11-12 확인). Linux 확장 로드 뒤 일반 connect 실패가 0.5.18 에서 사라지는지 재검증은 #105 다(미검증). #1271(writable VFS 손상)은 열림, 수정 PR #1363 도 열림(§3-3 유지)

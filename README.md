@@ -68,7 +68,7 @@ PyPI 에 **실험적 사전 릴리스**로 배포한다([D-28](docs/DECISIONS.md
 
 ## 설치
 
-요구 버전: Python 3.13+, Django 5.2+, SQLite 3.37+. boot CLI 는 POSIX(Linux·macOS)와 PATH 의 `litestream` 0.5.17 이 필요하다([boot CLI](#boot-cli)).
+요구 버전: Python 3.13+, Django 5.2+, SQLite 3.37+. boot CLI 는 POSIX(Linux·macOS)와 PATH 의 `litestream` 0.5.17 또는 0.5.18 이 필요하다([boot CLI](#boot-cli)).
 
 PyPI 에서 설치한다. 사전 릴리스는 버전을 명시해 설치한다. 실험적 프로젝트이므로 그 버전으로 고정해 둔다.
 
@@ -375,7 +375,7 @@ python manage.py sqlite_doctor --json          # 모니터링·스크립트용
 |---|---|
 | `--database ALIAS` | 볼 별칭(여러 번 줄 수 있다). 없으면 sqlite3 엔진 별칭 전부 |
 | `--litestream-config PATH` | Litestream 설정 파일. 주면 그 DB 목록을 `DATABASES` 와 대조한다. 없으면 이 섹션은 건너뛴다. 상대 경로는 명령을 실행한 디렉터리 기준이다 |
-| `--litestream BIN` | Litestream 바이너리(기본 PATH 의 `litestream`, 0.5.17 만 받는다) |
+| `--litestream BIN` | Litestream 바이너리(기본 PATH 의 `litestream`, 0.5.17·0.5.18 만 받는다) |
 | `--json` | JSON 출력(스키마 `version: 1`, [DESIGN §6-2](docs/DESIGN.md)). 열린 파일 한도는 `section` `process`, `key` `nofile_soft`·`nofile_hard`(값은 정수 또는 `"unlimited"`) 또는 `nofile`(값 `null`, 읽지 못함) |
 
 > **주의 — 연결하면 `init_command` 가 실행되고 `-wal`·`-shm` 이 생길 수 있다.** Django 는 연결할 때마다 `OPTIONS["init_command"]` 를 실행하므로 진단이 DB 를 바꿀 수 있다. 예를 들어 `PRAGMA journal_mode=WAL` 은 파일에 남는다. 또 WAL 모드 DB 는 연결만 해도 SQLite 가 `-wal`·`-shm` 파일을 만든다(`init_command` 가 없어도). 쓰기 별칭은 앱이 연결할 때와 같은 일이므로 그대로 연결한다. 운영 DB 에서 돌린다는 점을 알고 실행한다.
@@ -533,7 +533,7 @@ WantedBy=timers.target
 
 컨테이너가 뜰 때 Litestream 복제본과 로컬 DB 를 비교해 **쓸 수 있으면 그대로, 볼륨이 비었으면 복원, 판정할 수 없으면 기동을 거부**한 뒤 다음 명령으로 넘어간다. Django 를 import 하지 않는 독립 CLI 다. `manage.py` 명령은 `django.setup()` 중에 빈 DB 파일을 만들 수 있고, 그러면 복원이 건너뛰어지기 때문이다([DESIGN §4-1](docs/DESIGN.md)).
 
-필요한 것: POSIX(Linux·macOS), PATH 의 `litestream` 0.5.17(검증한 버전만 받는다), DB 마다 복제본이 적힌 Litestream 설정 파일. 설치는 [공식 문서](https://litestream.io/install/)를 따른다.
+필요한 것: POSIX(Linux·macOS), PATH 의 `litestream` 0.5.17 또는 0.5.18(검증한 버전만 받는다, 2026-11-12 확인), DB 마다 복제본이 적힌 Litestream 설정 파일. 설치는 [공식 문서](https://litestream.io/install/)를 따른다.
 
 #### 실행 형태
 

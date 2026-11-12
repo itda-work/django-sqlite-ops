@@ -50,7 +50,7 @@
 - 의존성은 Django 만 필수다. channels-nats(`[nats]`)와 channels-lite(`[channels-lite]`)는 extra 로 둔다.
 
 ## CI
-- GitHub Actions(`.github/workflows/ci.yml`)가 정본이다: lint(ruff) + Python 3.13/3.14 × Django 5.2/6.1 매트릭스 + `sqlite-floor`(Ubuntu 22.04 시스템 SQLite 3.37.2) + `litestream`(릴리스 .deb 로 설치한 실제 바이너리와 `channels-lite[aio]==0.4.0`. `REQUIRE_LITESTREAM=1`·`REQUIRE_CHANNELS_LITE=1` 이라 둘 중 하나가 없어 skip 되면 실패. channels-lite 테스트는 이 잡에서만 돈다). uv 의 Python 은 최신 SQLite 를 품고 있어 하한은 `sqlite-floor` 에서만 검사된다.
+- GitHub Actions(`.github/workflows/ci.yml`)가 정본이다: lint(ruff) + Python 3.13/3.14 × Django 5.2/6.1 매트릭스 + `sqlite-floor`(Ubuntu 22.04 시스템 SQLite 3.37.2) + `litestream`(검증한 판 0.5.17·0.5.18 매트릭스 — `VERIFIED_VERSIONS`·`tests/fixtures/litestream-<판>/` 와 같은 집합이어야 하고 테스트가 본다, 2026-11-12 #99. 릴리스 .deb 로 설치한 실제 바이너리와 `channels-lite[aio]==0.4.0`. `REQUIRE_LITESTREAM=1`·`REQUIRE_CHANNELS_LITE=1` 이라 둘 중 하나가 없어 skip 되면 실패. channels-lite 테스트는 이 잡에서만 돈다). uv 의 Python 은 최신 SQLite 를 품고 있어 하한은 `sqlite-floor` 에서만 검사된다.
 - 로컬에서는 `scripts/ci-local.sh` 로 같은 워크플로를 act 로 돌린다(`lint`, `litestream`, `test <py> <django>` 로 좁힐 수 있다). `-W .github/workflows/ci.yml` 로 `ci.yml` 만 돈다. act 는 push 의 `branches`·`tags` 필터를 보지 않는다(act 0.2.89). 그래서 `ci.yml`(`branches: [main]`)이 브랜치에서도 돌고, `-W` 가 없으면 `release.yml`(`tags: [v*]`)까지 돌아 실패한다(#90, 2026-10-27 확인). 지원 범위를 바꾸면 이 매트릭스와 DESIGN §5 를 함께 고친다.
 - `macos` 잡(`macos-latest`, py3.14, Django 6.1)이 전체 테스트를 돈다. `REQUIRE_CASE_INSENSITIVE_FS=1` 이라 대소문자 무시 볼륨 전용 테스트(`ci_lab`)가 skip 되면 실패한다(#50). Linux 잡에서는 그 테스트가 skip 된다.
 - act 는 Linux 컨테이너만 돌린다. `macos` 잡은 `ci-local.sh` 에서 'unsupported platform' 으로 건너뛴다. 로컬 macOS 에서는 `REQUIRE_CASE_INSENSITIVE_FS=1 uv run pytest -rs` 로 대신한다.
@@ -66,7 +66,7 @@
 - Litestream 을 붙인 스택에서는 Django 기본 SQLite 설정도 WAL 로 돈다(복제를 시작하며 journal_mode 를 바꾼다, #83 에서 재현함 2026-10-26). Django 기본(rollback journal)을 잴 때는 Litestream 없는 앱(`labapp-plain`)을 쓴다.
 - restore 로 만든 DB 옆에는 로컬 메타(`.<db>-litestream/`)가 없다. replicate 가 시작돼야 생긴다.
 - S3 가 끊겨도 Litestream 은 로그·`status`·메트릭에 아무것도 남기지 않는다(D3). 그래서 헬스는 TXID 를 직접 비교해 계산한다.
-- Linux 에서 litestream-vfs 확장을 로드하면 그 뒤의 일반 connect 가 실패한다. 우회책 `sqlite3_reset_auto_extension()` 은 **모든** 자동 확장을 해제하므로 옵션으로만 둔다. 상류 수정 #1506 은 2026-10-08 에 머지됐지만 v0.5.17 이후라 아직 릴리스되지 않았다(2026-10-13 확인). 다음 릴리스가 나오면 재검증한다.
+- Linux 에서 litestream-vfs 확장을 로드하면 그 뒤의 일반 connect 가 실패한다. 우회책 `sqlite3_reset_auto_extension()` 은 **모든** 자동 확장을 해제하므로 옵션으로만 둔다. 상류 수정 #1506 은 v0.5.18(2026-11-03)에 들어갔다(릴리스 노트, 2026-11-12 확인). 0.5.18 에서 사라지는지 재검증은 #105 다(미검증).
 - SeaweedFS 는 버킷마다 볼륨을 잡는다. 랩에서는 버킷 하나를 두고 prefix 로 나누며, `-volume.max` 를 올린다.
 - macOS 에는 `timeout` 명령이 없다.
 - `.work/issue-<N>/` 아래에서 `uv init`·`uv add` 를 하면 uv 가 상위의 이 저장소를 workspace 루트로 잡아 메인 `pyproject.toml` 에 `[tool.uv.workspace] members = [...]` 를 넣는다(#77 에서 재현됨, 2026-10-26 확인). 시험 프로젝트는 저장소 밖에 만들거나 `uv init --no-workspace` 를 쓰고, 브리프에 적는다.

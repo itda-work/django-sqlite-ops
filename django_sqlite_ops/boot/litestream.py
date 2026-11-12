@@ -6,11 +6,11 @@
 ``RemoteTxid`` 중 하나를, 로컬 조회는 ``int | None`` 을, restore 는 ``RestoreResult`` 를
 돌려준다. 판정은 ``decide()`` 가 한다.
 
-빈 목록(rc 0, ``[]``)은 그대로 ``RemoteEmpty`` 다. 0.5.17 은 복제본 경로·prefix 오타와
+빈 목록(rc 0, ``[]``)은 그대로 ``RemoteEmpty`` 다. 0.5.17·0.5.18 은 복제본 경로·prefix 오타와
 "복제본 없음"을 같은 출력으로 돌려주므로 이 모듈은 둘을 구분하지 못한다. 그 빈 목록을 새 DB 의
 근거로 쓸지는 판정 정책이 정한다(``decide()`` 의 ``init_new``, D-13).
 
-출력 형식·동작은 Litestream 0.5.17 에서 실측했다(``tests/fixtures/litestream-0.5.17/``).
+출력 형식·동작은 Litestream 0.5.17·0.5.18 에서 실측했다(``tests/fixtures/litestream-<판>/``).
 검증하지 않은 버전이면 원격 조회와 restore 를 하지 않고 실패로 돌려준다.
 """
 
@@ -47,7 +47,8 @@ __all__ = [
 ]
 
 # 실측으로 출력 형식과 동작을 확인한 버전. 범위 밖이면 판정할 수 없으므로 거부한다.
-VERIFIED_VERSIONS = frozenset({"0.5.17"})
+# 판마다 tests/fixtures/litestream-<판>/ 의 실측 fixture 가 있어야 한다(테스트가 집합을 맞춘다).
+VERIFIED_VERSIONS = frozenset({"0.5.17", "0.5.18"})
 
 # `litestream version` 은 네트워크를 쓰지 않는다. 바이너리가 멈췄을 때만 걸린다.
 DEFAULT_VERSION_TIMEOUT = 10.0
@@ -254,7 +255,7 @@ def remote_max_txid(
     ``litestream ltx -level all -json`` 을 쓴다. 기본(``-level`` 생략)은 L0 만 나열해
     L0 가 지워진 복제본을 빈 목록으로 오판한다(DESIGN §4-4).
 
-    주의(0.5.17 실측): 복제본 경로가 없거나 비어 있어도 rc 0 과 ``[]`` 다. 둘은 출력으로
+    주의(0.5.17·0.5.18 실측): 복제본 경로가 없거나 비어 있어도 rc 0 과 ``[]`` 다. 둘은 출력으로
     구분되지 않으므로 둘 다 ``RemoteEmpty`` 다. 설정에 없는 DB·설정 파일 없음·접근 불가는 rc 1.
     """
     problem = check_version(binary=binary, timeout=version_timeout)
@@ -284,9 +285,9 @@ def remote_max_txid(
 def parse_databases_json(stdout: str) -> list[str] | str:
     """``litestream databases -json`` 의 stdout 에서 DB 경로 목록을 읽는다. 실패면 사유 문자열.
 
-    0.5.17 출력은 ``[{"path": "<절대 경로>", "replica": "<종류>"}, ...]`` 다. Litestream 은
+    0.5.17·0.5.18 출력은 ``[{"path": "<절대 경로>", "replica": "<종류>"}, ...]`` 다. Litestream 은
     경로를 ``filepath.Abs`` 로 바꿔 내보낸다: 상대 경로는 Litestream 의 작업 디렉터리 기준이 되고
-    ``..`` 는 문자열로 접힌다. 링크는 그대로 남는다(실측, ``tests/fixtures/litestream-0.5.17/``).
+    ``..`` 는 문자열로 접힌다. 링크는 그대로 남는다(실측, ``tests/fixtures/litestream-<판>/``).
     """
     body = _strip_log_lines(stdout)
     try:

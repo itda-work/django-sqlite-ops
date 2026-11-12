@@ -83,11 +83,16 @@ jobs:
   # 설치하고, REQUIRE_CHANNELS_LITE=1 로 channels-lite 가 없어 skip 되는 경우를 실패로 바꾼다.
   # 설치는 공식 방법(https://litestream.io/install/linux/)인 릴리스 .deb + dpkg 다. apt 는 쓰지 않는다.
   # .deb 는 같은 릴리스의 checksums.txt 와 SHA-256 이 맞아야 설치한다.
+  # 매트릭스는 boot/litestream.py 의 VERIFIED_VERSIONS(= tests/fixtures/litestream-*/)와 같게 둔다.
   litestream:
-    name: test (litestream 0.5.17, py3.14, django 6.1)
+    name: test (litestream ${{ matrix.litestream }}, py3.14, django 6.1)
     runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        litestream: ["0.5.17", "0.5.18"]
     env:
-      LITESTREAM_VERSION: "0.5.17"  # 바꾸면 위 name 도 함께 고친다
+      LITESTREAM_VERSION: ${{ matrix.litestream }}
       REQUIRE_LITESTREAM: "1"
       REQUIRE_CHANNELS_LITE: "1"
     steps:
