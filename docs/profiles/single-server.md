@@ -7,7 +7,7 @@
 | 머신 | 1대 (쓰는 머신은 언제나 1대) |
 | 앱 프로세스 | ASGI 서버 워커 1개 (`uvicorn --workers 1`) |
 | 채널 레이어 | `channels.layers.InMemoryChannelLayer` |
-| 복제 | Litestream 0.5.17, `litestream replicate -exec` 가 앱을 띄운다 |
+| 복제 | Litestream 0.5.18(0.5.17 도 검증한 판이다), `litestream replicate -exec` 가 앱을 띄운다 |
 | 부팅 | `python -m django_sqlite_ops.boot` 가 판정·복원한 뒤 exec |
 | 설정 | `sqlite_database(..., profile="single-server")`, `SQLITE_OPS["PROFILE"] = "single-server"` |
 
@@ -56,7 +56,7 @@ litestream replicate -config /etc/litestream.yml -exec "..."     PID 1, 복제
 | 조각 | 검증 |
 |---|---|
 | `settings.py`, `urls.py` | 그대로 실행하고, `check --deploy` 에서 `sqlite_ops.*` 경고가 없음(`channels` 를 import 하지 못하게 막은 상태에서도) |
-| `litestream.yml` | 실제 litestream 0.5.17 의 `litestream databases -config` 가 읽음 |
+| `litestream.yml` | 실제 litestream(검증한 판 0.5.17·0.5.18, CI 매트릭스)의 `litestream databases -config` 가 읽음 |
 | `entrypoint.sh` | `bash -n`·`sh -n` 문법 검사 |
 | `compose.yaml` | YAML 구문, 그리고 회귀 랩이 그대로 띄운다(이미지 이름·라벨·호스트 포트만 덮음) |
 | Dockerfile, `requirements.txt` | 회귀 랩(`lab/`, #10)이 이 블록을 그대로 꺼내 빌드하고 띄운다. 다른 점은 패키지를 PyPI 대신 작업 트리 wheel 로 넣는 한 줄뿐이다([lab/README.md](../../lab/README.md)) |
@@ -141,7 +141,7 @@ Litestream 은 공식 설치 방법(릴리스 `.deb` + `dpkg`, https://litestrea
 ```dockerfile
 FROM python:3.13-slim
 
-ARG LITESTREAM_VERSION=0.5.17
+ARG LITESTREAM_VERSION=0.5.18
 RUN set -eu; \
     apt-get update; \
     apt-get install -y --no-install-recommends ca-certificates curl; \

@@ -15,6 +15,15 @@ scripts/lab.sh up             # 이미지 빌드 + SeaweedFS·toxiproxy 만 띄�
 scripts/lab.sh down           # 이 랩의 자원만 지우고 남은 것을 보여 준다(비어 있어야 한다)
 ```
 
+### Litestream 판 고르기 (#99)
+
+```bash
+scripts/lab.sh run all                                 # 프로필 문서 Dockerfile 의 ARG 기본값(지금 0.5.18)
+LAB_LITESTREAM_VERSION=0.5.17 scripts/lab.sh run L8c   # 검증한 다른 판으로
+```
+
+`LAB_LITESTREAM_VERSION` 은 문서 Dockerfile 블록을 바꾸지 않고 `docker build --build-arg LITESTREAM_VERSION=...` 로 넘긴다. 이미지 태그는 `dso-lab-app:<git sha>-ls<판>` 이라 판이 다른 캐시 이미지로 돌지 않는다. 시나리오는 이 값을 믿지 않고 이미지 안의 `litestream version` 을 읽어(`lab/conftest.py`, 결과 줄마다 `litestream_version`) 판별 기대값(`_checks.REFUSED_LOOKUP`)을 고른다. 표에 없는 판이면 L4·L8c·L8d 가 실패한다.
+
 ### GitHub 러너(amd64)에서 돌리기
 
 `.github/workflows/lab.yml` 은 `workflow_dispatch` 전용 잡이다(#25). 기본 CI(push/PR)에는 들어가지 않는다.
@@ -84,14 +93,14 @@ P2 는 channels-nats 를 넣은 이미지로 워커 사이 채널 전달을 런�
 | L1 | 볼륨 A 로 200건 → 볼륨 없는 새 컨테이너 | `fresh` → 복원, 200건, 이어 쓴 것도 복제 |
 | L2 | A 50건 → B 가 복원해 150건 → A 로 재부팅 | exit 2 `remote_ahead`, 복제본 TXID·150건 그대로, A 무변경 |
 | L3 | 정상 종료 뒤 로컬 메타 디렉터리만 삭제 | exit 2 `no_local_meta`, DB 무변경 |
-| L4 | toxiproxy `s3` 끔 / 양방향 무응답 + `--ltx-timeout 5`: `timeout` toxic(`timeout` 0)을 `stream` `downstream`·`upstream` 둘 다(L8d 와 같은 방식, 결과에 `hang_streams` 로 남김) | 둘 다 exit 2 `remote_error`, 복구 후 `match` |
+| L4 | toxiproxy `s3` 끔 / 양방향 무응답 + `--ltx-timeout 5`: `timeout` toxic(`timeout` 0)을 `stream` `downstream`·`upstream` 둘 다(L8d 와 같은 방식, 결과에 `hang_streams` 로 남김) | 둘 다 exit 2 `remote_error`, 복구 후 `match`. 사유의 종류는 판별(#99): 끔은 0.5.17 `timed out`·0.5.18 `exited with 1`, 무응답은 두 판 `timed out`. 거부까지의 시간은 기록만 한다(`refused_seconds`·`hang_seconds`) |
 | L5 | S3 를 끊고 25건 → SIGKILL → S3 복구 → 재부팅 | `match`(`local_current`), 65건, 뒤이어 복제본 65건 |
 | L6 | L2 의 옛 볼륨 + `--on-unknown restore`. rename 마다 잠드는 훅(`lab_hooks/sitecustomize.py`)으로 k 번째 rename 직후 SIGKILL, 모든 k 에 대해 → 훅 없이 재실행 | kill 직전 훅 로그의 rename 수가 정확히 k. 재실행 성공·150건, `.partial` 없음. kill 전 템플릿의 DB·`-wal`·`-shm`·메타 하위 전부가 **같은 하나의** 격리 디렉터리에 같은 해시로 있고 그 밖에는 manifest 뿐, 템플릿 파일 내용이 그 밖 어디에도 없음. 설치 뒤 kill(D-14)이면 격리 디렉터리 2개, 두 번째는 manifest·복원본 DB(+사이드카)만 (`_checks.quarantine_problems`) |
 | L7 | 복제본의 모든 LTX 객체 가운데 64바이트를 뒤집음(filer API) | 새 컨테이너 exit 4 / 메타 삭제 볼륨 + `--on-unknown restore` exit 4, 로컬 파일 해시 무변경, 격리 없음 |
 | L8a | 쓰기를 계속하며 `s3` 20초 끔(업로드·헬스 조회 모두) | 경과 시간 기준: 랩의 허용 시간(가정) `REFRESH × 3` + 진행 중 조회 여유(`REFRESH` 로 가정) + 표본 간격 + 1초 안에 `unknown`(`stale`/`remote_error`)로 바뀌고 단절이 끝날 때까지 유지. 전환 전 `caught_up` 은 age ≤ `REFRESH × 3`, `stale` 은 age > 그 값(응답 age 의 반올림 0.0005 허용, `_checks.full_outage_problems`). 복구 뒤 `caught_up`, 쓰기 오류 0 |
 | L8b | 헬스 조회는 `s3h` 로 두고 업로드 경로 `s3` 만 20초 끔 | `backlog`(`local_ahead`) → 복구 뒤 `caught_up` |
-| L8c | 쓰기를 계속하며 `s3` 를 90초 끔(조회 타임아웃 30초의 3배, 연결 거부) | 랩의 허용 시간(가정, `_checks.long_outage_bounds`): 10초 안에 `stale`, 첫 `remote_error` 는 29–36초, 그 뒤 `remote_error`(약 6초)와 `stale`(약 26초)이 32±2초 주기로 번갈아(90초에 2구간 이상) 단절 내내 `unknown`. strict 는 단절 내내 503·복구 뒤 200. 앱 컨테이너의 `litestream ltx`(`lab_tools/procs.py` 로 `/proc` 를 3초마다)는 1개 이하·좀비 없음·한 PID 가 40초 넘게 보이지 않음·복구 뒤 단절 중 PID 없음, 그리고 검출기가 동작한다는 하한(단절 중 `ltx` 를 본 표본 ≥ 3, 서로 다른 PID ≥ 2). 시각 판정의 표본 여유는 실제 최대 헬스 표본 간격이고, 그 간격이 1.5초를 넘으면 '표본이 거칠다'로 판정 실패와 따로 알린다. 쓰기 오류 0, 복구 뒤 120초 안 `caught_up`, 복제본 행 수 = 최종 행 수. Litestream WARN/ERROR 줄 수·대표 줄을 기록 |
-| L8d | 같은 90초를 양방향 무응답으로: `s3` 에 `timeout` toxic(`timeout` 0 = 연결은 받고 데이터를 버림)을 `stream` `downstream`·`upstream` 둘 다(기본값은 `downstream` 뿐이라 하나만 넣으면 요청은 S3 에 닿는다 — toxiproxy 2.12.0 README) | L8c 와 같다 |
+| L8c | 쓰기를 계속하며 `s3` 를 90초 끔(조회 타임아웃 30초의 3배, 연결 거부) | 판별(#99, `_checks.REFUSED_LOOKUP`). 먼저 단절 중 헬스의 조회 실패 줄이 모두 그 판의 종류인지(0.5.17 `timed out`, 0.5.18 `exited with 1`) 본다. 시간은 랩의 허용 시간(가정, `_checks.long_outage_bounds`): 10초 안에 `stale`. **0.5.17**: 첫 `remote_error` 는 29–36초, 그 뒤 `remote_error`(약 6초)와 `stale`(약 26초)이 32±2초 주기로 번갈아(90초에 2구간 이상). **0.5.18**: 조회가 약 7초 뒤 rc 1 로 끝나 첫 `remote_error` 2–21초, 구간 간격 11±8초(4구간 이상, 경계 근거는 `_checks.py`). 두 판 모두 단절 내내 `unknown`. strict 는 단절 내내 503·복구 뒤 200. 앱 컨테이너의 `litestream ltx`(`lab_tools/procs.py` 로 `/proc` 를 3초마다)는 1개 이하·좀비 없음·한 PID 가 40초 넘게 보이지 않음·복구 뒤 단절 중 PID 없음, 그리고 검출기가 동작한다는 하한(단절 중 `ltx` 를 본 표본 ≥ 3, 서로 다른 PID ≥ 2). 시각 판정의 표본 여유는 실제 최대 헬스 표본 간격이고, 그 간격이 1.5초를 넘으면 '표본이 거칠다'로 판정 실패와 따로 알린다. 쓰기 오류 0, 복구 뒤 120초 안 `caught_up`, 복제본 행 수 = 최종 행 수. Litestream WARN/ERROR 줄 수·대표 줄을 기록 |
+| L8d | 같은 90초를 양방향 무응답으로: `s3` 에 `timeout` toxic(`timeout` 0 = 연결은 받고 데이터를 버림)을 `stream` `downstream`·`upstream` 둘 다(기본값은 `downstream` 뿐이라 하나만 넣으면 요청은 S3 에 닿는다 — toxiproxy 2.12.0 README) | 두 판 모두 0.5.17 의 L8c 와 같다(30초 타임아웃, 사유 `timed out`) |
 
 P2 채널 시나리오(`CHANNEL_SPECS`, N=200, 수신 워커 2). 준비 확인: 두 워커가 probe 를 1건 이상 받을 때까지 보낸 뒤 본 메시지를 보낸다. 수신이 멈추면 꼬리 probe 를 한 번 더 보내 다시 기다린다(용량 드롭 합계 "has room again after dropping N" 은 다음 메시지가 들어올 때만 나온다).
 

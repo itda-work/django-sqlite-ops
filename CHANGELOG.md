@@ -6,6 +6,11 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Litestream 0.5.18 을 검증한 판으로 받는다.** boot·`sqlite_doctor` 의 Litestream 설정 대조·헬스·`--restore-test` 가 0.5.17 과 0.5.18 을 받고 그 밖의 판은 계속 거부한다. 0.5.18 실측 fixture(`file://` 복제본의 `ltx`·`databases`·`restore`)의 출력 형식·rc·오류 문구는 0.5.17 과 같았다(시각·크기·압축 묶음만 다름). 배포 프로필 `single-server` 의 Dockerfile 이 0.5.18 을 설치한다 (#99)
+- **S3 가 연결을 거부할 때 0.5.18 은 더 빨리 실패한다.** 0.5.17 의 `ltx` 는 30초 타임아웃까지 매달려 사유가 `timed out` 이었고, 0.5.18 은 약 8초 뒤 `exited with 1: … exceeded maximum number of attempts` 로 끝난다. boot 의 거부(exit 2, `remote_error`)와 헬스의 `unknown` 은 두 판에서 같고, 헬스의 `stale`↔`remote_error` 주기만 짧아진다. 0.5.18 은 이때 Litestream ERROR 로그도 남긴다 (#99)
+
 ## [0.1.0a2] - 2026-10-27
 
 의존성 하한과 문서를 고친 사전 릴리스다. 패키지 코드(`django_sqlite_ops/`)는 0.1.0a1 과 같다. 저장소 안의 회귀 랩·CI 정비(#88·#90·#94)는 sdist 에는 실리지만 설치되는 코드(wheel)에는 영향이 없으므로 여기 적지 않는다.

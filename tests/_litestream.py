@@ -5,9 +5,11 @@ fixture ``litestream_binary`` 는 ``conftest.py`` 에 있다.
 """
 
 import os
+import re
 import shutil
 import socket
 import threading
+from dataclasses import dataclass
 from pathlib import Path
 
 import pytest
@@ -25,6 +27,61 @@ def require_litestream() -> str:
 
 
 needs_litestream = pytest.mark.usefixtures("litestream_binary")
+
+# --- 판별 실측 fixture --------------------------------------------------------------------
+
+FIXTURE_ROOT = Path(__file__).parent / "fixtures"
+# 검증한 판마다 fixture 폴더(tests/fixtures/litestream-<판>/) 하나와 그 판의 기대값 한 줄.
+# boot/litestream.py 의 VERIFIED_VERSIONS 와 같아야 한다(test_boot_litestream 이 본다).
+# 값은 그 판의 make_litestream_fixtures.sh 실행 결과다(만든 방법은 각 폴더 README).
+FIXTURE_EXPECTED: dict[str, dict[str, int]] = {
+    "0.5.17": {"max_txid": 0x19},
+    "0.5.18": {"max_txid": 0x19},
+}
+
+
+def fixture_versions() -> list[str]:
+    """``tests/fixtures/litestream-*/`` 폴더 이름의 판(숫자 순)."""
+    found = [
+        d.name.removeprefix("litestream-") for d in FIXTURE_ROOT.glob("litestream-*") if d.is_dir()
+    ]
+    return sorted(found, key=lambda v: tuple(int(x) for x in re.findall(r"\d+", v)))
+
+
+@dataclass(frozen=True)
+class LitestreamFixtures:
+    """한 판의 실측 fixture 폴더와 그 판의 기대값."""
+
+    version: str
+    max_txid: int
+
+    @property
+    def dir(self) -> Path:
+        return FIXTURE_ROOT / f"litestream-{self.version}"
+
+    def out(self, name: str) -> tuple[str, str, int]:
+        d = self.dir / name
+        return (d / "stdout").read_text(), (d / "stderr").read_text(), int((d / "rc").read_text())
+
+    @property
+    def latest_ltx(self) -> Path:
+        """replicate 종료 뒤 로컬 메타에 남은 최신 L0(이름 ``<max>-<max>.ltx``)."""
+        (path,) = (self.dir / "local_meta_after_replicate" / "meta" / "ltx" / "0").iterdir()
+        return path
+
+    @property
+    def sample_ltx(self) -> Path:
+        """복제본 L1 의 이름순 첫 파일(낮은 TXID 의 실제 LTX)."""
+        (path,) = (self.dir / "ltx_sample").iterdir()
+        return path
+
+    @property
+    def sample_txid(self) -> int:
+        return int(self.sample_ltx.name[17:33], 16)
+
+
+def litestream_fixtures(version: str) -> LitestreamFixtures:
+    return LitestreamFixtures(version, **FIXTURE_EXPECTED[version])
 
 
 def write_config(lab: Path, db: Path, replica_block: str) -> Path:

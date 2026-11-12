@@ -362,6 +362,72 @@ def test_l8_long_wrong_http_or_gap_fails():
     assert any("episode(s)" in p for p in c.long_outage_problems(one, 2, 90))
 
 
+# --- L4·L8c 판별 기대값(#99) ------------------------------------------------------------------
+
+
+def _bounds(c, version):
+    look = c.refused_lookup(version)
+    return look["min"], look["max"]
+
+
+def test_l8c_bounds_per_version():
+    """0.5.17 은 기존 경계 그대로, 0.5.18 은 rc 1 로 빨리 끝나는 조회의 경계."""
+    c = _checks()
+    assert (
+        c.long_outage_bounds(2, *_bounds(c, "0.5.17"))
+        == c.long_outage_bounds(2)
+        == {
+            "stale_by": c.full_outage_deadline(2),
+            "first_error_after": 29.0,
+            "first_error_by": 36.0,
+            "period": 32.0,
+            "period_slack": 2.0,
+        }
+    )
+    assert c.refused_lookup("0.5.17")["kind"] == "timeout"
+    assert c.refused_lookup("0.5.18")["kind"] == "exit1"
+    assert c.BLACKHOLE_LOOKUP["kind"] == "timeout"
+
+
+@pytest.mark.parametrize("version", ["0.5.16", "0.5.19", "0.6.0", None, ""])
+def test_l8c_unknown_version_has_no_expectation(version):
+    assert _checks().refused_lookup(version) is None
+
+
+@pytest.mark.parametrize("lookup", [6.1, 7.2])
+def test_l8c_0518_measured_lookup_passes_only_0518_bounds(lookup):
+    """0.5.18 의 잰 조회 시간(약 6~7초)은 0.5.18 경계에서만 통과한다."""
+    c = _checks()
+    timeline = _long_outage_timeline(last_ok=0.0, timeout=lookup)
+    assert c.long_outage_problems(timeline, 2, 90, *_bounds(c, "0.5.18")) == []
+    assert c.long_outage_problems(timeline, 2, 90, *_bounds(c, "0.5.17")) != []
+
+
+def test_l8c_0517_timeout_fails_0518_bounds():
+    """반대로 0.5.17 의 30초 매달림은 0.5.18 경계에서 실패한다."""
+    c = _checks()
+    timeline = _long_outage_timeline(last_ok=0.0)
+    assert c.long_outage_problems(timeline, 2, 90, *_bounds(c, "0.5.17")) == []
+    problems = c.long_outage_problems(timeline, 2, 90, *_bounds(c, "0.5.18"))
+    assert any("first remote_error" in p for p in problems), problems
+
+
+def test_lookup_failure_kind():
+    c = _checks()
+    timeout = "health 'default': remote lookup failed: litestream ltx timed out after 30s"
+    exit1 = (
+        "health 'default': remote lookup failed: litestream ltx exited with 1: Error: operation "
+        "error S3: ListObjectsV2, exceeded maximum number of attempts, 8"
+    )
+    assert c.lookup_failure_kind(timeout) == "timeout"
+    assert c.lookup_failure_kind(exit1) == "exit1"
+    assert c.lookup_failure_kind("something else") is None
+    assert c.lookup_kind_problems([exit1, exit1], "exit1") == []
+    assert c.lookup_kind_problems([exit1, timeout], "exit1") != []
+    assert c.lookup_kind_problems([timeout], "exit1") != []
+    assert c.lookup_kind_problems([], "timeout") != []
+
+
 def test_l8_ltx_process_checks():
     c = _checks()
     outage = [(t, [(100, "S")]) for t in range(0, 31, 3)] + [(33, []), (36, [(200, "S")])]

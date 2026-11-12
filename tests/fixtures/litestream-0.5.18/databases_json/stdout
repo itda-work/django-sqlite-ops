@@ -1,0 +1,22 @@
+[
+  {
+    "path": "$LAB/app.db",
+    "replica": "file"
+  },
+  {
+    "path": "$LAB/link/linked.db",
+    "replica": "file"
+  },
+  {
+    "path": "$LAB/dotdot.db",
+    "replica": "file"
+  },
+  {
+    "path": "$LAB/cwd/relative.db",
+    "replica": "file"
+  },
+  {
+    "path": "$LAB/cwd",
+    "replica": "file"
+  }
+]

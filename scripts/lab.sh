@@ -22,7 +22,16 @@ case "$PROJECT" in
   *) echo "LAB_PROJECT must be dso-lab or dso-lab-<suffix>: $PROJECT" >&2; exit 64 ;;
 esac
 export LAB_PROJECT="$PROJECT"
-export LAB_TAG="${LAB_TAG:-$(git rev-parse --short HEAD)}"
+# Litestream 판(#99): 없으면 프로필 문서 Dockerfile 의 ARG 기본값. 문서 블록은 그대로 두고 build arg 로
+# 넘긴다. 판이 다른 이미지가 같은 태그를 쓰지 않도록 태그에 판을 넣는다. 시나리오는 이 값이 아니라
+# 이미지 안의 `litestream version` 으로 기대값을 고른다(lab/conftest.py).
+doc_ls_version="$(sed -n 's/^ARG LITESTREAM_VERSION=//p' docs/profiles/single-server.md)"
+LS_VERSION="${LAB_LITESTREAM_VERSION:-$doc_ls_version}"
+if [[ ! "$LS_VERSION" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+  echo "LAB_LITESTREAM_VERSION must look like 0.5.18 (doc default: '$doc_ls_version'): $LS_VERSION" >&2
+  exit 64
+fi
+export LAB_TAG="${LAB_TAG:-$(git rev-parse --short HEAD)}-ls$LS_VERSION"
 BUILD=lab/.build
 OUT="${LAB_OUT:-lab/.out}"
 
@@ -54,7 +63,8 @@ build() {
   uv run --no-project python lab/build_context.py "$wheel" >/dev/null
   # uv build 가 .gitignore 도 남긴다. mktemp 로 만든 디렉터리 하나만 지운다.
   rm -rf -- "${dist:?}"
-  docker build --label io.itda.dso-lab=1 -t "dso-lab-app:$LAB_TAG" "$BUILD"
+  docker build --label io.itda.dso-lab=1 --build-arg "LITESTREAM_VERSION=$LS_VERSION" \
+    -t "dso-lab-app:$LAB_TAG" "$BUILD"
   # P2(#66): 위 이미지에 channels-nats([nats] extra)를 더한 이미지
   docker build --label io.itda.dso-lab=1 --build-arg "BASE=dso-lab-app:$LAB_TAG" \
     -f "$BUILD/nats.Dockerfile" -t "dso-lab-app-nats:$LAB_TAG" "$BUILD"

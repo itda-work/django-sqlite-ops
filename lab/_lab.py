@@ -312,6 +312,24 @@ class Stack:
         )
         return json.loads(res.out.strip().splitlines()[-1])
 
+    def litestream_version(self) -> str:
+        """이미지 안의 실제 ``litestream version``(#99). 판별 기대값은 이 값으로 고른다."""
+        res = self.compose(
+            "run",
+            "--rm",
+            "--no-deps",
+            "-T",
+            "--entrypoint",
+            "litestream",
+            "tool",
+            "version",
+            timeout=120,
+        )
+        lines = res.out.strip().splitlines()
+        if not lines or not re.fullmatch(r"v?\d+\.\d+\.\d+", lines[-1].strip()):
+            raise RuntimeError(f"cannot read litestream version from the image: {res.text[-300:]}")
+        return lines[-1].strip().removeprefix("v")
+
     def s3_objects(self, prefix: str, *args: str) -> Result:
         return self.compose(
             "run",

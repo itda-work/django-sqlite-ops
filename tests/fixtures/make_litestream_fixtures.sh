@@ -1,21 +1,43 @@
 #!/usr/bin/env bash
-# litestream 0.5.17 실측 fixture 를 다시 만든다. 사용법은 같은 폴더의 README.md.
-#   make_fixtures.sh <새 랩 디렉터리(없어야 함)>
+# Litestream 실측 fixture 를 판별 폴더(tests/fixtures/litestream-<판>/)에 만든다.
+# 사용법은 각 판 폴더의 README.md.
+#   make_litestream_fixtures.sh <판> <새 랩 디렉터리(없어야 함)>
+# 바이너리(LITESTREAM, 기본 PATH 의 litestream)의 `version` 이 <판> 과 다르면 거부한다.
+# 대상 폴더가 이미 있으면 거부한다(검증한 판의 fixture 를 덮어쓰지 않는다).
 # 랩 디렉터리의 절대 경로는 fixture 에서 '$LAB' 으로 바꿔 저장한다.
 set -euo pipefail
 
-if [ $# -ne 1 ]; then
-  echo "usage: $0 NEW_LAB_DIR" >&2
+if [ $# -ne 2 ]; then
+  echo "usage: $0 VERSION NEW_LAB_DIR" >&2
   exit 64
 fi
-if [ -e "$1" ]; then
-  echo "refusing: $1 already exists (use a new directory)" >&2
-  exit 64
-fi
-mkdir -p "$1"
-LAB=$(cd "$1" && pwd -P)
-OUT=$(cd "$(dirname "$0")" && pwd -P)
+WANT=$1
+case "$WANT" in
+  *[!0-9.]* | "" | .* | *. | *..*)
+    echo "refusing: version must look like 0.5.18, got: $WANT" >&2
+    exit 64
+    ;;
+esac
 LS=${LITESTREAM:-litestream}
+GOT=$("$LS" version | tr -d '[:space:]')
+GOT=${GOT#v}
+if [ "$GOT" != "$WANT" ]; then
+  echo "refusing: $LS version is $GOT, not $WANT" >&2
+  exit 64
+fi
+FIXTURES=$(cd "$(dirname "$0")" && pwd -P)
+OUT="$FIXTURES/litestream-$WANT"
+if [ -e "$OUT" ]; then
+  echo "refusing: $OUT already exists (fixtures of a verified version are not regenerated)" >&2
+  exit 64
+fi
+if [ -e "$2" ]; then
+  echo "refusing: $2 already exists (use a new directory)" >&2
+  exit 64
+fi
+mkdir -p "$2"
+LAB=$(cd "$2" && pwd -P)
+mkdir "$OUT"
 
 # 한 명령의 stdout·stderr·rc 를 OUT/<name>/ 에 저장한다. 랩 경로는 $LAB 로 치환한다.
 capture() {
@@ -114,12 +136,10 @@ capture ltx_l0_default "$LS" ltx -config ls.yml -json "$LAB/app.db"
 capture ltx_all_levels_text "$LS" ltx -config ls.yml -level all "$LAB/app.db"
 # 로컬 메타 디렉터리(.app.db-litestream) 를 그대로 복사한다. 업로드·정리·종료 뒤의 상태다.
 META_OUT="$OUT/local_meta_after_replicate"
-rm -rf -- "$META_OUT"
 mkdir -p "$META_OUT"
 cp -R "$LAB/.app.db-litestream" "$META_OUT/meta"
 # 낮은 TXID 의 실제 LTX 파일 하나(복제본 L1 의 첫 파일). 로컬 메타 검증 테스트가 쓴다.
 SAMPLE_OUT="$OUT/ltx_sample"
-rm -rf -- "$SAMPLE_OUT"
 mkdir -p "$SAMPLE_OUT"
 first_l1=$(cd "$LAB/replica/ltx/1" && ls | sort | head -n 1)
 cp "$LAB/replica/ltx/1/$first_l1" "$SAMPLE_OUT/$first_l1"

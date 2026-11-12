@@ -120,7 +120,7 @@ class Fake:
             "#!/bin/sh\n"
             f'printf "%s\\n" "$*" >> "{d}/argv.log"\n'
             'case "$1" in\n'
-            "  version) echo 0.5.17; exit 0 ;;\n"
+            f'  version) cat "{d}/version"; exit 0 ;;\n'
             f'  ltx) cat "{d}/ltx.out"; exit "$(cat "{d}/ltx.rc")" ;;\n'
             "  restore)\n"
             '    out=""; prev=""\n'
@@ -133,8 +133,16 @@ class Fake:
             "exit 9\n"
         )
         self.binary.chmod(self.binary.stat().st_mode | stat.S_IXUSR)
+        self.set_version("0.5.17")
         self.remote_txid(5)
         make_db(d / "restore.db", 7)
+
+    def set_version(self, version: str) -> None:
+        (self.dir / "version").write_text(version + "\n")
+
+    def remote_ltx_output(self, stdout: str) -> None:
+        (self.dir / "ltx.out").write_text(stdout)
+        (self.dir / "ltx.rc").write_text("0")
 
     def remote_txid(self, txid: int | None) -> None:
         items = (
@@ -157,6 +165,8 @@ class Fake:
         return [ln.split()[0] for ln in path.read_text().splitlines()] if path.exists() else []
 
 
+# 판정 동작 테스트의 시드(0.5.17 실측 LTX). 판마다의 실측 출력·메타는
+# test_match_with_each_verified_version 이 본다(fixture lsfx).
 LATEST_LTX = next(
     (
         Path(__file__).parent
@@ -1723,6 +1733,34 @@ def test_match_proceeds_without_changes(lab, fake, no_exec):
     assert state(lab)["state"] == "match"
 
 
+def test_match_with_each_verified_version(lab, fake, no_exec, lsfx):
+    """검증한 판마다: 그 판의 ``ltx -level all -json`` 실측 출력과 실측 로컬 메타가 같으면 match."""
+    fake.set_version(lsfx.version)
+    fake.remote_ltx_output(lsfx.out("ltx_all_levels")[0])
+    db = lab / "app.db"
+    make_db(db, 4)
+    l0 = ls.default_meta_path(db) / "ltx" / "0"
+    l0.mkdir(parents=True)
+    shutil.copy(lsfx.latest_ltx, l0 / lsfx.latest_ltx.name)
+    assert ls.local_max_txid(db) == lsfx.max_txid
+    assert main_inproc(boot_args(lab, fake), no_exec) == "exec"
+    s = state(lab)
+    assert (s["state"], s["litestream_version"]) == ("match", lsfx.version)
+
+
+@pytest.mark.parametrize("version", ["0.5.16", "0.5.19", "0.6.0"])
+def test_unverified_version_refuses(lab, fake, no_exec, capsys, version):
+    fake.set_version(version)
+    fake.remote_txid(0x19)
+    make_db(lab / "app.db", 1)
+    write_meta(lab / "app.db")
+    assert main_inproc(boot_args(lab, fake, "--on-unknown", "restore"), no_exec) == 2
+    err = capsys.readouterr().err
+    assert "reason_code=remote_error" in err
+    assert f"unsupported litestream version {version}; verified: 0.5.17, 0.5.18" in err
+    assert fake.calls() == ["version"]
+
+
 def test_remote_error_refuses_even_with_restore_policy(lab, fake, no_exec, capsys):
     fake.remote_error()
     make_db(lab / "app.db", 1)
@@ -2213,7 +2251,10 @@ def test_l1_fresh_container_restores(real):
     assert read_marker(data)["lock_held"] is True
     assert count_rows(db) == 20
     s = state(data)
-    assert (s["state"], s["action"], s["litestream_version"]) == ("fresh", "restore", "0.5.17")
+    # 상태 파일에는 실제로 돈 바이너리의 판이 남는다(CI 매트릭스의 검증한 판마다).
+    real_version = ls.version(binary=LITESTREAM)
+    assert real_version in ls.VERIFIED_VERSIONS
+    assert (s["state"], s["action"], s["litestream_version"]) == ("fresh", "restore", real_version)
 
 
 def test_l2_old_volume_refuses_and_replica_untouched(real):
