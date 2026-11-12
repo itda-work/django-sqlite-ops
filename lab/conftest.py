@@ -31,7 +31,7 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "walcp: 앱 wal_autocheckpoint 와 Litestream 측정(scripts/lab.sh walcp, #106)"
     )
-    config.addinivalue_line("markers", "profile:배포 프로필 문서 compose 종단 검증")
+    config.addinivalue_line("markers", "profile: 배포 프로필 문서 compose 종단 검증")
 
 
 @pytest.fixture(scope="session")
