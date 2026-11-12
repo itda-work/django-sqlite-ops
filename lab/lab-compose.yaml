@@ -80,6 +80,18 @@ services:
       - -c
       - python manage.py migrate --noinput && exec uvicorn proj.asgi:application --host 0.0.0.0 --port 8000 --workers ${LAB_WORKERS:-1}
 
+  # #106 감독 변형: boot 는 프로필과 같고, 그 뒤를 `replicate -exec` 대신 lab_tools/walcp_sup.py 가
+  # 맡아 uvicorn 과 litestream replicate 를 따로 띄운다. Litestream 만 멈췄다 다시 띄울 때(앱은 계속
+  # 쓴다) 쓴다. 프로필에서는 Litestream 이 PID 1 이라 이 상태를 만들 수 없다.
+  labapp-sup:
+    <<: *app
+    ports: ["127.0.0.1::8000"]
+    volumes: ["${LAB_VOLUME:-v01}:/data"]
+    entrypoint:
+      - sh
+      - -c
+      - exec python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream.yml $${BOOT_FLAGS:-} -- python /app/lab_tools/walcp_sup.py
+
   # 볼륨 없는 앱(무상태 교체, L1).
   labapp-nv:
     <<: *app

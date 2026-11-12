@@ -306,9 +306,16 @@ class Stack:
         )
         return json.loads(res.out.strip().splitlines()[-1])
 
-    def replica(self, prefix: str) -> dict:
+    def replica(self, prefix: str, *args: str, timeout: float = 300) -> dict:
         res = self.compose(
-            "run", "--rm", "--no-deps", "-T", "tool", env={"LAB_PREFIX": prefix}, timeout=300
+            "run",
+            "--rm",
+            "--no-deps",
+            "-T",
+            "tool",
+            *args,
+            env={"LAB_PREFIX": prefix},
+            timeout=timeout,
         )
         return json.loads(res.out.strip().splitlines()[-1])
 

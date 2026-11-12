@@ -16,14 +16,27 @@ _BODY = "x" * 200
 
 @csrf_exempt
 def write(request):
-    """POST: 행 ``n`` 개(기본 1)를 한 트랜잭션으로 쓴다."""
+    """POST: 행 ``n`` 개(기본 1)를 한 트랜잭션으로 쓴다.
+
+    ``size`` 는 본문 길이(기본 200). #106 은 WAL 을 빨리 지나가게 하려고 큰 행을 쓴다. 응답의
+    ``first_id``·``last_id`` 는 커밋된 행의 id 범위다(문장 하나로 넣으므로 이어진다 — #106 이
+    복제본과 대조할 때 쓴다).
+    """
     if request.method != "POST":
         return JsonResponse({"error": "POST only"}, status=405)
     n = int(request.GET.get("n", "1"))
+    body = _BODY if "size" not in request.GET else "x" * int(request.GET["size"])
     notes = Note.objects.bulk_create(
-        [Note(body=_BODY, score=random.randrange(1_000_000)) for _ in range(n)]
+        [Note(body=body, score=random.randrange(1_000_000)) for _ in range(n)]
     )
-    return JsonResponse({"written": len(notes), "last_id": notes[-1].pk if notes else None})
+    ids = [note.pk for note in notes]
+    return JsonResponse(
+        {
+            "written": len(notes),
+            "first_id": min(ids) if ids else None,
+            "last_id": max(ids) if ids else None,
+        }
+    )
 
 
 @csrf_exempt
@@ -86,6 +99,7 @@ def stats(request):
             "mmap_size",
             "cache_size",
             "journal_size_limit",
+            "wal_autocheckpoint",
         ):
             cursor.execute(f"PRAGMA {p}")
             pragmas[p] = cursor.fetchone()[0]

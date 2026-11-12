@@ -2,6 +2,8 @@
 
     python s3_objects.py <prefix> list
     python s3_objects.py <prefix> corrupt      # 모든 .ltx 객체의 본문 가운데 바이트를 뒤집는다
+    python s3_objects.py <prefix> levels       # 레벨별 LTX 객체 수·바이트(#106)
+    python s3_objects.py <prefix> corrupt-path <filer 경로>   # 객체 하나만 손상(#106)
 
 S3 버킷 ``dso-lab`` 은 filer 의 ``/buckets/dso-lab/`` 이다. 헤더(앞 100바이트)는 건드리지 않고
 페이지 영역을 바꾼다. 결과는 JSON 한 줄.
@@ -55,6 +57,26 @@ def main() -> None:
     elif action == "corrupt":
         results = [corrupt(o["path"]) for o in objects if o["path"].endswith(".ltx")]
         print(json.dumps({"corrupted": results}))
+    elif action == "levels":
+        # #106 Q4: 레벨별 LTX 객체 수·바이트, 레벨마다 가장 앞·뒤 이름. 경로는
+        # <prefix>/<레벨 4자리>/<min>-<max>.ltx 다(0.5.18 에서 확인, 0000 = L0, 0009 = 스냅샷).
+        levels: dict = {}
+        for o in objects:
+            parts = o["path"].split("/")
+            if not o["path"].endswith(".ltx") or len(parts) < 2 or not parts[-2].isdigit():
+                continue
+            level = str(int(parts[-2]))
+            d = levels.setdefault(level, {"count": 0, "bytes": 0, "names": []})
+            d["count"] += 1
+            d["bytes"] += o["size"]
+            d["names"].append(parts[-1])
+        for d in levels.values():
+            names = sorted(d.pop("names"))
+            d["first"], d["last"] = names[0], names[-1]
+        print(json.dumps({"levels": levels}))
+    elif action == "corrupt-path":
+        # #106 Q4: 객체 하나만 손상시킨다(경로는 levels/list 가 낸 이름으로 고른다)
+        print(json.dumps({"corrupted": [corrupt(sys.argv[3])]}))
     else:
         raise SystemExit(f"unknown action {action}")
 

@@ -28,7 +28,10 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "dbconfig: Django 기본 대 권장 설정 비교(scripts/lab.sh dbconfig, #83)"
     )
-    config.addinivalue_line("markers", "profile: 배포 프로필 문서 compose 종단 검증")
+    config.addinivalue_line(
+        "markers", "walcp: 앱 wal_autocheckpoint 와 Litestream 측정(scripts/lab.sh walcp, #106)"
+    )
+    config.addinivalue_line("markers", "profile:배포 프로필 문서 compose 종단 검증")
 
 
 @pytest.fixture(scope="session")
