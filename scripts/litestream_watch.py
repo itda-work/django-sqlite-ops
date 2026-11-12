@@ -5,6 +5,8 @@
     python3 scripts/litestream_watch.py --dry-run                   # 실제 최신 판, 이슈 없음
     python3 scripts/litestream_watch.py --dry-run --latest v0.5.19  # 주어진 판으로 흐름만
 
+`--latest` 는 `--dry-run` 과 함께만 받는다(시험용 판으로 실제 이슈를 만들지 않는다).
+
 - 검증한 판은 `django_sqlite_ops.boot.litestream.VERIFIED_VERSIONS` 를 그대로 읽는다(boot 는
   Django 를 import 하지 않으므로 의존성 없이 돈다). 이 파일에 판 번호를 적지 않는다.
 - 최신 판은 `GET /repos/benbjohnson/litestream/releases/latest` 의 `tag_name` 이다(정식 릴리스만).
@@ -239,9 +241,14 @@ def main(argv: list[str] | None = None) -> int:
         "--dry-run", action="store_true", help="이슈를 만들지 않고 할 일만 출력한다"
     )
     parser.add_argument(
-        "--latest", metavar="TAG", help="API 대신 이 태그를 최신 판으로 쓴다(시험용)"
+        "--latest",
+        metavar="TAG",
+        help="API 대신 이 태그를 최신 판으로 쓴다(시험용, --dry-run 과 함께만)",
     )
     args = parser.parse_args(argv)
+    # 시험용 판으로 공개 저장소에 실제 이슈를 만들지 않게, 아무것도 부르기 전에 거부한다
+    if args.latest is not None and not args.dry_run:
+        parser.error("--latest is for testing and requires --dry-run")
     latest = (lambda: args.latest) if args.latest is not None else gh_latest_tag
     return run(
         verified=load_verified(),

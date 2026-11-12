@@ -288,3 +288,17 @@ def test_cli_latest_override_rejects_bad_value():
     )
     assert proc.returncode == 1
     assert repr("v1.0.0-rc1") in proc.stderr
+
+
+def test_cli_latest_without_dry_run_is_rejected(monkeypatch, capsys):
+    # --latest 는 시험용이다. --dry-run 없이 주면 가짜 판으로 실제 이슈를 만들 수 있으므로 거부한다
+    called = []
+    monkeypatch.setattr(watch, "gh_latest_tag", lambda: called.append("latest") or "v0.5.18")
+    monkeypatch.setattr(watch, "gh_search_issues", lambda t: called.append("search") or [])
+    monkeypatch.setattr(watch, "gh_create_issue", lambda t, b: called.append("create") or "url")
+    monkeypatch.setattr(watch, "load_verified", lambda: called.append("verified") or VERIFIED)
+    with pytest.raises(SystemExit) as exc:
+        watch.main(["--latest", "v9.9.9"])
+    assert exc.value.code == 2
+    assert called == []
+    assert "--dry-run" in capsys.readouterr().err
