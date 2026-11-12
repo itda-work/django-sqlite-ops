@@ -971,7 +971,7 @@ SQLite 공식 문서([wal.html §11](https://sqlite.org/wal.html#the_wal_reset_b
 | 증상 | 원인 | 대처 | 근거 |
 |---|---|---|---|
 | 첫 배포에서 exit 2, `no_replica_no_local` | Litestream 은 복제본 경로·prefix 오타와 "복제본 없음"을 똑같이 rc 0·`[]` 로 돌려준다 | 경로를 확인하고 `--init-new` 를 한 번만([생애 첫 배포](#생애-첫-배포---init-new-를-한-번-쓰고-끈다)) | 재현함(Litestream 0.5.17, #3) |
-| exit 2, `remote_error` 이고 사유에 `timed out` (평문 HTTP S3 호환 서버) | `endpoint` 에 스킴이 없으면 Litestream 이 HTTPS 로 접속해 끝없이 기다리고, boot 가 `--ltx-timeout`(기본 30초)에서 끊는다 | `endpoint: http://…` 로 스킴을 붙인다 | 재현함(평범한 HTTP 서버로) |
+| exit 2, `remote_error` (평문 HTTP S3 호환 서버). 0.5.17 은 30초 뒤 사유 `timed out`, 0.5.18 은 약 7초 뒤 사유 `exited with 1: … exceeded maximum number of attempts, 8, … Get "https://…` | `endpoint` 에 스킴이 없으면 Litestream 이 HTTPS 로 접속한다. 0.5.17 은 끝없이 기다려 boot 가 `--ltx-timeout`(기본 30초)에서 끊고, 0.5.18 은 재시도를 다 쓰고 스스로 실패한다(Litestream 원문 끝은 `http: server gave HTTP response to HTTPS client` 지만 boot 사유는 300자에서 잘린다). 사유의 URL 이 `https://` 로 시작하면 이 경우다 | `endpoint: http://…` 로 스킴을 붙인다 | 재현함(평범한 HTTP 서버로, 두 판, [#105](docs/research/lab-2026-11-12-litestream-pitfalls-0.5.18.md#1-endpoint-에-스킴이-없을-때)) |
 | S3 가 내려가 연결을 거부해 exit 2, `remote_error`. 0.5.17 은 30초 걸리고 사유 `timed out`, 0.5.18 은 약 8초에 사유 `exited with 1: … exceeded maximum number of attempts` | Litestream 0.5.17 의 `ltx` 는 연결 거부에도 곧바로 실패하지 않고 재시도하며 기다린다. 0.5.18 은 S3 재시도를 다 쓰면 스스로 실패한다 | S3 를 복구한 뒤 다시 띄운다. 0.5.17 에서 더 빨리 거부하려면 `--ltx-timeout` 을 줄인다 | 재현함(회귀 랩 L4: toxiproxy 로 끊음 → 0.5.17 30.5초, 0.5.18 7.7초, [#99](docs/research/lab-2026-11-12-litestream-0.5.18.md)) |
 | exit 2, `remote_error` 이고 사유에 `unsupported litestream version` | 설치된 Litestream 이 검증한 판이 아니다. boot 는 출력 형식을 재지 않은 판으로 판정하지 않는다. `hint:` 줄에 설치된 판과 검증한 판 목록이 나온다 | 검증한 판을 설치하거나 `--litestream` 으로 그 바이너리를 가리킨다. 새 판을 받으려면 이 패키지의 새 릴리스를 기다린다([지원 범위](docs/DESIGN.md#5-django-쪽-구성)) | 재현함(`version` 에 다른 판을 답하는 대역, #100) |
 | exit 2, `remote_error` 이고 사유에 `cannot run`(`No such file or directory`·`Permission denied`) 또는 `litestream version exited with` | `--litestream`(기본 `litestream`, `PATH` 에서 찾는다)을 실행할 수 없다. `hint:` 줄에 그 경로가 나온다 | Litestream 을 설치하거나(<https://litestream.io/install/>) `--litestream` 에 실행 가능한 절대 경로를 준다 | 재현함(없는 경로, #100) |
@@ -982,14 +982,14 @@ SQLite 공식 문서([wal.html §11](https://sqlite.org/wal.html#the_wal_reset_b
 | exit 2, `--meta-path ... is not a directory`·`broken symbolic link` | 메타 경로에 정규 파일·FIFO·끊어진 링크가 있다 | 메타 경로를 확인해 디렉터리로 두거나 경로를 고친다. boot 는 그 파일을 격리하지 않는다 | 코드상 확인(#39 테스트) |
 | exit 5 | 같은 볼륨에서 boot 나 그것이 exec 한 앱이 이미 돈다(잠금은 exec 된 명령에 상속) | 앞선 컨테이너를 멈춘다. `<db>.boot.lock` 은 지우지 않는다([함정](#boot-cli)) | 코드상 확인 |
 | 옛 볼륨으로 다시 띄우자 exit 2, `remote_ahead` | 복제본이 이 볼륨보다 새롭다. 보호가 없으면 최신본이 옛 볼륨으로 덮인다 | 복제본이 정본이면 `--on-unknown restore` 로 한 번([사유 코드별 대처](#거부됐을-때-exit-2-사유-코드별-대처)) | 실측(docker D4: 150건이 55건으로 덮임), 재현함(회귀 랩 L2: boot 가 exit 2 로 막고 복제본 무변경) |
-| 복원 직후 컨테이너가 죽은 뒤 exit 2, `no_local_meta` | 복원한 DB 옆에는 Litestream 메타가 없고 `replicate` 가 첫 변경을 기록해야 생긴다 | `--on-unknown restore` 로 한 번([복원 직후 크래시 복구](#복원-직후-크래시-복구)) | 실측(restore 결과에 메타 없음), [D-14](docs/DECISIONS.md) |
-| 직접 만든 entrypoint 의 `litestream restore -if-db-not-exists` 가 복원을 건너뛴다 | 0바이트 DB 파일이 있으면 rc 0 으로 건너뛴다 | boot 를 쓴다. `manage.py` 를 boot 앞에서 부르지 않는다([boot CLI](#boot-cli)) | 재현함([DESIGN §4-1](docs/DESIGN.md#4-1-왜-django-관리-명령이-아닌가)) |
+| 복원 직후 컨테이너가 죽은 뒤 exit 2, `no_local_meta` | 복원한 DB 옆에는 Litestream 메타가 없고 `replicate` 가 첫 변경을 기록해야 생긴다 | `--on-unknown restore` 로 한 번([복원 직후 크래시 복구](#복원-직후-크래시-복구)) | 실측(restore 결과에 메타 없음. 0.5.17·0.5.18, #105), [D-14](docs/DECISIONS.md) |
+| 직접 만든 entrypoint 의 `litestream restore -if-db-not-exists` 가 복원을 건너뛴다 | 0바이트 DB 파일이 있으면 rc 0 으로 건너뛴다(`database already exists, skipping`) | boot 를 쓴다. `manage.py` 를 boot 앞에서 부르지 않는다([boot CLI](#boot-cli)) | 재현함([DESIGN §4-1](docs/DESIGN.md#4-1-왜-django-관리-명령이-아닌가). 0.5.17·0.5.18, #105) |
 
 ### 복제·헬스
 
 | 증상 | 원인 | 대처 | 근거 |
 |---|---|---|---|
-| S3 가 끊겼는데 Litestream 로그·`status`·메트릭이 조용하다 | Litestream 은 업로드 실패를 드러내지 않는다 | 헬스 본문 `status` 로 알람을 건다([복제 헬스](#복제-헬스)) | 실측([docker D3](docs/research/litestream-django-docker.md#d3-관측-조용한-실패-위험)) |
+| S3 가 끊겼는데 Litestream 로그·`status`·메트릭이 조용하다 | Litestream 은 업로드 실패를 드러내지 않는다. `litestream status` 는 로컬만 보아 두 판 모두 rc 0·`ok` 이고, 메트릭의 `litestream_sync_error_count` 도 0 그대로다(`sync` 는 로컬 단계). 로그는 0.5.18 이 연결 거부에만 ERROR 줄을 남기고 무응답에는 두 판 모두 0줄이다 | 헬스 본문 `status` 로 알람을 건다([복제 헬스](#복제-헬스)) | 실측([docker D3](docs/research/litestream-django-docker.md#d3-관측-조용한-실패-위험)), 재현함(0.5.17·0.5.18 의 `status`·메트릭, [#105](docs/research/lab-2026-11-12-litestream-pitfalls-0.5.18.md#9-s3-단절-중-litestream-status-와-메트릭)) |
 | S3 가 통째로 끊긴 동안 헬스가 `backlog` 가 아니라 `unknown`(`stale` 또는 `remote_error`) | 헬스의 원격 조회도 같은 S3 로 간다. 조회가 끝나지 않는 동안(무응답이면 30초 타임아웃까지, 연결 거부는 0.5.17 30초·0.5.18 약 7초) 결과가 `REFRESH × 3` 보다 오래되어 `stale`, 끝나면 `remote_error` 다. 업로드만 끊기고 조회가 되면 `backlog`(`local_ahead`)다 | 둘 다 알람 대상으로 둔다(`caught_up` 이 아니면 경보) | 재현함(회귀 랩 L8a·L8b) |
 | 배포 직후 헬스가 `unknown`(`not_checked`) | 갱신 스레드는 첫 헬스 요청 때 시작한다 | `REFRESH`(기본 15초) 뒤 다시 본다 | 코드상 확인(`health.py`) |
 | 헬스가 `backlog` 인데 HTTP 200 이다 | 설계상 항상 200 이다. 복제 지연으로 로드밸런서가 앱을 빼면 안 된다 | 본문 `status` 로 알람. HTTP 코드만 보는 모니터는 `?strict=1`(로드밸런서에는 쓰지 않는다) | 코드상 확인(`health.py`) |
