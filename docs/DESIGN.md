@@ -19,7 +19,7 @@ Django 프로젝트가 **SQLite 를 운영 DB 로 안전하게 쓰게 하는 운
   - S3 가 20초 끊긴 동안 WARN/ERROR 로그가 0줄이었다. `litestream status` 는 rc 0 을 돌려준다.
   - 두 머신이 동시에 replicate 하면 나중에 쓴 쪽이 경고 없이 이긴다.
   - VFS 읽기 복제본은 `CONN_MAX_AGE=0` 이면 요청마다 1,008ms 가 걸리고, `None` 이면 1.7ms 다(WSGI 기준).
-  - Linux 에서 VFS 확장을 로드하면 그 뒤의 일반 `connect` 가 `automatic extension loading failed` 로 실패한다.
+  - Linux 에서 VFS 확장(litestream-vfs 0.5.17)을 로드하면 그 뒤의 일반 `connect` 가 `automatic extension loading failed` 로 실패한다. 0.5.18 에서는 실패하지 않는다(상류 #1506, 2026-11-12 재현함 — [#105 기록](research/lab-2026-11-12-litestream-pitfalls-0.5.18.md#8-litestream-vfs-확장-로드-linux)).
 
 ## 3. 범위
 
@@ -209,7 +209,7 @@ django_sqlite_ops/
 ├── compat/
 │   ├── channels_lite.py  선택적 몽키패치 (§9)
 │   └── _channels_lite_aio.py  교체 메서드 (§9)
-└── vfs.py           (2단계) 확장 로드 우회 — 옵션
+└── vfs.py           (2단계) 확장 로드 우회 — 옵션(litestream-vfs 0.5.17 에만 필요, #105)
 ```
 - 의존성: Django ≥ 5.2(LTS)만 필수다. extra 로 `[nats]` → channels-nats, `[channels-lite]` → channels-lite 를 둔다.
 - 지원 범위(CI `.github/workflows/ci.yml` 이 정본): Python 3.13·3.14·3.15, Django 5.2 / 6.1(Python 3.15 는 Django 6.1 과만 — Django 5.2 는 3.14 까지, 3.15 는 Django 6.1.3 부터 지원. 2026-11-12 확인 #101), SQLite 3.37+ (Django 하한. 3.51.2 이하는 [WAL-reset 버그](https://sqlite.org/wal.html#the_wal_reset_bug)의 영향 범위지만 하한은 올리지 않고 `sqlite_doctor` 가 보고만 한다 — §6-2, #103). classifier(`pyproject.toml`)의 Python·Django 판 집합과 CI `test` 매트릭스가 같은지 테스트(`tests/test_support_matrix.py`)가 본다. Litestream 은 검증한 판 0.5.17·0.5.18 만 받는다(`VERIFIED_VERSIONS`, 2026-11-12 확인 #99). 판마다 실측 fixture(`tests/fixtures/litestream-<판>/`)와 CI `litestream` 잡의 매트릭스 칸(Python 3.14·3.15 두 칸)이 있고, 게이트·fixture 폴더·매트릭스가 같은 집합인지 테스트가 본다. 범위(`>=`)로 열지 않는다 — 재지 않은 판은 판정할 수 없다. 새 정식 릴리스는 주간 워크플로(`.github/workflows/litestream-watch.yml`)가 감지해, 게이트에 없으면 이 저장소에 이슈를 연다(2026-11-12 추가 #104). 플랫폼은 POSIX(Linux·macOS)다. 매트릭스는 Linux 이고, macOS 는 `macos` 잡(`macos-latest`, Python 3.14, Django 6.1) 하나가 전체 테스트를 돈다. 이 잡은 `REQUIRE_CASE_INSENSITIVE_FS=1` 이라 대소문자 무시 볼륨 전용 테스트가 skip 되면 실패한다(#50, 2026-10-14 추가). act(`scripts/ci-local.sh`)로는 돌지 않는다.
@@ -515,7 +515,7 @@ SQLITE_OPS = {
 - **`ATOMIC_REQUESTS`**: Django 5.2.18·6.1.2 의 `BaseHandler.make_view_atomic()`(`django/core/handlers/base.py`)은 `ATOMIC_REQUESTS` 가 켜진 별칭마다 `alias not in view._non_atomic_requests` 이면 뷰를 `atomic(using=alias)` 로 감싸고, 그러면 뷰 실행 전에 연결이 열려 DB 파일이 생긴다(review-1 재현). `transaction.non_atomic_requests(using)` 은 별칭 하나만 넣으므로, `health_view._non_atomic_requests` 에 모든 별칭을 포함하는 집합(`__contains__` 가 항상 참인 `set` 하위 클래스)을 둔다. 사용자가 `non_atomic_requests` 를 덧씌워도 `add()` 가 그대로 동작한다.
 - 인증하지 않는다. 응답에는 DB 경로·TXID·파일 시각·부팅 상태가 들어가므로 내부망에만 노출한다. **사유는 고정 문장에 경로·TXID·초만 넣고, subprocess stderr·예외 원문은 응답에 넣지 않는다.** Litestream 은 설정 오류 메시지에 endpoint 의 `user:password@` 를 그대로 찍는다(review-1 재현). 원문은 `logging.getLogger("django_sqlite_ops.health")` 에 WARNING 으로 남기며(별칭마다 같은 메시지는 한 번), 남기기 전에 `redact()` 한 곳의 규칙으로 가린다: URL userinfo, 쿼리의 `secret`·`password`·`token`·`signature`·`credential`·`access-key`·`auth` 류 키의 값, 같은 낱말이 든 `키: 값`·`키=값`. 부팅 상태 파일의 문자열도 같은 규칙을 거친다. 완전한 탐지기가 아니므로 원문을 응답으로 보내지 않는 것이 1차 방어다.
 - 헬스는 "지금 복제가 따라오는가"만 말한다. "복구할 수 있는가"는 별도의 주기적 복원 검증(`sqlite_doctor --restore-test`, #52 설계·#54 구현 — §6-2 `--restore-test` 소절)으로 본다. **헬스에 넣지 않는다**: 헬스는 `REFRESH` 초마다 도는 가벼운 판정이고(요청은 `litestream` 을 기다리지 않는다), 복원 검증은 스냅샷 전체를 내려받는 무겁고 드문 작업이다. 그 결과를 헬스 응답에 섞지 않는다.
-- D3 실측: 끊김 동안 Litestream 의 로그와 메트릭에 아무것도 보이지 않았다. 그래서 헬스는 Litestream 의 자기 보고에 기대지 않고, TXID 와 WAL 위치 비교로 직접 계산한다.
+- D3 실측: 끊김 동안 Litestream 의 로그와 메트릭에 아무것도 보이지 않았다. 0.5.18 은 S3 가 연결을 거부할 때만 ERROR 로그를 남기고(무응답에는 0줄, #99), `litestream status` 는 두 판 모두 단절 중에도 rc 0·`ok`, 메트릭의 `sync_error_count` 는 0 그대로였다. 단절은 `replica_operation_total{operation="PUT"}` 이 멈추는 것으로만 간접적으로 보이는데, 쓰기가 없을 때와 구분되지 않는다. 상류 #1535 의 검증 메트릭은 기본 설정에서 나오지 않았다(2026-11-12 재현함, [#105 기록](research/lab-2026-11-12-litestream-pitfalls-0.5.18.md#9-s3-단절-중-litestream-status-와-메트릭)). 그래서 헬스는 Litestream 의 자기 보고에 기대지 않고, TXID 와 WAL 위치 비교로 직접 계산한다.
 - 테스트(`tests/test_health.py`): 순수 함수 표(grace 경계, 원격 앞섬, 빈 목록, 메타 없음, `unknown_at_boot`, 오래된 결과, pending 경계·L0 변경 시 재시작, DB 본 파일 사유 네 개와 우선순위), 가짜 조회 함수로 스레드(주기 갱신·예외 내구·PID 변경 재시작·첫 요청 전 미시작·벽시계 역행), 서브프로세스 Django 의 뷰(JSON 스키마, 200/strict 503, 연결이 열리지 않고 DB 파일이 생기지 않음 — 두 별칭 `ATOMIC_REQUESTS=True` 포함, 자격 증명이 응답·로그에 없음), 실제 Litestream `file://` 복제본(TXID: `replicate -once` 로 caught_up, 다른 복제본으로만 보내 grace 뒤 backlog, 빈 목록·조회 실패 unknown / #40 DB 본 파일: 정상+`-wal` `in_sync`, 없음·0바이트 × `-wal` 유무 네 경우 `db_missing`·`db_empty`, 조회 전후 디렉터리가 같고 `sqlite3.connect` 를 부르지 않음 / 파일 시각: `-once` 뒤 커밋 → backlog, `replicate` 지속 실행 중 유휴 caught_up → 종료 → 쓰기 → grace 안 caught_up, 뒤 backlog). S3 끊김(L8)은 랩(#10) 몫이다. 라운드 3: 읽기 사이에 실제 체크포인트·헤더 변경·파일 교체를 끼우는 테스트(테스트에서 `os.pread` 를 감싼다. 운영 코드에 훅 없음) — TRUNCATE 는 `in_sync` 아님, 두 번 다 바뀌면 `changed during read`, 같은 내용으로 교체되면 재시도 뒤 `in_sync`, PENDING 은 유지, review-3 `checkpoint_race.py`(TRUNCATE·RESTART, 실제 Litestream·복원). 라운드 2: `wal.compare()` 를 실제 SQLite 가 쓴 `-wal` 바이트로(같은/다른 salt, 체크섬·salt 가 틀린 프레임, 쓰다 만 프레임, 근거 없음 사례, 링크·FIFO), L0 헤더 필드, 실제 0.5.17 L0 의 WAL 위치, review-2 `race.py`(8 × 1MiB, 3회 중 경쟁 재현 시 `db_not_replicated`, 어느 경우도 `in_sync` 아님)·`edge.py`, 바쁜 DB 의 TXID backlog 오탐.
 
 ## 8. 배포 프로필과 채널 레이어
@@ -617,4 +617,4 @@ SQLITE_OPS = {
 - Windows 에서 boot CLI 의 파일 잠금과 디렉터리 rename 원자성 [확인 필요]. 그때까지 boot 는 `fcntl` 이 없으면 exit 64 로 거부한다
 - "같은 이력" 증명 방법(자동 판정의 전제) [확인 필요]
 - `--restore-test`(§6-2) 의 두 전제는 #54 에서 재현했다(2026-10-15): `restore -o` 는 `DB_PATH` 쪽을 읽지도 쓰지도 않고, `interrupt()` 는 707MB full 검사를 1ms 안에 멈춘다. 남은 것: 페이지 캐시가 차가운 상태·수십 GB DB·Linux 에서의 `interrupt()` 지연, S3 복제본에서의 불변 계약(file 복제본으로만 확인), litestream VFS 별칭에 로컬 캐시 경로가 있는지(있다면 보호 대상에 넣어야 한다 — 지금은 `vfs` 를 로컬 경로 없음으로 통과시킨다) (미검증)
-- Litestream 상류: #1506(VFS 확장 로드)은 v0.5.18(2026-11-03)에 들어갔다(릴리스 노트, 2026-11-12 확인). Linux 확장 로드 뒤 일반 connect 실패가 0.5.18 에서 사라지는지 재검증은 #105 다(미검증). #1271(writable VFS 손상)은 열림, 수정 PR #1363 도 열림(§3-3 유지)
+- Litestream 상류: #1506(VFS 확장 로드)은 v0.5.18(2026-11-03)에 들어갔다(릴리스 노트, 2026-11-12 확인). Linux 확장 로드 뒤 일반 connect 실패는 litestream-vfs 0.5.18 에서 사라졌다(PyPI wheel, python:3.13-slim aarch64, 2026-11-12 재현함 — #105. amd64 는 미검증). 2단계 `vfs.py` 의 우회(`sqlite3_reset_auto_extension()`)는 0.5.17 용으로만 필요하다. #1271(writable VFS 손상)은 열림, 수정 PR #1363 도 열림(§3-3 유지)
