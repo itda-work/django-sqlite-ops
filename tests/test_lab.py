@@ -1893,3 +1893,67 @@ def test_dbconfig_report_csv_and_tables():
     ) in out
     # locked 밖의 예외도 숨기지 않는다
     assert "x.DoesNotExist: y': 4" in out
+
+
+# --- walcp(#106) -------------------------------------------------------------------------------
+
+
+def _walcpstat():
+    sys.path.insert(0, str(ROOT / "lab"))
+    try:
+        import _walcpstat
+    finally:
+        sys.path.pop(0)
+    return _walcpstat
+
+
+def test_walcp_compare_ids_finds_missing_and_extra_ranges():
+    w = _walcpstat()
+    committed = [[1, 10], [11, 20], [31, 40]]  # 이어진 구간은 합친다
+    restored = [[1, 5], [9, 20], [31, 45]]
+    got = w.compare_ids(committed, restored)
+    assert got["committed_rows"] == 30
+    assert got["restored_rows"] == 32
+    assert got["missing_rows"] == 3 and got["missing_ranges"] == [[6, 8]]
+    assert got["hole_rows"] == 3 and got["tail_rows"] == 0
+    tail = w.compare_ids([[1, 10]], [[1, 2], [5, 7]])
+    assert tail["hole_rows"] == 2 and tail["tail_rows"] == 3  # 3..4 는 구멍, 8..10 은 꼬리
+    assert got["extra_rows"] == 5 and got["extra_ranges"] == [[41, 45]]
+    assert w.compare_ids([[1, 3]], [[1, 3]])["missing_rows"] == 0
+    assert w.compare_ids([[1, 3]], [])["missing_ranges"] == [[1, 3]]
+
+
+def test_walcp_wal_summary_counts_resets_backfill_and_blocked_samples():
+    w = _walcpstat()
+
+    def s(t, wal, salt, mx, nb, nba):
+        return {"t": t, "wal": wal, "salt": salt, "mx": mx, "nb": nb, "nba": nba}
+
+    samples = [
+        s(0, 100, [1, 1], 10, 0, 0),
+        s(1, 200, [1, 1], 20, 0, 20),  # 체크포인트가 막힘(nba > nb)
+        s(2, 300, [1, 1], 30, 20, 20),  # 체크포인트가 옮김
+        s(3, 300, [2, 2], 5, 0, 0),  # WAL 재시작(salt·mxFrame)
+        s(4, None, None, None, None, None),  # 표본에 WAL 이 없음
+    ]
+    got = w.wal_summary(samples)
+    assert got["wal_max_bytes"] == 300 and got["wal_end_bytes"] == 300
+    assert got["salt_changes"] == 1 and got["mx_drops"] == 1
+    assert got["backfill_steps"] == 1 and got["blocked_samples"] == 1
+    assert got["wal_missing_samples"] == 1 and got["mx_max_frames"] == 30
+    # 구간을 좁히면 그 안의 간격만 센다
+    assert w.wal_summary(samples, 0, 2)["salt_changes"] == 0
+
+
+def test_walcp_growth_is_least_squares_mb_per_min():
+    w = _walcpstat()
+    samples = [{"t": t, "wal": 1_000_000 * t} for t in range(0, 61)]  # 1 MB/초
+    assert w.growth_mb_per_min(samples, 10, 50) == 60.0
+    assert w.growth_mb_per_min(samples, 100, 200) is None
+
+
+def test_walcp_window_latency_uses_whole_intervals_only():
+    w = _walcpstat()
+    rows = [{"t": t, "write": {"p95_ms": t}} for t in (0, 5, 10, 15, 20)]
+    got = w.window_latency(rows, 3, 20, 5)
+    assert got["first"]["t"] == 5 and got["last"]["t"] == 15

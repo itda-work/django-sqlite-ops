@@ -11,6 +11,7 @@ scripts/lab.sh bench          # PRAGMA 벤치 + 포화 측정 (약 50분). pytes
 scripts/lab.sh soak           # fd·RSS 장시간 실행, CONN_MAX_AGE None·0 각 30분 (약 70분, #33)
 scripts/lab.sh dbconfig       # Django 기본 SQLite 대 권장 설정, 동시 쓰기 (약 30분, #83)
 scripts/lab.sh cache [mech]   # cache_size 최소 재현(mech: 원인 가설)을 랩 이미지의 Python·SQLite 로 (약 19분 / 6분, #27)
+scripts/lab.sh walcp          # 앱 wal_autocheckpoint 와 Litestream, WAL·L0 증가 (Q1 18회·Q2·Q3·Q4 약 1시간 30분, #106)
 scripts/lab.sh up             # 이미지 빌드 + SeaweedFS·toxiproxy 만 띄워 둔다(디버깅용)
 scripts/lab.sh down           # 이 랩의 자원만 지우고 남은 것을 보여 준다(비어 있어야 한다)
 ```
@@ -60,6 +61,7 @@ ubuntu-latest(amd64)에서 `scripts/lab.sh run <선택>` 을 그대로 돌리고
 | `labapp` / `labapp-nv` | `dso-lab-app:<태그>` | 시나리오 앱. 볼륨 `LAB_VOLUME` 있음 / 없음(무상태). 재시작하지 않는다(종료 코드를 본다) |
 | `labapp-soak` | 같은 이미지 | soak 앱(#33). `labapp` + `nofile`·메모리 한도(스왑 없음) |
 | `labapp-plain` | 같은 이미지 | 기본 대 권장 비교(#83). boot·Litestream 없이 `migrate` → `uvicorn --workers $LAB_WORKERS` |
+| `labapp-sup` | 같은 이미지 | #106 감독 변형. boot 는 같고, 뒤를 `lab_tools/walcp_sup.py` 가 맡아 uvicorn 과 `litestream replicate` 를 따로 띄운다(Litestream 만 멈출 수 있게) |
 | `tool` | 같은 이미지 | 볼륨 없이 복제본을 `/tmp` 로 복원해 TXID·행 수·`integrity_check` 를 낸다 |
 | `loadgen` | 같은 이미지 | 벤치 부하 발생기(`lab_tools/loadgen.py`) |
 | P1 `app` | 같은 이미지 | **single-server 문서의 compose.yaml 그대로** + `profile-override.yaml` |
@@ -156,7 +158,7 @@ L6 의 훅은 `LAB_RENAME_DELAY` 가 있을 때만 `os.rename` 뒤에 한 줄(`[
 
 ## fd·RSS 장시간 실행 (soak, #33)
 
-`lab/test_soak.py` 의 `test_soak`(마커 `soak`)이다. `scripts/lab.sh soak` 으로만 돈다 — `run` 은 `-m "not bench and not soak and not dbconfig"` 이고 GitHub 의 `lab.yml` 도 `run` 만 부르므로 기본 수집·CI 에 들어가지 않는다. 결과는 [`fd-soak-2026-10-09.md`](../docs/research/fd-soak-2026-10-09.md).
+`lab/test_soak.py` 의 `test_soak`(마커 `soak`)이다. `scripts/lab.sh soak` 으로만 돈다 — `run` 은 `-m "not bench and not soak and not dbconfig and not walcp"` 이고 GitHub 의 `lab.yml` 도 `run` 만 부르므로 기본 수집·CI 에 들어가지 않는다. 결과는 [`fd-soak-2026-10-09.md`](../docs/research/fd-soak-2026-10-09.md).
 
 - 앱은 `labapp-soak`(lab-compose.yaml)이다. `labapp` 과 같고 compose [`ulimits`](https://docs.docker.com/reference/compose-file/services/#ulimits) 로 `nofile` soft·hard 를 `LAB_SOAK_NOFILE`(기본 1048576 = 이 랩 VM 의 `fs.nr_open`, 컨테이너가 올릴 수 있는 최대)로, [`mem_limit`](https://docs.docker.com/reference/compose-file/services/#mem_limit)·[`memswap_limit`](https://docs.docker.com/reference/compose-file/services/#memswap_limit) 를 같은 값 `LAB_SOAK_MEM`(기본 `2g`, 스왑 없음)으로 둔다. 시작할 때 앱 프로세스의 `/proc/self/limits`·`/proc/1/limits`·`nr_open`·cgroup `memory.max` 를 원자료로 남기고, nofile 이 요청값과 다르거나 메모리 한도가 없으면 실패한다.
 - `CONN_MAX_AGE` 값마다 스택을 새로 띄워(`down -v` → `up`) 새 볼륨·prefix 로 `--init-new` 부팅 → 행 `LAB_SOAK_ROWS` 개 → 부하 직전 표본 → `loadgen --report-every`. 부하는 벤치 `mixed` 와 같다(읽기 70%·정렬 10%·1행 쓰기 20%, 동시 `LAB_SOAK_CONCURRENCY`). 두 값이 같은 부하다.
@@ -205,6 +207,26 @@ uv run --no-project python lab/cache_report.py --bench lab/.out/bench-<시각>.j
 
 `--quick` 은 하네스 확인용(블록 2, 칸 0.3초, 행 1/10)이다. 기본 `pytest`·CI 에서는 돌지 않는다.
 
+## 앱 wal_autocheckpoint 와 Litestream (walcp, #106)
+
+`lab/test_walcp.py`(마커 `walcp`)다. `scripts/lab.sh walcp` 으로만 돈다(`run`·`lab.yml` 밖). 판은 `LAB_LITESTREAM_VERSION` 으로 고르고 결과에는 이미지 안의 실제 판을 적는다. 결과는 [`lab-2026-11-12-wal-autocheckpoint.md`](../docs/research/lab-2026-11-12-wal-autocheckpoint.md).
+
+- `wal_autocheckpoint` 는 `1000`(프로필 그대로, 설정을 더하지 않는다)과 `0`(`LAB_PRAGMAS` → `sqlite_database(pragmas=...)` → `init_command`)이다. 실제 연결의 값을 `/lab/stats` 로 읽어 다르면 실패한다.
+- 부하(`lab_tools/walcp_load.py`, `loadgen` 컨테이너): 쓰기 스레드가 `POST /lab/write?n=<행>&size=<바이트>`(기본 10행 × 3,500바이트, 합계 30 req/s)를 보내고 200 응답의 `first_id`·`last_id` 를 '커밋된 id' 로 모은다. 읽기 스레드는 커밋된 id 를 무작위로 읽는다. 0.1초마다 `/lab/probe` 로 `-wal` 크기·헤더 salt 와 `-shm` 의 `mxFrame`·`nBackfill`·`nBackfillAttempted`(`notes/metrics.shm_header`)를 표본한다. 지연은 5초 구간마다 p50·p95.
+- 복원본 대조: `tool`(`lab_tools/replica.py --ids`)이 복제본을 `/tmp` 로 복원해 id 구간·`integrity_check` 를 내고, `_walcpstat.compare_ids` 가 커밋된 id 와 견줘 빠진 행·구간을 낸다.
+- **감독 변형 `labapp-sup`**: 프로필은 `replicate -exec` 라 Litestream(PID 1)이 끝나면 앱도 끝난다. 'Litestream 만 없는' 구간을 만들려고 boot 뒤를 `lab_tools/walcp_sup.py` 가 맡아 uvicorn 과 `litestream replicate -config /etc/litestream.yml`(프로필과 같은 명령, `-exec` 만 없음)을 따로 띄운다. Litestream 을 멈추고 띄우는 것은 `lab_tools/lsctl.py stop TERM|KILL`·`start`(hold 파일 + 신호)다.
+
+| 테스트 | 조건 | 재는 것 |
+|---|---|---|
+| `test_walcp_replica` (Q1·Q2) | ckpt × `steady`(프로필 그대로 `labapp`) / `restart`(`labapp-sup`, `LAB_WALCP_KILL_AT` 초에 Litestream SIGTERM, `LAB_WALCP_HOLD` 초 뒤 재기동) / `restart-persist`(`restart` + `CONN_MAX_AGE=None`, 기본 모드 목록에는 없다 — `LAB_WALCP_MODES=restart-persist`) × `LAB_WALCP_REPS` | 헬스 `caught_up` 뒤와 `docker stop` 뒤 복원본의 빠진 행·`integrity_check`, WAL 표본 요약 |
+| `test_walcp_plain` (Q2 대조) | Litestream 없는 `labapp-plain`, ckpt 마다 한 번 | WAL 표본 요약 |
+| `test_walcp_stall` (Q3) | ckpt × `hang`(프로필 그대로, `docker compose kill -s SIGSTOP` 으로 Litestream(PID 1) 정지 — 읽기 잠금을 쥔 채) / `dead`(`labapp-sup`, Litestream SIGTERM) / `dead-persist`(`dead` + `CONN_MAX_AGE=None`. 프로필 기본 `0` 은 요청마다 연결을 닫아 마지막 연결이 닫힐 때 SQLite 가 체크포인트하고 `-wal` 을 지운다) | 정지 `LAB_WALCP_STALL` 초 동안 WAL 증가율(MB/분)·지연, 헬스, 재개 뒤 `caught_up` 까지 시간·복원본 |
+| `test_walcp_l0` (Q4) | 프로필 그대로. 가장 최근 원격 L0 객체 하나를 손상(`s3_objects.py corrupt-path`) | `LAB_WALCP_L0_MINUTES` 분 동안 레벨별 객체 수(`s3_objects.py levels`)·헬스·boot 와 같은 원격 조회(`replica.py --no-restore`)·Litestream 경고 줄 |
+
+WAL 표본 요약(`_walcpstat.wal_summary`, Docker 없이 `tests/test_lab.py` 가 검사)의 수는 모두 표본 간격(0.1초) 해상도의 **하한**이다: salt 가 바뀐 간격 수·`mxFrame` 이 줄어든 간격 수(WAL 을 처음부터 다시 씀), `nBackfill` 이 는 간격 수(체크포인트가 프레임을 DB 로 옮김), `nBackfillAttempted > nBackfill` 인 표본 수(읽는 쪽 때문에 끝까지 못 옮김). `-shm` 은 잠금 없이 읽는다.
+
+환경 변수: `LAB_WALCP_REPS`(3), `LAB_WALCP_CKPT`(`1000,0`), `LAB_WALCP_MODES`(`steady,restart`), `LAB_WALCP_DURATION`(90초), `LAB_WALCP_KILL_AT`(30), `LAB_WALCP_HOLD`(20), `LAB_WALCP_STALL`(180), `LAB_WALCP_STALL_KINDS`(`hang,dead,dead-persist`), `LAB_WALCP_L0_MINUTES`(10), 부하 `LAB_WALCP_WRITERS`(2)·`READERS`(2)·`ROWS`(10)·`SIZE`(3500)·`RATE`(30). 결과: `lab/.out/walcp-<시각>-<replica|plain|stall|l0>.json`. 표는 `uv run --no-project python lab/walcp_report.py lab/.out/walcp-<시각>-*.json`.
+
 ## 파일
 
 ```
@@ -229,8 +251,12 @@ lab/
 ├── cache_probe.py          cache_size 최소 재현(#27, 표준 라이브러리 sqlite3 만)
 ├── _cachestat.py           그 집계·판정(순수 함수, 같은 테스트가 검사)
 ├── cache_report.py         그 원자료 → 결과 문서의 표
+├── test_walcp.py           앱 wal_autocheckpoint 와 Litestream, WAL·L0 증가(#106)
+├── _walcpstat.py           그 집계(순수 함수, 같은 테스트가 검사)
+├── walcp_report.py         그 원자료 → 결과 문서의 표
 └── app/                    랩 Django 프로젝트(문서 조각 밖의 것)
     ├── manage.py, proj/asgi.py(벤치 계측 래퍼), proj/*_tail.py, notes/(뷰·계측, chanlab.py = P2 채널 수신)
-    ├── lab_tools/          inspect_data.py, replica.py, s3_objects.py, loadgen.py, procs.py, chanlab_run.py
+    ├── lab_tools/          inspect_data.py, replica.py, s3_objects.py, loadgen.py, procs.py, chanlab_run.py,
+    │                       walcp_load.py·walcp_sup.py·lsctl.py(#106)
     └── lab_hooks/          sitecustomize.py (L6)
 ```

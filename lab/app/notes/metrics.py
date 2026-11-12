@@ -61,6 +61,38 @@ def wal_header(path: str) -> dict | None:
     return {"page_size": page_size, "ckpt_seq": ckpt_seq, "salt1": salt1, "salt2": salt2}
 
 
+def shm_header(path: str) -> dict | None:
+    """``-shm`` 의 WAL 인덱스 헤더와 체크포인트 정보(#106). 파일을 읽기만 한다.
+
+    형식(SQLite ``wal.c``, 호스트 바이트 순서): 앞 48바이트 ``WalIndexHdr`` 의 ``mxFrame``
+    (오프셋 16, WAL 의 마지막 유효 프레임)·``aSalt``(32), 두 사본(96바이트) 뒤 ``WalCkptInfo`` 의
+    ``nBackfill``(96, 체크포인트가 DB 로 옮긴 프레임 수)·``aReadMark[5]``(100)·
+    ``nBackfillAttempted``(128, 체크포인트가 옮기려 한 프레임 수). ``nBackfillAttempted`` 가
+    ``nBackfill`` 보다 크면 읽는 쪽 때문에 끝까지 옮기지 못한 것이다. 잠금 없이 읽으므로 한
+    표본의 값끼리 어긋날 수 있다(표본 해석은 날것으로).
+    """
+    try:
+        with open(path + "-shm", "rb") as f:
+            head = f.read(136)
+    except FileNotFoundError:
+        return None
+    if len(head) < 132:
+        return None
+    mx_frame, _n_page = struct.unpack_from("=II", head, 16)
+    salt1, salt2 = struct.unpack_from("=II", head, 32)
+    n_backfill = struct.unpack_from("=I", head, 96)[0]
+    read_marks = list(struct.unpack_from("=5I", head, 100))
+    attempted = struct.unpack_from("=I", head, 128)[0]
+    return {
+        "mx_frame": mx_frame,
+        "n_backfill": n_backfill,
+        "n_backfill_attempted": attempted,
+        "read_marks": read_marks,
+        "salt1": salt1,
+        "salt2": salt2,
+    }
+
+
 def snapshot() -> dict:
     name = settings.DATABASES["default"]["NAME"]
     sizes = {}
@@ -79,6 +111,7 @@ def snapshot() -> dict:
         "fd_limit": resource.getrlimit(resource.RLIMIT_NOFILE)[0],
         "sizes": sizes,
         "wal": wal_header(name),
+        "shm": shm_header(name),
         **counts,
     }
 

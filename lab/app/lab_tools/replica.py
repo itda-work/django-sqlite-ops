@@ -26,6 +26,10 @@ def main() -> None:
         out["detail"] = getattr(remote, "message", None)
         print(json.dumps(out))
         return
+    if "--no-restore" in sys.argv[1:]:
+        # #106 Q4: boot 와 같은 원격 조회(최대 TXID)만 본다
+        print(json.dumps(out))
+        return
     tmp = Path(tempfile.mkdtemp(prefix="replica-"))
     target = tmp / "r.sqlite3"
     proc = subprocess.run(
@@ -42,6 +46,15 @@ def main() -> None:
         try:
             out["rows"] = con.execute("SELECT count(*) FROM notes_note").fetchone()[0]
             out["integrity"] = con.execute("PRAGMA integrity_check").fetchone()[0]
+            if "--ids" in sys.argv[1:]:
+                # #106: 복원본에 있는 id 의 이어진 구간들(빠진 커밋을 id 범위로 찾는다)
+                out["id_ranges"] = [
+                    list(r)
+                    for r in con.execute(
+                        "SELECT min(id), max(id) FROM (SELECT id, id - row_number() "
+                        "OVER (ORDER BY id) AS g FROM notes_note) GROUP BY g ORDER BY 1"
+                    )
+                ]
         finally:
             con.close()
     print(json.dumps(out))
