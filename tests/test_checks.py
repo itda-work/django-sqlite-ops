@@ -982,3 +982,274 @@ def test_readonly_alias_breaks_with_wal_remediation(tmp_path):
 def test_vfs_alias_skips_w001_w002_keeps_w003(deploy):
     databases = {"default": sqlite_database("/srv/app/app.sqlite3"), "replica": raw(VFS)}
     assert run_checks(databases, deploy=deploy) == [("sqlite_ops.W003", "replica")]
+
+
+# W006: ATOMIC_REQUESTS 와 transaction_mode IMMEDIATE·EXCLUSIVE (#102)
+
+W006 = "sqlite_ops.W006"
+
+# (역할, NAME) — 역할 판정은 W001 과 같다(_role). 파일 쓰기 잠금을 다투지 않는 별칭(read-only·
+# vfs·memory)에는 내지 않고, 판정할 수 없는 별칭(W004 대상)에는 낸다. 메모리 DB 는 직렬화되지 않는다
+# (#102 검수 1 재현: ":memory:" 는 연결마다 DB 가 따로라 4개 모두 0.32초, 공유 캐시는 즉시 500)
+W006_ROLES = [
+    ("write", "/srv/app/app.sqlite3", True),
+    ("memory", ":memory:", False),
+    ("memory-shared", "file:w006mem?mode=memory&cache=shared", False),
+    ("memory-uri", "file::memory:?cache=shared", False),
+    ("read-only", "file:/srv/app/app.sqlite3?mode=ro", False),
+    ("vfs", VFS, False),
+    ("unknown", "file:/srv/app/app.sqlite3?mode=rwc&mode=ro", True),
+]
+_ABSENT = object()
+W006_ATOMIC = [(True, True), (1, True), (False, False), (0, False), (_ABSENT, False)]
+W006_MODES = [
+    ("IMMEDIATE", True),
+    ("immediate", True),
+    ("EXCLUSIVE", True),
+    ("exclusive", True),
+    ("DEFERRED", False),
+    (None, False),
+    (_ABSENT, False),
+]
+
+
+def w006_table():
+    """(별칭 이름, 설정, W006 이 나와야 하는가) 의 칸 목록."""
+    cells = []
+    for role, name, writes in W006_ROLES:
+        for ai, (atomic, atomic_on) in enumerate(W006_ATOMIC):
+            for mi, (mode, mode_locks) in enumerate(W006_MODES):
+                options = {} if mode is _ABSENT else {"transaction_mode": mode}
+                config = raw(name, **options)
+                if atomic is not _ABSENT:
+                    config["ATOMIC_REQUESTS"] = atomic
+                cells.append((f"{role}-a{ai}-m{mi}", config, writes and atomic_on and mode_locks))
+    return cells
+
+
+@pytest.mark.parametrize("deploy", [False, True])
+def test_w006_table(deploy):
+    # 항상 도는 체크다: --deploy 여부와 무관하게 같은 칸에서 나온다
+    cells = w006_table()
+    databases = {"default": sqlite_database("/srv/app/default.sqlite3")}
+    databases.update({alias: config for alias, config, _ in cells})
+    got = run_checks(databases, deploy=deploy)
+    warned = {obj for ident, obj in got if ident == W006}
+    assert warned == {alias for alias, _, expected in cells if expected}
+    assert len(warned) == 2 * 2 * 4  # 역할 2(write·unknown) × ATOMIC_REQUESTS 참 2 × 잠그는 모드 4
+
+
+def test_w006_only_the_matching_alias():
+    databases = {
+        "default": {**sqlite_database("/srv/app/app.sqlite3"), "ATOMIC_REQUESTS": True},
+        "events": sqlite_database("/srv/app/events.sqlite3"),
+    }
+    assert run_checks(databases) == [(W006, "default")]
+
+
+def test_w006_not_for_sqlite_database_defaults():
+    # sqlite_database() 는 ATOMIC_REQUESTS 를 넣지 않는다. 경고는 사용자가 켤 때만 나온다
+    assert "ATOMIC_REQUESTS" not in sqlite_database("/srv/app/app.sqlite3")
+    db = {**sqlite_database("/srv/app/app.sqlite3"), "ATOMIC_REQUESTS": False}
+    assert run_checks({"default": db}) == []
+
+
+def test_w006_skips_non_sqlite_engines():
+    databases = {
+        "default": {
+            "ENGINE": "django.db.backends.postgresql",
+            "NAME": "app",
+            "ATOMIC_REQUESTS": True,
+            "OPTIONS": {"transaction_mode": "IMMEDIATE"},
+        }
+    }
+    assert run_checks(databases) == []
+
+
+W006_MESSAGE_SCRIPT = """
+import io
+import json
+import sys
+
+import django
+from django.conf import settings
+
+from django_sqlite_ops.database import sqlite_database
+
+db = {**sqlite_database("/srv/app/app.sqlite3"), "ATOMIC_REQUESTS": True}
+settings.configure(
+    INSTALLED_APPS=["django_sqlite_ops"],
+    DATABASES={"default": db},
+    SILENCED_SYSTEM_CHECKS=json.loads(sys.argv[1]),
+)
+django.setup()
+
+from django.core.checks import run_checks
+from django.core.management import call_command
+
+for m in run_checks():
+    if m.id.startswith("sqlite_ops."):
+        print(m.id, m.obj, m.level, m.msg, m.hint, sep="\\n")
+err = io.StringIO()
+call_command("check", stderr=err)
+print("---")
+print(err.getvalue())
+"""
+
+
+def run_w006_message(silenced):
+    result = subprocess.run(
+        [sys.executable, "-c", W006_MESSAGE_SCRIPT, json.dumps(silenced)],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    return result.stdout
+
+
+def test_w006_message():
+    out = run_w006_message([])
+    ident, obj, level, msg, hint = out.split("\n---\n")[0].split("\n")
+    assert (ident, obj, level) == (W006, "default", "30")
+    assert msg == (
+        "Database 'default' runs every request serially: ATOMIC_REQUESTS is on and "
+        "OPTIONS['transaction_mode'] is 'IMMEDIATE'."
+    )
+    for part in (
+        "BEGIN IMMEDIATE",
+        "write lock",
+        "read-only views",
+        'DATABASES["default"]["ATOMIC_REQUESTS"] = False',
+        "transaction.atomic()",
+        '@transaction.non_atomic_requests(using="default")',
+        "0.32s",
+        "1.31s",
+        "silence sqlite_ops.W006",
+        "DESIGN §6-1",
+    ):
+        assert part in hint, part
+    # transaction_mode 를 DEFERRED 로 바꾸라고 하지 않는다(W001 과 충돌한다)
+    assert "DEFERRED" not in hint
+
+
+@pytest.mark.parametrize("silenced", [[], [W006]])
+def test_w006_silenced(silenced):
+    out = run_w006_message(silenced)
+    assert ("default: (sqlite_ops.W006)" in out.split("\n---\n")[1]) == (not silenced)
+
+
+# 이 조합이 실제로 요청을 직렬로 돌린다 (#102 의 재현)
+
+SERIAL_SCRIPT = """
+import sqlite3
+import sys
+import threading
+import time
+
+atomic, db_path = sys.argv[1] == "1", sys.argv[2]
+
+seed = sqlite3.connect(db_path)
+seed.execute("PRAGMA journal_mode=WAL")
+seed.execute("CREATE TABLE t (id INTEGER PRIMARY KEY, v TEXT)")
+seed.execute("INSERT INTO t (v) VALUES ('x')")
+seed.commit()
+seed.close()
+
+import django
+from django.conf import settings
+
+from django_sqlite_ops.database import sqlite_database
+
+db = {**sqlite_database(db_path), "ATOMIC_REQUESTS": atomic}
+settings.configure(
+    DEBUG=False,
+    ALLOWED_HOSTS=["*"],
+    ROOT_URLCONF=__name__,
+    DATABASES={"default": db},
+    MIDDLEWARE=[],
+)
+django.setup()
+
+from django.db import connection, connections
+from django.http import HttpResponse
+from django.test import Client
+from django.urls import path
+
+SLEEP = float(sys.argv[3])
+N = int(sys.argv[4])
+
+
+def read_view(request):
+    with connection.cursor() as cur:
+        cur.execute("SELECT count(*) FROM t")
+        n = cur.fetchone()[0]
+    time.sleep(SLEEP)
+    return HttpResponse(str(n))
+
+
+urlpatterns = [path("read", read_view)]
+
+durations = [0.0] * N
+statuses = [0] * N
+barrier = threading.Barrier(N)
+
+
+def worker(i):
+    client = Client()
+    barrier.wait()
+    t0 = time.perf_counter()
+    statuses[i] = client.get("/read").status_code
+    durations[i] = time.perf_counter() - t0
+    connections.close_all()
+
+
+threads = [threading.Thread(target=worker, args=(i,)) for i in range(N)]
+t0 = time.perf_counter()
+for t in threads:
+    t.start()
+for t in threads:
+    t.join()
+wall = time.perf_counter() - t0
+print(wall, *sorted(durations), *statuses)
+"""
+
+SERIAL_SLEEP = 0.3
+SERIAL_N = 4
+
+
+def run_serial(atomic, tmp_path):
+    result = subprocess.run(
+        [
+            sys.executable,
+            "-c",
+            SERIAL_SCRIPT,
+            "1" if atomic else "0",
+            str(tmp_path / f"atomic-{int(atomic)}.sqlite3"),
+            str(SERIAL_SLEEP),
+            str(SERIAL_N),
+        ],
+        cwd=ROOT,
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    assert result.returncode == 0, result.stderr
+    values = result.stdout.split()
+    wall = float(values[0])
+    durations = [float(v) for v in values[1 : 1 + SERIAL_N]]
+    statuses = [int(v) for v in values[1 + SERIAL_N :]]
+    assert statuses == [200] * SERIAL_N
+    return wall, durations
+
+
+def test_w006_combination_serializes_read_views(tmp_path):
+    # 읽기만 하는 뷰 N 개를 동시에 부른다. 직렬이면 전체가 N × 쉼 근처, 병렬이면 쉼 근처다.
+    # 여유: 직렬은 N × 쉼의 0.8배 이상, 병렬은 2 × 쉼 미만(느린 CI 를 위해)
+    serial_wall, serial = run_serial(True, tmp_path)
+    parallel_wall, parallel = run_serial(False, tmp_path)
+    assert serial_wall >= SERIAL_N * SERIAL_SLEEP * 0.8, serial
+    assert serial[-1] >= SERIAL_N * SERIAL_SLEEP * 0.8, serial
+    assert parallel_wall < 2 * SERIAL_SLEEP, parallel
+    assert parallel[-1] < 2 * SERIAL_SLEEP, parallel

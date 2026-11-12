@@ -277,7 +277,8 @@ def _asgi_evidence() -> str | None:
 
 
 def check_settings(app_configs=None, **kwargs):
-    """항상 도는 체크: E001(프로필), E002(헬스 설정), W003·W005(별칭의 ``CONN_MAX_AGE``)."""
+    """항상 도는 체크: E001(프로필), E002(헬스 설정), W003·W005(별칭의 ``CONN_MAX_AGE``),
+    W006(``ATOMIC_REQUESTS`` 와 쓰기 잠금을 잡는 ``transaction_mode``)."""
     _, error = _profile()
     if error:
         return [error]
@@ -317,7 +318,50 @@ def check_settings(app_configs=None, **kwargs):
                     id="sqlite_ops.W005",
                 )
             )
+        w006 = _atomic_requests_warning(alias, config)
+        if w006 is not None:
+            messages.append(w006)
     return messages
+
+
+# BEGIN 에서 바로 쓰기 잠금을 잡는 transaction_mode (DEFERRED 는 첫 쓰기 때 잡는다)
+_LOCKING_MODES = frozenset({"IMMEDIATE", "EXCLUSIVE"})
+
+
+def _atomic_requests_warning(alias: str, config: Mapping[str, Any]) -> checks.Warning | None:
+    """W006: ``ATOMIC_REQUESTS`` 가 켜지고 ``transaction_mode`` 가 IMMEDIATE·EXCLUSIVE 면 낸다.
+
+    Django 는 이 별칭의 뷰마다 ``atomic()`` 을 씌우고, 그 ``BEGIN IMMEDIATE`` 가 뷰가 끝날 때까지
+    쓰기 잠금을 쥐므로 읽기만 하는 파일 DB 뷰도 직렬로 돈다(#102 재현). 파일 쓰기 잠금을 다투지
+    않는 별칭에는 내지 않는다: read-only·vfs 는 쓰지 않고, memory 는 직렬화되지 않는다(``:memory:``
+    는 연결마다 DB 가 따로다. 공유 캐시는 기다리지 않고 바로 실패한다 — 둘 다 재현함, #102 검수 1).
+    역할을 판정할 수 없는 별칭에는 낸다.
+    """
+    if not config.get("ATOMIC_REQUESTS"):
+        return None
+    mode = _options(config).get("transaction_mode")
+    if not isinstance(mode, str) or mode.upper() not in _LOCKING_MODES:
+        return None
+    role, _ = _role(config.get("NAME"))
+    if role in ("read-only", "vfs", "memory"):
+        return None
+    return checks.Warning(
+        f"Database {alias!r} runs every request serially: ATOMIC_REQUESTS is on and "
+        f"OPTIONS['transaction_mode'] is {mode.upper()!r}.",
+        hint=(
+            "ATOMIC_REQUESTS wraps each view in atomic(), which starts with "
+            f"BEGIN {mode.upper()} and holds the database's single write lock until the view "
+            "returns, so even read-only views wait for each other. Measured with 4 concurrent "
+            "read-only views that sleep 0.3s: 0.32s, 0.67s, 0.99s, 1.31s with ATOMIC_REQUESTS, "
+            "0.32s each without (#102). Either set "
+            f'DATABASES["{alias}"]["ATOMIC_REQUESTS"] = False and wrap only the views that '
+            "write in transaction.atomic(), or decorate read-only views with "
+            f'@transaction.non_atomic_requests(using="{alias}"). If this is intended, silence '
+            "sqlite_ops.W006 (DESIGN §6-1)."
+        ),
+        obj=alias,
+        id="sqlite_ops.W006",
+    )
 
 
 def check_deploy_settings(app_configs=None, **kwargs):
