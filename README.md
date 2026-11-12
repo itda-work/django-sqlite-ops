@@ -68,7 +68,7 @@ PyPI 에 **실험적 사전 릴리스**로 배포한다([D-28](docs/DECISIONS.md
 
 ## 설치
 
-요구 버전: Python 3.13+, Django 5.2+, SQLite 3.37+. boot CLI 는 POSIX(Linux·macOS)와 PATH 의 `litestream` 0.5.17 또는 0.5.18 이 필요하다([boot CLI](#boot-cli)).
+요구 버전: Python 3.13+(CI 는 3.13·3.14·3.15), Django 5.2+, SQLite 3.37+. Python 3.15 는 Django 6.1.3 이상과 함께 쓴다(Django 5.2 는 3.14 까지 지원). boot CLI 는 POSIX(Linux·macOS)와 PATH 의 `litestream` 0.5.17 또는 0.5.18 이 필요하다([boot CLI](#boot-cli)).
 
 PyPI 에서 설치한다. 사전 릴리스는 버전을 명시해 설치한다. 실험적 프로젝트이므로 그 버전으로 고정해 둔다.
 
@@ -994,7 +994,7 @@ uv venv && uv pip install -e . --group dev
 uv run --no-sync pytest
 
 scripts/ci-local.sh                 # GitHub Actions CI 를 act 로 로컬 실행 (lint + 전체 매트릭스)
-scripts/ci-local.sh test 3.14 6.1   # 매트릭스 한 칸만
+scripts/ci-local.sh test 3.15 6.1   # 매트릭스 한 칸만 (python, django — 3.15 × 5.2 칸은 없다)
 scripts/ci-local.sh litestream      # 실제 litestream 바이너리 + channels-lite[aio]==0.4.0 으로 통합 테스트 (둘 중 하나가 없어 skip 되면 실패)
 
 scripts/lab.sh run all              # 회귀 랩 L1–L8·프로필 종단 검증 (Docker, 약 8분, 끝나면 down -v)

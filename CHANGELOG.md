@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+### Added
+
+- **Python 3.15 를 지원한다.** Django 6.1(3.15 를 지원하는 6.1.3 이상)과 함께다. Django 5.2 는 Python 3.14 까지 지원하므로 3.15 × Django 5.2 는 지원 범위가 아니다. CI 가 3.15 에서 전체 테스트와 실제 Litestream(0.5.17·0.5.18)·channels-lite 통합 테스트를 돌고, classifier 에 `Programming Language :: Python :: 3.15` 를 넣었다 (#101)
+
 ### Changed
 
 - **Litestream 0.5.18 을 검증한 판으로 받는다.** boot·`sqlite_doctor` 의 Litestream 설정 대조·헬스·`--restore-test` 가 0.5.17 과 0.5.18 을 받고 그 밖의 판은 계속 거부한다. 0.5.18 실측 fixture(`file://` 복제본의 `ltx`·`databases`·`restore`)의 출력 형식·rc·오류 문구는 0.5.17 과 같았다(시각·크기·압축 묶음만 다름). 배포 프로필 `single-server` 의 Dockerfile 이 0.5.18 을 설치한다 (#99)
