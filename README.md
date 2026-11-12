@@ -68,7 +68,7 @@ PyPI 에 **실험적 사전 릴리스**로 배포한다([D-28](docs/DECISIONS.md
 
 ## 설치
 
-요구 버전: Python 3.13+(CI 는 3.13·3.14·3.15), Django 5.2+, SQLite 3.37+. Python 3.15 는 Django 6.1.3 이상과 함께 쓴다(Django 5.2 는 3.14 까지 지원). boot CLI 는 POSIX(Linux·macOS)와 PATH 의 `litestream` 0.5.17 또는 0.5.18 이 필요하다([boot CLI](#boot-cli)).
+요구 버전: Python 3.13+(CI 는 3.13·3.14·3.15), Django 5.2+, SQLite 3.37+(단 3.51.2 이하는 [WAL-reset 버그](#sqlite-wal-reset-버그)의 영향 범위다). Python 3.15 는 Django 6.1.3 이상과 함께 쓴다(Django 5.2 는 3.14 까지 지원). boot CLI 는 POSIX(Linux·macOS)와 PATH 의 `litestream` 0.5.17 또는 0.5.18 이 필요하다([boot CLI](#boot-cli)).
 
 PyPI 에서 설치한다. 사전 릴리스는 버전을 명시해 설치한다. 실험적 프로젝트이므로 그 버전으로 고정해 둔다.
 
@@ -394,7 +394,7 @@ python manage.py sqlite_doctor --json          # 모니터링·스크립트용
 
 무엇을 보나:
 
-- **database** — 별칭마다 Django 가 실제로 여는 경로(`OPTIONS["database"]` 가 있으면 `NAME` 대신 그것. 연결하지 않고 Django 의 연결 매개변수에서 읽는다)를 기준으로 역할(쓰기·읽기 전용·메모리·VFS), 파일 크기, `-wal` 크기(연결 전), 실제 `transaction_mode`·`journal_mode`·`synchronous`·`busy_timeout`·`foreign_keys`·SQLite 버전. [권장값](#기본값)과 다르면 `warn`. 읽기 전용 별칭은 쓰기 권고(`transaction_mode`·`journal_mode`·`synchronous`)를 비교하지 않는다. 메모리 DB 는 "메모리 DB" 로만 적는다. Litestream VFS 별칭과 역할을 판정할 수 없는 별칭(W004, 로컬이 아닌 URI authority 포함)은 연결하지 않고 `unknown`. 연결 실패는 `error`.
+- **database** — 별칭마다 Django 가 실제로 여는 경로(`OPTIONS["database"]` 가 있으면 `NAME` 대신 그것. 연결하지 않고 Django 의 연결 매개변수에서 읽는다)를 기준으로 역할(쓰기·읽기 전용·메모리·VFS), 파일 크기, `-wal` 크기(연결 전), 실제 `transaction_mode`·`journal_mode`·`synchronous`·`busy_timeout`·`foreign_keys`·SQLite 버전. [권장값](#기본값)과 다르면 `warn`. SQLite 버전이 [WAL-reset 버그](#sqlite-wal-reset-버그)의 영향 범위이면 `sqlite_version` 줄에 그 사실을 메시지로 적는다. **보고만 하므로 수준은 `ok` 이고 종료 코드를 바꾸지 않는다.** 읽기 전용 별칭은 쓰기 권고(`transaction_mode`·`journal_mode`·`synchronous`)를 비교하지 않는다. 메모리 DB 는 "메모리 DB" 로만 적는다. Litestream VFS 별칭과 역할을 판정할 수 없는 별칭(W004, 로컬이 아닌 URI authority 포함)은 연결하지 않고 `unknown`. 연결 실패는 `error`.
 - **mount** — 위의 실제 경로로 DB 파일(없으면 존재하는 상위 디렉터리)의 파일시스템 종류. NFS·SMB/CIFS·AFP·sshfs 같은 네트워크 파일시스템이면 `warn` 이다. SQLite 의 파일 잠금을 믿을 수 없고 WAL 이 동작하지 않는다([SQLite 문서](https://www.sqlite.org/useovernet.html)). 로컬로 확인되지 않은 종류(알 수 없는 FUSE 등)는 `unknown`.
 - **litestream** — `litestream databases -config PATH -json` 으로 설정의 DB 목록을 읽어 실제 경로로 대조한다. 쓰기 별칭이 설정에 없으면 `warn`(복제되지 않음). 단 channels-lite 전용 채널 DB(앱 DB 와 다른 파일)는 복제에서 빼는 것이 규칙이라 이 경고를 내지 않는다. 설정 경로가 실제 경로가 아니면(부모에 링크) `warn` — boot 가 거부하는 구성이다([경로 규칙](#경로-규칙)). 상대 경로·`dir:` 항목은 Litestream 의 작업 디렉터리 기준으로 풀려 대조할 수 없으므로 `warn`. 설정에만 있는 DB 는 `ok`(정보). 설정 파일 없음·깨진 YAML·바이너리 없음은 `error`.
 - **channels** — `CHANNEL_LAYERS` 를 읽기만 한다(`channels` 를 import 하지 않는다. 예외는 아래 `patch` 항목). 백엔드별 의미론을 한 줄로 요약한다. `InMemoryChannelLayer` 는 프로필이 `single-server-multiproc` 이면 `warn`. channels-lite 는 채널 DB 가 앱 DB 와 같은 파일이면 `warn`, Litestream 설정의 복제 대상이면 `warn`. 모르는 백엔드(`channels_redis` pub/sub 포함)는 `unknown`. `AIOSQLiteChannelLayer` 를 쓰거나 `PATCH_CHANNELS_LITE_AIO` 가 켜져 있으면 [중복 배달 패치](#channels-lite-패치) 상태를 `patch` 항목으로 보여 준다. 이때만 channels-lite 를 import 한다(DB 는 열지 않는다).
@@ -944,12 +944,27 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 | 증상 | 원인 | 대처 | 근거 |
 |---|---|---|---|
 | doctor 를 돌린 뒤 `-wal`·`-shm` 이 생기거나 `journal_mode` 가 바뀌었다 | doctor 는 실제로 연결하므로 `init_command` 가 실행되고, WAL DB 는 연결만 해도 사이드카가 생긴다 | 운영 DB 에서 돈다는 것을 알고 실행한다([주의](#sqlite_doctor)) | 재현함 |
+| `sqlite_version` 줄에 `affected by the SQLite WAL-reset bug` 가 붙는다 | 실행 중인 SQLite 가 3.7.0~3.51.2 이고 백포트 판(3.44.6~3.44.x, 3.50.7~3.50.x)이 아니다. 판 번호만 본다 | 아래 [SQLite WAL-reset 버그](#sqlite-wal-reset-버그)를 읽는다. 수준은 `ok` 라 종료 코드는 그대로다 | 코드상 확인(`doctor.py`), 범위는 [SQLite 문서](https://sqlite.org/wal.html#the_wal_reset_bug)(2026-11-12 확인) |
 | `[process]` 의 `nofile_soft` 가 compose 에 준 값과 다르다 | doctor 는 자기 프로세스의 한도를 본다. 다른 셸이나 호스트에서 돌렸거나, 앱이 `setrlimit` 으로 바꿨다 | `docker compose exec app ...` 로 컨테이너 안에서 돌리고, 앱 PID 의 `/proc/<pid>/limits` 와 맞춰 본다([fd 한도 가이드 §2](docs/profiles/fd-limits.md#2-현재-한도-확인)) | 재현함(#32) |
 | 읽기 전용 별칭(`mode=ro`)이 `unknown` 이다 | WAL DB 는 읽기 전용 연결도 `-shm` 에 쓰고 `-wal` 을 만들 수 있어 연결하지 않는다 | 같은 파일의 쓰기 별칭이나 `immutable=1` URI 별칭으로 진단한다([주의](#sqlite_doctor)) | 재현함 |
 | DB 파일이 없다는 `error` | 없는 파일에 연결하면 SQLite 가 빈 DB 를 만들어 다음 boot 의 복원을 막으므로 연결하지 않는다 | 경로를 확인하거나 boot 로 먼저 복원한다 | 코드상 확인(`doctor.py`) |
 | `--restore-test` 가 `restore_dir` `error` 로 바로 끝난다 | `--restore-dir` 이 없거나 링크이거나, 운영 DB 디렉터리·메타와 겹친다. 같은 `litestream.yml` 에만 있는 다른 서비스 DB 의 디렉터리와 겹쳐도 거부한다(메시지에 `litestream config database`). TMPDIR 이 `--restore-dir` 과 같거나 그 안이어도 거부한다(Linux 에서 `--restore-dir /tmp`). 모두 아무것도 만들지 않고 거부 | DB 디렉터리·메타 밖의 실제 디렉터리를 미리 만들어 준다. TMPDIR 이 걸리면 `TMPDIR=/var/tmp` 처럼 밖으로 옮기거나 다른 디렉터리를 준다([복원 검증](#복원-검증---restore-test)) | 재현함(#54·#57 테스트) |
 | `--restore-test` 의 `remote_txid` 가 `error`(복제본이 비었다) | 복제본에 LTX 가 없다. 0.5.17 은 복제본 경로·prefix 오타도 같은 결과다 | 설정의 복제본 경로를 확인하고 헬스(`remote_txid`)도 본다 | 재현함 |
 | `--restore-test` 산출물이 `--restore-dir` 에 쌓인다 | 실패(또는 `--keep`)한 실행의 작업 디렉터리는 조사용으로 남기고 자동으로 지우지 않는다 | `output` 경로를 확인한 뒤 지운다 | 코드상 확인(`restore_check.py`) |
+
+#### SQLite WAL-reset 버그
+
+SQLite 공식 문서([wal.html §11](https://sqlite.org/wal.html#the_wal_reset_bug), 2026-11-12 확인)는 WAL 모드에서 드물게 DB 를 손상시키는 버그를 적는다.
+
+- 영향 범위: 3.7.0 ~ 3.51.2. 3.51.3 에서 고쳐졌고 3.44.6·3.50.7 로 백포트됐다.
+- 조건: WAL 모드 DB 에 연결이 둘 이상(스레드든 프로세스든) 있고, 쓰기나 체크포인트가 같은 순간에 겹칠 때. 이 패키지가 권하는 구성(WAL + 여러 연결 + Litestream 의 체크포인트)은 이 조건에 해당한다.
+- SQLite 의 평가: 결과는 심각하지만 긴급 사안은 아니고 발생률이 매우 낮다. 업그레이드 외의 우회책은 없다.
+
+실행 중인 판은 `sqlite_doctor` 의 `sqlite_version` 줄이나 `python -c "import sqlite3; print(sqlite3.sqlite_version)"` 로 확인한다. Python 의 `sqlite3` 모듈이 연결된 SQLite 가 기준이다(`sqlite3` 명령줄 도구의 판과 다를 수 있다).
+
+- 배포판은 판 번호를 바꾸지 않고 패치할 수 있다. 그래서 doctor 는 경고(`warn`)가 아니라 메시지로만 알린다. Ubuntu 는 22.04(`3.37.2-2ubuntu0.9`)·24.04(`3.45.1-1ubuntu2.10`)에 "Fix WAL-Reset corruption race" 를 `-proposed` 에 올렸다([Launchpad changelog](https://launchpad.net/ubuntu/+source/sqlite3/+changelog), 2026-11-12 확인 — 아직 `-updates` 전이고, 상류 3.51.3 수정과 같은지는 미확인). Debian 은 bookworm(`3.40.1-2+deb12u2`)·trixie(`3.46.1-7+deb13u1`)의 changelog 에 해당 항목이 없다(2026-11-12 확인. trixie `deb13u2` 는 미확인). 이런 패치 판에서도 판 번호는 영향 범위로 보이므로 메시지가 나온다.
+- uv 가 받는 Python 은 SQLite 를 정적으로 품는다(CI 주석). 이 저장소의 로컬 실측(macOS, 2026-11-12)은 3.53.1 로 영향 범위가 아니다. 배포 프로필의 `python:3.13-slim` 은 3.46.1 이다([프로필](docs/profiles/single-server.md#dockerfile)).
+- 이 패키지 구성에서 실제로 일어나는지는 재현을 시도하지 않았다(미검증).
 
 ### boot
 

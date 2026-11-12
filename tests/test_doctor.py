@@ -30,6 +30,7 @@ from django_sqlite_ops.doctor import (
     mountinfo_fstype,
     nofile_items,
     to_json,
+    wal_reset_affected,
 )
 
 ROOT = Path(__file__).resolve().parent.parent
@@ -280,6 +281,98 @@ def test_text_output(tmp_path):
     assert any(line.split()[:3] == ["WARN", "default", "synchronous"] for line in out.splitlines())
     assert out.rstrip().splitlines()[-1].endswith("-> exit 1")
     assert rc == 1
+
+
+# --- SQLite WAL-reset 버그(#103, https://sqlite.org/wal.html#the_wal_reset_bug) ---------------
+
+
+@pytest.mark.parametrize(
+    ("version", "affected"),
+    [
+        ("3.6.23", False),  # WAL(3.7.0) 이전
+        ("3.7.0", True),
+        ("3.37.2", True),  # CI sqlite-floor
+        ("3.44.5", True),
+        ("3.44.6", False),  # 백포트
+        ("3.44.99", False),
+        ("3.45.0", True),
+        ("3.46.1", True),  # 프로필 이미지 python:3.13-slim
+        ("3.50.6", True),
+        ("3.50.7", False),  # 백포트
+        ("3.50.99", False),
+        ("3.51.0", True),
+        ("3.51.2", True),
+        ("3.51.3", False),  # 수정
+        ("3.53.1", False),
+        ("4.0.0", False),
+        ("", None),
+        ("3.46", None),
+        ("3.46.x", None),
+        ("abc", None),
+        (None, None),
+    ],
+)
+def test_wal_reset_affected(version, affected):
+    assert wal_reset_affected(version) is affected
+
+
+# 자식 프로세스에서 실행 중인 SQLite 판을 흉내 낸다(진짜 판은 바꿀 수 없다).
+def fake_sqlite_version(version):
+    return (
+        "import django_sqlite_ops.doctor as _doctor\n"
+        "_read = _doctor._read_pragmas\n"
+        "def _fake(alias, keys):\n"
+        "    values = _read(alias, keys)\n"
+        f"    values['sqlite_version'] = {version!r}\n"
+        "    return values\n"
+        "_doctor._read_pragmas = _fake\n"
+    )
+
+
+def test_wal_reset_affected_version_is_reported_not_warned(tmp_path):
+    db = make_db(tmp_path / "app.sqlite3")
+    rc, data = doctor({"default": sqlite_database(db)}, prelude=fake_sqlite_version("3.46.1"))
+    item = one(data, "database", "default", "sqlite_version")
+    assert item["level"] == "ok"
+    assert item["value"] == "3.46.1"
+    assert "WAL-reset" in item["message"]
+    assert "3.51.3" in item["message"]
+    assert "https://sqlite.org/wal.html" in item["message"]
+    assert "patched" in item["message"]
+    assert problems(data) == []
+    assert rc == 0
+
+
+@pytest.mark.parametrize("version", ["3.51.3", "3.50.7", "3.44.6"])
+def test_wal_reset_fixed_version_has_no_message(tmp_path, version):
+    db = make_db(tmp_path / "app.sqlite3")
+    rc, data = doctor({"default": sqlite_database(db)}, prelude=fake_sqlite_version(version))
+    item = one(data, "database", "default", "sqlite_version")
+    assert (item["level"], item["value"], item["message"]) == ("ok", version, "")
+    assert rc == 0
+
+
+def test_wal_reset_text_output(tmp_path):
+    db = make_db(tmp_path / "app.sqlite3")
+    rc, out = doctor(
+        {"default": sqlite_database(db)},
+        json_output=False,
+        prelude=fake_sqlite_version("3.46.1"),
+    )
+    line = next(x for x in out.splitlines() if x.split()[:3] == ["OK", "default", "sqlite_version"])
+    assert "3.46.1  — " in line and "WAL-reset" in line
+    assert out.rstrip().splitlines()[-1].endswith("-> exit 0")
+    assert rc == 0
+
+
+def test_wal_reset_running_version(tmp_path):
+    """실행 중인 판(로컬 3.53.x, CI sqlite-floor 3.37.2)에 맞춰 단언한다."""
+    db = make_db(tmp_path / "app.sqlite3")
+    rc, data = doctor({"default": sqlite_database(db)})
+    item = one(data, "database", "default", "sqlite_version")
+    assert item["level"] == "ok"
+    assert bool(item["message"]) is bool(wal_reset_affected(sqlite3.sqlite_version))
+    assert rc == 0
 
 
 @pytest.mark.parametrize(

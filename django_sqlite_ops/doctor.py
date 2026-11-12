@@ -45,6 +45,7 @@ __all__ = [
     "mount_output_fstype",
     "nofile_items",
     "to_json",
+    "wal_reset_affected",
 ]
 
 SCHEMA_VERSION = 1
@@ -55,6 +56,19 @@ SECTIONS = ("settings", "database", "mount", "litestream", "channels", "process"
 _SYNCHRONOUS = {0: "OFF", 1: "NORMAL", 2: "FULL", 3: "EXTRA"}
 # 읽기 전용 별칭에는 의미가 없거나 따르면 연결이 깨지는 쓰기 권고(정적 체크 W001·W002 와 같은 원칙).
 _WRITE_KEYS = frozenset({"transaction_mode", "journal_mode", "synchronous"})
+
+# SQLite WAL-reset 버그(https://sqlite.org/wal.html#the_wal_reset_bug, 2026-11-12 확인).
+# 3.7.0 ~ 3.51.2 에 있고 3.51.3 에서 고쳐졌으며 3.44.6·3.50.7 로 백포트됐다.
+_WAL_RESET_DOC = "https://sqlite.org/wal.html#the_wal_reset_bug"
+_WAL_RESET_FIRST = (3, 7, 0)
+_WAL_RESET_FIXED = (3, 51, 3)
+# 백포트가 들어간 줄: (그 판, 다음 줄의 첫 판). 이 구간의 판은 영향 범위가 아니다.
+_WAL_RESET_BACKPORTS = (((3, 44, 6), (3, 45, 0)), ((3, 50, 7), (3, 51, 0)))
+_WAL_RESET_MESSAGE = (
+    "affected by the SQLite WAL-reset bug (3.7.0 through 3.51.2; fixed in 3.51.3, "
+    "backported to 3.44.6 and 3.50.7); a distribution may have patched it without "
+    f"changing the version; see {_WAL_RESET_DOC}"
+)
 
 _NETWORK_FS_DOC = "https://www.sqlite.org/useovernet.html"
 # 네트워크 파일시스템. SQLite 의 파일 잠금을 믿을 수 없고 WAL 은 동작하지 않는다.
@@ -127,6 +141,23 @@ class Item:
     value: Any = None
     expected: Any = None
     message: str = ""
+
+
+def wal_reset_affected(version: object) -> bool | None:
+    """SQLite 판 문자열이 WAL-reset 버그의 영향 범위인지. 판을 읽을 수 없으면 ``None``.
+
+    판 번호만 본다. 배포판이 판 번호를 바꾸지 않고 패치했을 수 있으므로 doctor 는 이 결과를
+    경고가 아니라 보고(``ok`` + 메시지)로만 쓴다(#103).
+    """
+    if not isinstance(version, str):
+        return None
+    parts = version.strip().split(".")
+    if len(parts) != 3 or not all(p.isdigit() for p in parts):
+        return None
+    v = tuple(int(p) for p in parts)
+    if not _WAL_RESET_FIRST <= v < _WAL_RESET_FIXED:
+        return False
+    return not any(low <= v < high for low, high in _WAL_RESET_BACKPORTS)
 
 
 def _one_line(text: object) -> str:
@@ -515,7 +546,11 @@ def _diagnose_alias(alias: str, target: _Target, rec: dict[str, Any]) -> list[It
             level = "ok" if actual == want else "warn"
             message = "" if level == "ok" else "differs from the recommended value (DESIGN §6-0)"
             items.append(Item(section, alias, key, level, actual, want, message))
-    items.append(Item(section, alias, "sqlite_version", "ok", values["sqlite_version"]))
+    version = values["sqlite_version"]
+    # journal_mode 와 무관하게 알린다. Litestream 은 복제를 시작하며 WAL 로 바꾸므로 진단 시점의
+    # 값이 운영 중의 값이 아닐 수 있고, 판은 프로세스 전체에 걸린 사실이다. 수준은 ok 다(#103).
+    note = _WAL_RESET_MESSAGE if wal_reset_affected(version) else ""
+    items.append(Item(section, alias, "sqlite_version", "ok", version, None, note))
     return items
 
 
