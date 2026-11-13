@@ -21,6 +21,7 @@ import signal
 import stat
 import subprocess
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 from .decide import LookupFailure, Remote, RemoteEmpty, RemoteError, RemoteTxid
@@ -29,6 +30,7 @@ __all__ = [
     "DEFAULT_LTX_TIMEOUT",
     "DEFAULT_RESTORE_TIMEOUT",
     "DEFAULT_VERSION_TIMEOUT",
+    "LtxSummary",
     "LtxWalRange",
     "VERIFIED_VERSIONS",
     "RestoreResult",
@@ -42,8 +44,10 @@ __all__ = [
     "parse_databases_json",
     "parse_ltx_json",
     "parse_version",
+    "remote_listing",
     "remote_max_txid",
     "restore",
+    "summarize_ltx_json",
     "verified_versions_text",
     "version",
 ]
@@ -270,6 +274,140 @@ def parse_ltx_json(stdout: str) -> Remote:
     return RemoteTxid(best)
 
 
+# 스냅샷 레벨(Litestream SnapshotLevel). 컴팩션된 끝을 정할 때 뺀다(summarize_ltx_json).
+_SNAPSHOT_LEVEL = 9
+
+
+@dataclass(frozen=True, slots=True)
+class LtxSummary:
+    """복제본 목록(``ltx -level all -json``)에서 본 컴팩션 진행(#115, DESIGN §7).
+
+    ``compacted_txid`` 는 레벨 1~8 의 최대 ``max_txid``(사실상 L1 의 끝, 없으면 0)다. L1 파일은
+    보존으로 지워질 때도 레벨의 마지막 파일이 남고(Litestream ``EnforceRetentionByTXID``), L2~L8 은
+    L(n−1) 에서만 만들어지므로 L1 끝보다 클 수 없다. L9(스냅샷)는 DB 의 현재 위치에서 새로
+    쓰이므로(``db.go`` ``WriteLTXFile(SnapshotLevel, 1, pos.TXID)``) 넣으면 컴팩션 정지를 가린다.
+    Litestream 자신도 L0 보존에서 L1 의 최대 TXID 를 '컴팩션된 끝'으로 본다
+    (``EnforceL0RetentionByTime``).
+
+    ``uncompacted`` 는 ``min_txid`` 가 그 끝보다 큰 L0 의 수, 시각은 UNIX 초다. 한 복제본 안의
+    시각은 같은 시계(S3 ``LastModified``·파일 mtime)라 서로 비교한다. 로컬 시계와는 비교하지
+    않는다. ``problem`` 이 있으면 판정할 수 없다는 뜻이다(고정 문장).
+    """
+
+    l0_files: int
+    compacted_txid: int
+    uncompacted: int
+    oldest_uncompacted_at: float | None
+    newest_at: float | None
+    problem: str | None = None
+
+    @property
+    def compaction_lag(self) -> float | None:
+        """가장 새 객체 시각 − 가장 오래된 미컴팩션 L0 시각(초). 미컴팩션 L0 가 없으면 0.
+
+        L0 는 계속 오는데 L1 이 오지 않으면 벽시계와 같은 속도로 는다. L0 기록까지 멈추면(새
+        객체가 없음) 늘지 않는다 — 그 경우는 로컬 근거(``db_not_replicated``)가 맡는다.
+        """
+        if self.problem is not None:
+            return None
+        if self.uncompacted == 0 or self.oldest_uncompacted_at is None or self.newest_at is None:
+            return 0.0
+        return max(self.newest_at - self.oldest_uncompacted_at, 0.0)
+
+
+def _parse_timestamp(value: object) -> float | None:
+    """RFC 3339(``2006-01-02T15:04:05Z07:00``) → UNIX 초. 시간대가 없거나 읽을 수 없으면 None."""
+    if type(value) is not str or not value:
+        return None
+    try:
+        parsed = datetime.fromisoformat(value)
+    except ValueError:
+        return None
+    if parsed.tzinfo is None:
+        return None
+    return parsed.timestamp()
+
+
+def _bad_summary(problem: str) -> LtxSummary:
+    return LtxSummary(0, 0, 0, None, None, problem)
+
+
+def summarize_ltx_json(stdout: str) -> LtxSummary:
+    """``litestream ltx -level all -json`` 의 stdout 을 컴팩션 요약으로 바꾼다(예외 없음).
+
+    ``parse_ltx_json()`` 과 같은 출력을 읽지만 boot 판정에는 쓰지 않는다: boot 는 시각이 필요
+    없고, 시각 형식이 조금 바뀌었다고 부팅을 막으면 안 된다. 항목 하나라도 시각을 읽을 수 없으면
+    ``problem`` 이 있는 요약이다(헬스가 ``caught_up`` 이라 하지 않는다).
+    """
+    try:
+        data = json.loads(_strip_log_lines(stdout))
+    except ValueError:
+        return _bad_summary("cannot parse litestream ltx output as JSON")
+    if type(data) is not list:
+        return _bad_summary("unexpected litestream ltx output: expected a list")
+    l0: list[tuple[int, float]] = []
+    compacted = 0
+    newest: float | None = None
+    for i, item in enumerate(data):
+        if type(item) is not dict:
+            return _bad_summary(f"unexpected litestream ltx output: item {i} is not an object")
+        level, lo, hi = item.get("level"), item.get("min_txid"), item.get("max_txid")
+        if type(level) is not int or not 0 <= level <= _SNAPSHOT_LEVEL:
+            return _bad_summary(f"unexpected litestream ltx output: item {i} has invalid level")
+        if type(lo) is not str or not _TXID_RE.fullmatch(lo):
+            return _bad_summary(f"unexpected litestream ltx output: item {i} has invalid min_txid")
+        if type(hi) is not str or not _TXID_RE.fullmatch(hi):
+            return _bad_summary(f"unexpected litestream ltx output: item {i} has invalid max_txid")
+        at = _parse_timestamp(item.get("timestamp"))
+        if at is None:
+            return _bad_summary(
+                f"unexpected litestream ltx output: item {i} has no readable timestamp"
+            )
+        newest = at if newest is None else max(newest, at)
+        if level == 0:
+            l0.append((int(lo, 16), at))
+        elif level < _SNAPSHOT_LEVEL:
+            compacted = max(compacted, int(hi, 16))
+    pending = [at for lo, at in l0 if lo > compacted]
+    return LtxSummary(len(l0), compacted, len(pending), min(pending, default=None), newest)
+
+
+def remote_listing(
+    db_path: str | os.PathLike[str],
+    *,
+    config: str | os.PathLike[str],
+    binary: str = "litestream",
+    timeout: float = DEFAULT_LTX_TIMEOUT,
+    version_timeout: float = DEFAULT_VERSION_TIMEOUT,
+) -> tuple[Remote, LtxSummary | None]:
+    """``remote_max_txid()`` 와 같은 조회 한 번으로 최대 TXID 와 컴팩션 요약을 함께 돌려준다.
+
+    요약은 조회가 성공해 TXID 가 있을 때만 있다(실패·빈 목록이면 ``None``). 헬스가 쓴다(#115).
+    """
+    problem = check_version(binary=binary, timeout=version_timeout)
+    if problem is not None:
+        return RemoteError(problem.message, problem.failure, problem.detail), None
+    argv = [
+        binary,
+        "ltx",
+        "-config",
+        os.fspath(config),
+        "-level",
+        "all",
+        "-json",
+        os.fspath(db_path),
+    ]
+    run = _run(argv, timeout)
+    if isinstance(run, str):
+        return RemoteError(run), None
+    if run.rc != 0:
+        return RemoteError(_failure("ltx", run)), None
+    remote = parse_ltx_json(run.stdout)
+    if type(remote) is not RemoteTxid:
+        return remote, None
+    return remote, summarize_ltx_json(run.stdout)
+
+
 def remote_max_txid(
     db_path: str | os.PathLike[str],
     *,
@@ -286,25 +424,9 @@ def remote_max_txid(
     주의(0.5.17·0.5.18 실측): 복제본 경로가 없거나 비어 있어도 rc 0 과 ``[]`` 다. 둘은 출력으로
     구분되지 않으므로 둘 다 ``RemoteEmpty`` 다. 설정에 없는 DB·설정 파일 없음·접근 불가는 rc 1.
     """
-    problem = check_version(binary=binary, timeout=version_timeout)
-    if problem is not None:
-        return RemoteError(problem.message, problem.failure, problem.detail)
-    argv = [
-        binary,
-        "ltx",
-        "-config",
-        os.fspath(config),
-        "-level",
-        "all",
-        "-json",
-        os.fspath(db_path),
-    ]
-    run = _run(argv, timeout)
-    if isinstance(run, str):
-        return RemoteError(run)
-    if run.rc != 0:
-        return RemoteError(_failure("ltx", run))
-    return parse_ltx_json(run.stdout)
+    return remote_listing(
+        db_path, config=config, binary=binary, timeout=timeout, version_timeout=version_timeout
+    )[0]
 
 
 # --- 설정의 DB 목록 -------------------------------------------------------------------

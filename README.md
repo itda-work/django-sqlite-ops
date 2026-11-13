@@ -48,6 +48,7 @@ Litestream 만 쓰면 옛 볼륨으로 재부팅했을 때 최신 복제본이 �
 | L6 복원 도중 kill | 반쯤 옮겨진 상태 없음, 재실행으로 완료 |
 | L7 복제본 객체 손상 | exit 4, 로컬 파일 무변경 |
 | L8 S3 끊김 중 헬스 | 업로드만 끊기면 `backlog`, 조회까지 끊기면 `unknown`. 복구 뒤 `caught_up` |
+| L9 복제 파이프라인 정지 중 헬스(#115) | 로컬 L0 손상으로 컴팩션이 멈추면 `backlog`(`compaction_stalled`), Litestream 만 죽으면 `backlog`(`db_not_replicated`) |
 
 ## 현재 상태
 
@@ -62,7 +63,7 @@ PyPI 에 **실험적 사전 릴리스**로 배포한다([D-28](docs/DECISIONS.md
 | [복제 헬스](#복제-헬스) | 구현됨 | [#7](https://github.com/itda-work/django-sqlite-ops/issues/7) |
 | [channels-lite 패치](#channels-lite-패치) | 구현됨 | [#8](https://github.com/itda-work/django-sqlite-ops/issues/8) |
 | [배포 프로필 문서](#배포-프로필) | 구현됨 | [#9](https://github.com/itda-work/django-sqlite-ops/issues/9) |
-| 회귀 랩(Docker 로 실패 경계 L1–L8 재현, 프로필 Dockerfile·compose 종단 검증, PRAGMA 벤치). 수동 실행(`scripts/lab.sh`, GitHub Actions `lab.yml`), 기본 CI 밖. arm64·amd64 모두 통과 | 구현됨 | [#10](https://github.com/itda-work/django-sqlite-ops/issues/10) · [lab/README.md](lab/README.md) · [결과](docs/research/lab-2026-10-08.md) |
+| 회귀 랩(Docker 로 실패 경계 L1–L9 재현, 프로필 Dockerfile·compose 종단 검증, PRAGMA 벤치). 수동 실행(`scripts/lab.sh`, GitHub Actions `lab.yml`), 기본 CI 밖. arm64·amd64 모두 통과 | 구현됨 | [#10](https://github.com/itda-work/django-sqlite-ops/issues/10) · [lab/README.md](lab/README.md) · [결과](docs/research/lab-2026-10-08.md) |
 | [복원 검증](#복원-검증---restore-test) `sqlite_doctor --restore-test` | 구현됨 | [#52](https://github.com/itda-work/django-sqlite-ops/issues/52)(설계) · [#54](https://github.com/itda-work/django-sqlite-ops/issues/54) · [DESIGN §6-2](docs/DESIGN.md#6-2-sqlite_doctor-명시-실행-실제-연결) |
 | VFS 읽기 복제본용 DB 라우터 | 예정(2단계) | [DESIGN §3-2](docs/DESIGN.md#3-2-2단계-이후) |
 
@@ -692,10 +693,11 @@ python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream
 
 ### 복제 헬스
 
-"지금 복제가 따라오는가"를 `caught_up / backlog / unknown` 으로 보고하는 JSON 엔드포인트다. Litestream 은 S3 가 끊겨도 로그·`status`·메트릭에 아무것도 남기지 않을 수 있으므로(실측 D3: 0.5.17 은 0줄. 0.5.18 은 연결 거부 때만 ERROR 줄을 남기고 응답 없는 S3 에는 0줄이다, #99), 헬스는 Litestream 의 자기 보고 대신 두 가지를 직접 본다.
+"지금 복제가 따라오는가"를 `caught_up / backlog / unknown` 으로 보고하는 JSON 엔드포인트다. Litestream 은 S3 가 끊겨도 로그·`status`·메트릭에 아무것도 남기지 않을 수 있으므로(실측 D3: 0.5.17 은 0줄. 0.5.18 은 연결 거부 때만 ERROR 줄을 남기고 응답 없는 S3 에는 0줄이다, #99), 헬스는 Litestream 의 자기 보고 대신 세 가지를 직접 본다.
 
 1. **TXID 비교 (로컬 L0 → 복제본)** — 로컬 메타의 최대 TXID(`.<db>-litestream/ltx/0/`)와 복제본의 최대 TXID(`litestream ltx -level all -json`). 업로드가 막히면(S3 끊김) 로컬이 앞선다.
 2. **WAL 위치 비교 (DB → 로컬 L0)** — 최신 로컬 L0 파일의 헤더에는 그 L0 가 원래 WAL 의 어디까지를 담았는지(WAL 오프셋·크기·salt)가 있다. 현재 `-wal` 파일의 헤더와 프레임 헤더를 읽어(salt·누적 체크섬이 맞는 프레임만) 그 위치 **뒤에 커밋이 있는지** 본다. Litestream 자신도 다음 동기화를 이 위치에서 이어 간다. `litestream replicate` 가 죽거나 멈추면 TXID 는 로컬·원격이 같은 채로 멈춰 1 만으로는 그 뒤의 쓰기가 보이지 않는데, 2 가 그것을 잡는다.
+3. **컴팩션 진행 (복제본 L0 → L1)** — 1 과 같은 `ltx -level all -json` 출력에서, L1 이 아직 덮지 않은 가장 오래된 L0 가 복제본의 가장 새 객체보다 얼마나 오래됐는지 본다(추가 조회 없음). 로컬 L0 하나가 깨지면 L1 컴팩션만 멈추고 L0 업로드는 계속되어 1·2 는 정상으로 보인다(#106·#115 재현함). 3 이 그것을 잡는다.
 
 **DB 연결을 열지 않는다.** 모두 파일 읽기(`-wal` 은 읽기 전용으로 열어 헤더만)와 `litestream` 명령으로만 본다.
 
@@ -718,6 +720,7 @@ SQLITE_OPS = {
         },
         "REFRESH": 15,  # 초, 원격 조회 주기 (기본 15)
         "BACKLOG_GRACE": 60,  # 초, 로컬이 앞선 상태를 backlog 로 볼 때까지 (기본 60)
+        "COMPACTION_GRACE": 300,  # 초, 컴팩션 지연을 backlog 로 볼 때까지 (기본 300, None 이면 끔)
     },
 }
 ```
@@ -772,13 +775,17 @@ urlpatterns = [
 | `caught_up` | `local_ahead_within_grace` | 로컬 TXID 가 앞서 있지만 아직 올라가지 않은 TXID 가 기다린 시간이 `BACKLOG_GRACE` 보다 짧음(정상 업로드 지연). `backlog_since` 가 함께 나온다 |
 | `caught_up` | `db_changed_within_grace` | `-wal` 에 최신 L0 뒤의 커밋이 있지만 `BACKLOG_GRACE` 보다 짧음(Litestream 이 곧 L0 를 쓴다). `pending_since` 가 함께 나온다 |
 | `backlog` | `local_ahead` | 아직 올라가지 않은 로컬 TXID 가 `BACKLOG_GRACE` 이상 기다림. 업로드가 막혔거나 쓰기를 못 따라간다(S3 끊김, 자격 증명 만료) |
-| `backlog` | `db_not_replicated` | `-wal` 에 최신 L0 뒤의 커밋이 `BACKLOG_GRACE` 이상 남아 있음(또는 WAL 근거가 없을 때 파일 시각이 그만큼 L0 보다 새로움). `litestream replicate` 가 죽었거나 멈췄을 수 있다 |
+| `backlog` | `db_not_replicated` | 최신 로컬 L0 가 그대로인 채 `-wal` 에 그 뒤의 커밋이 `BACKLOG_GRACE` 이상 남아 있음(WAL 근거가 없는 표본에서는 파일 시각이 그만큼 L0 보다 새로움 — 두 근거가 번갈아 나와도 이어서 센다). `litestream replicate` 가 죽었거나 멈췄거나, 최신 로컬 L0 가 깨져 sync 가 멈췄을 수 있다(0.5.17) |
+| `backlog` | `compaction_stalled` | 다른 판정이 `caught_up` 인데, L1 이 덮지 않은 가장 오래된 원격 L0 가 가장 새 원격 객체보다 `COMPACTION_GRACE` 이상 오래됨. L1 컴팩션이 멈췄다(로컬 L0 손상 등). 복원은 아직 되지만 L0 가 쌓이며 복제본이 커진다. 사유에 미컴팩션 L0 수와 L1 끝 TXID 가 나온다. Litestream 로그의 `compaction failed` 를 본다 |
 | `unknown` | `no_wal_evidence` | `-wal` 로 판정할 수 없음: `-wal` 이 없거나(마지막 연결이 닫혀 지워짐) 비었음, L0 이후 WAL 이 다시 시작됐는데 아직 커밋이 없음 등. **이때는 `caught_up` 으로 단정하지 않는다** |
+| `unknown` | `no_compaction_evidence` | 다른 판정이 `caught_up` 인데 `ltx` 출력의 `timestamp` 를 읽을 수 없어 컴팩션 진행을 판정할 수 없음(검증한 판에서는 나오지 않는다 — 형식이 바뀐 경우의 방어) |
 | `unknown` | `file_time_backwards` | WAL 근거가 없는데 DB·`-wal`·L0 의 파일 시각이 앞선 관측보다 뒤로 감(시계 변경 등) |
 | `unknown` | `db_missing` · `db_empty` · `db_not_regular` · `db_stat_failed` | DB 본 파일이 없음 · 0바이트 · 정규 파일이 아님(디렉터리 등) · 상태를 읽을 수 없음. `-wal`·Litestream 메타·복제본이 맞아도 그것이 붙을 DB 가 없으므로 정상이 아니다. 아래 [DB 본 파일](#db-본-파일-상태) 참고 |
 | `unknown` | `remote_error` · `remote_empty` · `no_local_meta` · `remote_ahead` · `unknown_at_boot` · `path_not_real` · `not_file_db` · `refresh_failed` · `not_checked` · `stale` | 판정할 수 없음: 원격 조회 실패, 복제본이 빈 목록(경로·prefix 오타와 구분되지 않는다), 로컬 메타 없음(`litestream replicate` 가 돌지 않음), **복제본이 로컬보다 앞섬**(다른 기계가 같은 복제본에 쓰는 중일 수 있다), 부팅 상태 파일의 `unknown_at_boot`(boot 가 `--on-unknown keep-local` 로 진행함), [경로 규칙](#경로-규칙) 위반, 파일 DB 가 아님, 갱신 중 예외, 아직 첫 조회 전, 마지막 결과가 `REFRESH × 3` 보다 오래됨(갱신 스레드가 멈춤) |
 
 `local_ahead` 의 backlog 시간은 **처음 관측한 미업로드 로컬 TXID 가 원격에 올라가기까지 기다린 시간**이다. 가장 오래된 미업로드 커밋의 엄밀한 나이나 로컬·원격의 총 격차가 아니다.
+
+**`backlog` 는 "복제 파이프라인이 제때 진행하지 않는 것을 안다"는 뜻이다** — 업로드 지연(`local_ahead`), L0 기록 지연(`db_not_replicated`), 컴팩션 정지(`compaction_stalled`). 데이터는 아직 복제본에 있지만 그대로 두면 나빠진다. `caught_up` 은 "TXID·WAL 위치가 맞고 **파이프라인이 멈췄다는 근거가 없다**"이다. 한계: 쓰기가 없는 동안 Litestream 이 죽은 것은 `caught_up` 으로 남는다(복제할 것이 없다). 다음 쓰기에서 `BACKLOG_GRACE` 안에 `db_not_replicated` 로 드러난다.
 
 `code` 는 고정된 값이라 알람 규칙에 쓸 수 있다. 설정이 없거나 틀리면 최상위에 `code`(`not_configured`·`invalid_config`)와 `reason` 이 붙는다.
 
@@ -786,7 +793,7 @@ urlpatterns = [
 - 판정: 현재 `-wal` 의 salt 가 최신 L0 의 salt 와 같으면, L0 끝(`WALOffset + WALSize`) 뒤에 유효한 커밋 프레임이 있으면 pending, 없으면 in_sync. salt 가 다르면(L0 이후 WAL 이 다시 시작됨) 새 salt 의 커밋이 있으면 pending, 없으면 판정할 수 없음.
 - 프레임은 salt 와 누적 체크섬이 맞을 때만 센다(SQLite 의 복구 규칙과 같다). 쓰다 만 프레임은 커밋으로 세지 않는다. L0 끝 뒤의 프레임만, 첫 커밋까지만 읽는다(한 번에 최대 64 MiB).
 - 잠금 없이 읽으므로 읽는 도중 체크포인트가 `-wal` 을 비우거나 다시 시작할 수 있다. 그래서 "L0 뒤 커밋 없음"이라고 답하기 전에 처음 연 `-wal` 이 그대로인지(같은 파일, 같은 크기, 같은 헤더) 다시 보고, 바뀌었으면 한 번만 다시 읽는다. 그래도 바뀌면 판정하지 않는다(`no_wal_evidence`).
-- pending 지속 시간은 처음 관측한 때부터 monotonic 으로 세고, 최신 L0 의 WAL 위치가 바뀌면(Litestream 이 진행 중) 다시 센다. 쓰기가 계속되는 바쁜 DB 도 Litestream 이 살아 있으면 `backlog` 가 되지 않는다(실측: 30ms 간격 쓰기 30초, 0.5초마다 판정, grace 3초에서 모두 `caught_up`).
+- pending 지속 시간은 처음 관측한 때부터 monotonic 으로 세고, 최신 L0 가 바뀌면(Litestream 이 진행 중) 다시 센다. 최신 L0 가 그대로이면 WAL 근거와 파일 시각 근거가 번갈아 나와도 이어서 센다(#115 — 요청마다 연결을 닫는 앱에서 Litestream 이 없으면 `-wal` 이 지워졌다 생기며 두 근거가 번갈아 나온다. 예전에는 그때마다 다시 세어 `backlog` 가 되지 않았다, #106 재현함). 쓰기가 계속되는 바쁜 DB 도 Litestream 이 살아 있으면 `backlog` 가 되지 않는다(실측: 30ms 간격 쓰기 30초, 0.5초마다 판정, grace 3초에서 모두 `caught_up`).
 - Litestream 이 도는 동안에는 Litestream 이 연결을 쥐고 있어 `-wal` 이 남으므로 이 근거가 늘 있다.
 
 **보조 근거: 파일 시각** — WAL 로 판정할 수 없을 때만 쓴다(주로 Litestream 이 멈춘 뒤 앱의 마지막 연결이 닫혀 `-wal` 이 지워졌을 때).
@@ -794,6 +801,13 @@ urlpatterns = [
 - Litestream 이 멈춰 있으면 앱의 마지막 연결이 닫힐 때의 체크포인트(읽기만 했어도)와 `replicate -once` 의 종료가 DB mtime 을 바꾼다(실측). 그래서 이 경로의 `db_not_replicated` 는 "DB 가 쓰이는데 Litestream 이 진행하지 않는다"는 뜻이다.
 - 파일 시각이 앞선 관측보다 뒤로 가면(벽시계 역행, 파일 복사) `unknown`(`file_time_backwards`)이고 앞선 근거를 지우지 않는다. 다른 프로세스가 DB 파일을 `touch`·복사·덮어쓰면 이 경로는 틀릴 수 있다.
 - 드문 경우: Litestream 이 도는데 `-wal` 이 TRUNCATE 체크포인트로 0바이트가 되고 그 뒤 쓰기가 없으면(기본 설정에서는 WAL 이 약 500MB 를 넘을 때만) 다음 쓰기까지 `unknown` 이거나, 파일 시각 때문에 grace 뒤 `backlog` 로 보일 수 있다.
+
+**컴팩션 진행** (#115, Litestream 0.5.17·0.5.18 소스·실측):
+- 컴팩션 지연 = 복제본의 가장 새 객체 시각 − L1 이 덮지 않은 가장 오래된 L0 의 시각. 'L1 이 덮은 끝'은 레벨 1~8 의 최대 TXID 다(Litestream 자신도 L0 보존에서 L1 의 최대 TXID 를 쓴다). 스냅샷(L9)은 DB 의 현재 위치에서 새로 쓰이므로 넣지 않는다 — 넣으면 하루 한 번 정지를 가린다.
+- 시각은 복제본 안의 시각끼리만 비교한다(S3 `LastModified`·파일 mtime). 로컬 시계와 비교하지 않으므로 시계 차이·앱 재시작과 무관하다.
+- 정상 지연은 L1 주기에 묶인다: 기본 L1 30초에서 3~27초 톱니(0.5.17 로컬 파일 복제본, 쓰기 1회/초 — [기록](docs/research/lab-2026-11-13-health-pipeline-stall.md)). 컴팩션이 멈추면 벽시계와 같은 속도로 늘어 기본 `COMPACTION_GRACE` 300초를 정지 뒤 약 5분에 넘는다.
+- **Litestream 의 `levels` 에서 L1 `interval` 을 바꿨다면 `COMPACTION_GRACE` 를 그 10배 이상으로 둔다.** 헬스는 Litestream 설정을 읽지 않는다. L1 을 5분 이상으로 두면 기본값에서 `compaction_stalled` 가 오경보한다(코드상 예상, 미검증). 끄려면 `None`.
+- L0 기록까지 멈추면(새 객체가 없음) 이 지연은 늘지 않는다. 그 경우는 위 WAL 근거가 `db_not_replicated` 로 잡는다.
 
 - **전체 `status` 는 별칭 중 가장 나쁜 것**이다(`unknown` > `backlog` > `caught_up`). `unknown` 이 가장 나쁜 이유: 복제가 따라오는지조차 말할 수 없다는 뜻이라, 뒤처진 것을 아는 `backlog` 보다 더 큰 문제를 감출 수 있다.
 - **요청마다 S3 를 부르지 않는다.** 프로세스마다 데몬 스레드 하나가 `REFRESH` 초마다 조회하고 뷰는 마지막 결과를 읽기만 한다. 스레드는 **첫 헬스 요청 때** 시작하므로 배포 직후 첫 응답은 `unknown`("not checked yet")이다. 관리 명령·마이그레이션에서는 스레드가 돌지 않는다. gunicorn `--preload` 처럼 포크하는 서버에서도 워커마다 PID 를 보고 다시 시작한다.
@@ -991,10 +1005,10 @@ SQLite 공식 문서([wal.html §11](https://sqlite.org/wal.html#the_wal_reset_b
 |---|---|---|---|
 | S3 가 끊겼는데 Litestream 로그·`status`·메트릭이 조용하다 | Litestream 은 업로드 실패를 드러내지 않는다. `litestream status` 는 로컬만 보아 두 판 모두 rc 0·`ok` 이고, 메트릭의 `litestream_sync_error_count` 도 0 그대로다(`sync` 는 로컬 단계). 로그는 0.5.18 이 연결 거부에만 ERROR 줄을 남기고 무응답에는 두 판 모두 0줄이다 | 헬스 본문 `status` 로 알람을 건다([복제 헬스](#복제-헬스)) | 실측([docker D3](docs/research/litestream-django-docker.md#d3-관측-조용한-실패-위험)), 재현함(0.5.17·0.5.18 의 `status`·메트릭, [#105](docs/research/lab-2026-11-12-litestream-pitfalls-0.5.18.md#9-s3-단절-중-litestream-status-와-메트릭)) |
 | S3 가 통째로 끊긴 동안 헬스가 `backlog` 가 아니라 `unknown`(`stale` 또는 `remote_error`) | 헬스의 원격 조회도 같은 S3 로 간다. 조회가 끝나지 않는 동안(무응답이면 30초 타임아웃까지, 연결 거부는 0.5.17 30초·0.5.18 약 7초) 결과가 `REFRESH × 3` 보다 오래되어 `stale`, 끝나면 `remote_error` 다. 업로드만 끊기고 조회가 되면 `backlog`(`local_ahead`)다 | 둘 다 알람 대상으로 둔다(`caught_up` 이 아니면 경보) | 재현함(회귀 랩 L8a·L8b) |
-| 헬스는 `caught_up` 인데 원격 L0 가 계속 늘고 Litestream 로그에 `compaction failed` 가 30초마다 나온다 | 로컬 L0 하나가 깨지면 L1 컴팩션이 계속 실패한다. L0 업로드는 계속되어 로컬·원격 TXID 가 같으므로 헬스는 `caught_up` 이다 | 헬스로는 잡히지 않는다. Litestream 의 `level=ERROR` 줄이나 복제본의 L0 개수를 따로 본다 | 재현함(#106, 0.5.17·0.5.18, 로컬 L0 손상 주입 8분에 L0 21 → 440~449개, [기록](docs/research/lab-2026-11-12-wal-autocheckpoint.md#q4-컴팩션이-멈추면-원격-l0-가-쌓이고-그때-헬스는-무엇을-말하는가)) |
+| 헬스가 `backlog`(`compaction_stalled`)이고 Litestream 로그에 `compaction failed` 가 30초마다 나온다 | 로컬 L0 하나가 깨지면 L1 컴팩션이 계속 실패한다. L0 업로드는 계속되어 로컬·원격 TXID 는 같다(예전 헬스는 `caught_up` 이었다, #115 에서 고침). 원격 L0 가 쓰기 빈도에 비례해 쌓인다. **최신** 로컬 L0 가 깨진 경우는 판마다 다르다: 0.5.17 은 sync 도 멈춰(`sync error … last page match`) `db_not_replicated`, 0.5.18 은 마지막 페이지를 메모리에서 비교해 sync 가 계속되므로 `compaction_stalled` 다 | 로컬 메타(`.<db>-litestream/`)의 깨진 L0 를 확인한다. 앱을 멈춘 뒤 boot `--on-unknown restore` 로 복제본에서 다시 시작하는 것이 안전하다(복원은 L0 사슬로 아직 된다 — #106). L1 주기를 바꿨다면 `COMPACTION_GRACE` 를 맞춘다 | 재현함(#106 랩 0.5.17·0.5.18, #115 로컬 실제 바이너리 두 판·랩 L9a 두 판, [기록](docs/research/lab-2026-11-13-health-pipeline-stall.md)). 0.5.18 의 차이는 `db.go` `lastLTXPage`(코드상 확인). 이전 기록: (#106, 0.5.17·0.5.18, 로컬 L0 손상 주입 8분에 L0 21 → 440~449개, [기록](docs/research/lab-2026-11-12-wal-autocheckpoint.md#q4-컴팩션이-멈추면-원격-l0-가-쌓이고-그때-헬스는-무엇을-말하는가)) |
 | 배포 직후 헬스가 `unknown`(`not_checked`) | 갱신 스레드는 첫 헬스 요청 때 시작한다 | `REFRESH`(기본 15초) 뒤 다시 본다 | 코드상 확인(`health.py`) |
 | 헬스가 `backlog` 인데 HTTP 200 이다 | 설계상 항상 200 이다. 복제 지연으로 로드밸런서가 앱을 빼면 안 된다 | 본문 `status` 로 알람. HTTP 코드만 보는 모니터는 `?strict=1`(로드밸런서에는 쓰지 않는다) | 코드상 확인(`health.py`) |
-| 헬스가 `unknown`(`no_wal_evidence`) | `-wal` 이 없거나 비어 WAL 위치로 판정할 수 없다. Litestream 이 돌면 `-wal` 이 남는다 | `litestream replicate` 가 도는지 본다 | 코드상 확인(`health.py`) |
+| 헬스가 `unknown`(`no_wal_evidence`) | `-wal` 이 없거나 비어 WAL 위치로 판정할 수 없다. Litestream 이 돌면 `-wal` 이 남는다. 요청마다 연결을 닫는 앱에서 Litestream 이 없으면 `-wal` 이 지워졌다 생겨 이 값이 잠깐씩 나오고, 최신 L0 가 그대로이므로 `BACKLOG_GRACE` 뒤 `backlog`(`db_not_replicated`)가 된다(#115 전에는 `caught_up` 과 이 값을 오갔다) | `litestream replicate` 가 도는지 본다 | 코드상 확인(`health.py`), 재현함(#106 Q3 dead, #115 랩 L9b) |
 | 헬스가 `unknown`(`remote_ahead`) | 복제본이 로컬보다 앞섰다. 다른 머신이 같은 복제본에 쓰는 중일 수 있다 | 쓰는 머신이 1대인지 확인한다. 두 머신이 쓰면 나중 쪽이 경고 없이 이긴다 | 실측(scenarios S2b) |
 | 헬스가 `unknown`(`db_missing`·`db_empty`) | DB 본 파일이 없거나 0바이트다. `-wal`·메타가 남아 예전에는 `caught_up` 으로 보였다 | [DB 본 파일 상태](#db-본-파일-상태)의 대처를 따른다 | 재현함(#40, 실제 Litestream 0.5.17) |
 | 헬스가 계속 `unknown`(`unknown_at_boot`) | boot 가 `--on-unknown keep-local` 로 진행했다 | 원인을 푼 뒤 옵션 없이 다시 부팅한다 | 코드상 확인(`health.py`) |
@@ -1022,7 +1036,7 @@ scripts/ci-local.sh                 # GitHub Actions CI 를 act 로 로컬 실�
 scripts/ci-local.sh test 3.15 6.1   # 매트릭스 한 칸만 (python, django — 3.15 × 5.2 칸은 없다)
 scripts/ci-local.sh litestream      # 실제 litestream 바이너리 + channels-lite[aio]==0.4.0 으로 통합 테스트 (둘 중 하나가 없어 skip 되면 실패)
 
-scripts/lab.sh run all              # 회귀 랩 L1–L8·프로필 종단 검증 (Docker, 약 8분, 끝나면 down -v)
+scripts/lab.sh run all              # 회귀 랩 L1–L9·프로필 종단 검증 (Docker, 약 19분, 끝나면 down -v)
 scripts/lab.sh bench                # PRAGMA 벤치 (lab/README.md)
 scripts/lab.sh dbconfig             # Django 기본 대 권장 설정 비교 (약 25분, #83)
 
