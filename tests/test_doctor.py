@@ -296,14 +296,18 @@ def test_text_output(tmp_path):
         ("3.44.6", False),  # 백포트
         ("3.44.99", False),
         ("3.45.0", True),
-        ("3.46.1", True),  # 프로필 이미지 python:3.13-slim
+        ("3.46.1", True),  # python:3.13-slim(Debian trixie, #117 전의 프로필 이미지)
         ("3.50.6", True),
         ("3.50.7", False),  # 백포트
         ("3.50.99", False),
         ("3.51.0", True),
         ("3.51.2", True),
         ("3.51.3", False),  # 수정
-        ("3.53.1", False),
+        # 철회된 3.52.0(2026-03-06)도 수정(trunk check-in 7168988acb, 2026-03-03)을 조상으로 둔다
+        # (sqlite.org timeline, 2026-11-13 확인 #117).
+        ("3.52.0", False),
+        ("3.53.0", False),  # Litestream 0.5.17·0.5.18 이 품은 판(modernc.org/sqlite v1.49.1)
+        ("3.53.1", False),  # uv 가 받는 Python(python-build-standalone), #117 의 프로필 이미지
         ("4.0.0", False),
         ("", None),
         ("3.46", None),
