@@ -5,5 +5,6 @@ ARG BASE
 FROM ${BASE}
 USER root
 COPY requirements-nats.txt ./
-RUN pip install --no-cache-dir -r requirements-nats.txt
+# 문서 이미지에는 pip 가 없고 패키지는 /opt/venv 에 uv 로 넣는다(#117).
+RUN uv pip install -r requirements-nats.txt
 USER app

@@ -84,4 +84,4 @@
 - 이 호스트의 Docker(colima)에는 다른 프로젝트 컨테이너가 돈다. 랩 자원은 `lab/README.md` 의 규칙(프로젝트 이름 `dso-lab*`, 라벨 `io.itda.dso-lab=1`, `down -v` 만)으로만 다룬다.
 - `cache_size` 를 올리면 상한에 닿기 전에는 pcache 가 버퍼를 재활용하지 않는다. 측정에서는 연결당 요청 1~10개의 혼합 부하·여러 연결이 쓰는 재사용 연결에서 나빠지고, 같은 연결에서 같은 페이지를 다시 읽으면 좋아졌다(#27). 부하에 따라 방향이 바뀌므로 단정하지 않는다.
 - 표준 `sqlite3` 로 연결을 열고 닫는 측정에서 다른 연결이 없으면 close 가 매번 '마지막 연결 닫기'라 체크포인트·`-wal` 삭제가 끼어든다. 랩의 Litestream 대역으로 연결 하나를 열어 둔다(#27).
-- macOS 의 uv Python 은 SQLite 를 정적으로 넣는다. ctypes `CDLL(None)` 은 시스템 사본(3.51.0)을 잡아 `sqlite3_status` 가 0 이다. Linux 랩 이미지에서는 `libsqlite3.so.0` 이 같은 인스턴스다(#27).
+- macOS 의 uv Python 은 SQLite 를 정적으로 넣는다. ctypes `CDLL(None)` 은 시스템 사본(3.51.0)을 잡아 `sqlite3_status` 가 0 이다. `python:3.13-slim` 시절의 Linux 랩 이미지에서는 `libsqlite3.so.0` 이 같은 인스턴스였다(#27). #117 부터 랩 이미지의 Python 은 uv 의 정적 SQLite(3.53.1)라 ctypes 로 닿지 않는다 — `cache` 의 메모리 통계가 빈다(2026-11-13 재현함).

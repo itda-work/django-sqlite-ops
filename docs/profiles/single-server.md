@@ -136,12 +136,29 @@ dbs:
 
 Litestream 은 공식 설치 방법(릴리스 `.deb` + `dpkg`, https://litestream.io/install/linux/)으로 넣고, 같은 릴리스의 `checksums.txt` 와 SHA-256 이 맞을 때만 설치한다. CI 의 `litestream` 잡과 같은 방식이다.
 
-> **종단 검증함**(회귀 랩 P1, [`lab-2026-10-08.md`](../research/lab-2026-10-08.md)). 이 Dockerfile 을 그대로 빌드해(`python:3.13-slim`, linux/arm64 와 linux/amd64) 아래 compose 로 띄우고 첫 배포·`check --deploy`·`sqlite_doctor`·정지·재부팅을 확인했다. 랩은 `requirements.txt` 의 패키지 줄만 작업 트리 wheel 로 바꾼다.
+Python 은 Debian 패키지나 공식 `python:*-slim` 이미지가 아니라 **uv 가 받는 Python**(python-build-standalone)을 쓴다. 이 Python 은 SQLite 를 정적으로 품고 있고, 그 판(3.53.1, 2026-11-13 확인)은 [WAL-reset 버그](https://sqlite.org/wal.html#the_wal_reset_bug)가 고쳐진 판이다. 빌드 중에 SQLite 판을 확인해 3.51.3 미만이면 빌드를 멈춘다(`RUN python -c ...` 줄).
 
-> **이 이미지의 SQLite 와 WAL-reset 버그.** `python:3.13-slim`(Debian 기반)의 Python 은 SQLite 3.46.1 을 쓴다(랩 기록, 2026-10). SQLite 공식 문서가 적은 [WAL-reset 버그](https://sqlite.org/wal.html#the_wal_reset_bug)의 영향 범위(3.7.0~3.51.2, 3.51.3 에서 수정, 3.44.6·3.50.7 로 백포트) 안이다. 이 프로필(WAL + Litestream 의 체크포인트)은 버그의 조건(연결 둘 이상이 쓰기·체크포인트를 같은 순간에)에 해당한다. SQLite 는 발생률이 매우 낮고 긴급하지 않다고 평가한다. `sqlite_doctor` 는 `sqlite_version` 줄에 이 사실을 메시지로 적지만 수준은 `ok` 이고 종료 코드(exit 0)는 그대로다. Debian 의 백포트 여부는 미확인이다(2026-11-12, [README](../../README.md#sqlite-wal-reset-버그)).
+> **종단 검증함**(회귀 랩 P1, [`lab-2026-11-13-profile-image.md`](../research/lab-2026-11-13-profile-image.md)). 이 Dockerfile 을 그대로 빌드해(`debian:trixie-slim` + uv 0.13.8 의 Python 3.14, SQLite 3.53.1) 아래 compose 로 띄우고 첫 배포·`check --deploy`·`sqlite_doctor`·정지·재부팅을 확인했다. 랩은 `requirements.txt` 의 패키지 줄만 작업 트리 wheel 로 바꾼다. `python:3.13-slim` 기반의 앞선 판은 [`lab-2026-10-08.md`](../research/lab-2026-10-08.md) 에서 linux/arm64·amd64 로 검증했다.
+
+> **SQLite 판과 보안 업데이트.**
+> - 이 이미지의 Python 은 SQLite 3.53.1 을, Litestream 0.5.17·0.5.18 은 자체 내장 SQLite 3.53.0(modernc.org/sqlite v1.49.1)을 쓴다. 둘 다 WAL-reset 버그가 고쳐진 판이다(#117, 2026-11-13 확인). `sqlite_doctor` 의 `sqlite_version` 줄에 WAL-reset 메시지가 붙지 않는다.
+> - `debian:trixie-slim` 에는 Debian 의 `libsqlite3-0`(3.46.1)이 그대로 남아 있지만, Python 도 Litestream 도 그것을 쓰지 않는다.
+> - Python·SQLite·OpenSSL 은 uv 의 Python 빌드에 함께 들어 있다. 그래서 이 셋은 `apt` 업데이트가 아니라 **uv 판을 올리고 다시 빌드할 때** 갱신된다(`COPY --from=ghcr.io/astral-sh/uv:<판>`). uv 판은 [GitHub releases](https://github.com/astral-sh/uv/releases) 에서 확인한다. 다른 Debian 패키지는 기준 이미지를 다시 받아 빌드하면 갱신된다.
+> - Python 판은 `ARG PYTHON_VERSION`(기본 3.14)으로 바꾼다. 지원 범위는 3.13·3.14·3.15 이고, 3.15 는 Django 6.1.3 이상과만 쓴다([README](../../README.md#설치)).
+
+> **공식 `python:*-slim` 이미지를 계속 쓴다면.** `python:3.13-slim`·`3.14-slim`·`3.15-slim`(Debian trixie)의 Python 은 SQLite 3.46.1 을, `-slim-bookworm` 은 3.40.1 을 쓴다. 둘 다 WAL-reset 버그의 영향 범위(3.7.0~3.51.2, 3.51.3 에서 수정, 3.44.6·3.50.7 로 백포트)다. Debian 의 `3.46.1-7+deb13u2`·`3.40.1-2+deb12u2` changelog 에는 수정이 없다(2026-11-13 확인). 이 프로필(WAL + Litestream 의 체크포인트)은 버그의 조건(연결 둘 이상이 쓰기·체크포인트를 같은 순간에)에 해당한다. SQLite 는 발생률이 매우 낮고 긴급하지 않다고 평가한다. 그런 이미지에서는 `sqlite_doctor` 가 `sqlite_version` 줄에 메시지를 적는다. 수준은 `ok` 이고 종료 코드(exit 0)는 그대로다. 아래 Dockerfile 의 빌드 가드 줄은 그 이미지에서 빌드를 멈추므로, 지우기 전에 이 내용을 읽는다([README](../../README.md#sqlite-wal-reset-버그)).
 
 ```dockerfile
-FROM python:3.13-slim
+FROM debian:trixie-slim
+
+# Python 은 uv 가 받는 python-build-standalone 판이고 SQLite 를 정적으로 품는다(3.53.1, 2026-11-13 확인).
+# Python·SQLite·OpenSSL 의 판은 uv 판이 정한다: 보안 업데이트는 uv 판을 올리고 다시 빌드해서 받는다.
+COPY --from=ghcr.io/astral-sh/uv:0.13.8 /uv /usr/local/bin/uv
+ARG PYTHON_VERSION=3.14
+ENV UV_PYTHON_INSTALL_DIR=/opt/python UV_MANAGED_PYTHON=1 UV_NO_CACHE=1 \
+    VIRTUAL_ENV=/opt/venv PATH=/opt/venv/bin:$PATH
+RUN uv python install "$PYTHON_VERSION" \
+ && uv venv /opt/venv --python "$PYTHON_VERSION"
 
 ARG LITESTREAM_VERSION=0.5.18
 RUN set -eu; \
@@ -169,7 +186,9 @@ RUN set -eu; \
 ENV PYTHONDONTWRITEBYTECODE=1 PYTHONUNBUFFERED=1
 WORKDIR /app
 COPY requirements.txt .
-RUN pip install --no-cache-dir -r requirements.txt
+RUN uv pip install -r requirements.txt
+# 이 이미지의 SQLite 가 WAL-reset 버그의 영향 범위(3.51.3 미만)면 빌드를 멈춘다
+RUN python -c "import sqlite3, sys; print('sqlite', sqlite3.sqlite_version); sys.exit(sqlite3.sqlite_version_info < (3, 51, 3))"
 COPY . .
 COPY litestream.yml /etc/litestream.yml
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
@@ -187,6 +206,7 @@ EXPOSE 8000
 ENTRYPOINT ["/usr/local/bin/entrypoint.sh"]
 ```
 
+- 패키지는 가상 환경 `/opt/venv` 에 들어가고, `PATH` 의 첫 자리라 `python`·`uvicorn` 이 그것을 가리킨다. 이 이미지에는 `pip` 가 없다. 패키지를 더할 때는 `uv pip install` 을 쓴다(`USER root` 단계에서). Python 은 `/opt/python` 에 있고, 앱 사용자도 읽을 수 있다.
 - `/data` 는 앱 사용자(`app`, uid 10001) 소유다. boot 는 그 안에 잠금·상태 파일·임시 복원 디렉터리를 만들고 격리할 때 rename 하므로, DB 파일뿐 아니라 디렉터리에도 쓰기 권한이 있어야 한다.
 - 이름 있는 빈 볼륨을 `/data` 에 처음 붙이면 Docker 가 이미지의 `/data` 내용을 볼륨으로 복사한다([Docker 문서](https://docs.docker.com/engine/storage/volumes/)). **소유자도 함께 넘어온다**: 새 볼륨의 `/data` 가 `10001:10001`(권한 755)이었다(회귀 랩 P1·P2, Docker 29.5.2). 바인드 마운트(`./data:/data`)는 복사가 일어나지 않으므로 호스트 디렉터리의 소유자를 uid 10001 로 맞춘다.
 
