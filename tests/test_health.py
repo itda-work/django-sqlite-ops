@@ -82,6 +82,9 @@ def test_next_backlog_since(prev, local, remote, expected):
 
 L1 = ("a.ltx", 1)
 L2 = ("b.ltx", 2)
+# pending 의 키는 최신 L0 의 이름이다(WAL 근거와 같은 꼴, #115)
+K1 = ("l0", "a.ltx")
+K2 = ("l0", "b.ltx")
 
 
 @pytest.mark.parametrize(
@@ -92,11 +95,11 @@ L2 = ("b.ltx", 2)
         (None, FileTimes(5.0, None, None), None),  # L0 없음
         (None, FileTimes(5.0, 5.0, L1), None),  # 같음
         (None, FileTimes(4.0, 5.0, L1), None),  # L0 가 더 새로움(정상)
-        (None, FileTimes(6.0, 5.0, L1), since(100.0, 7.0, L1)),  # DB 가 새로워짐: 처음 관측
-        (since(40.0, key=L1), FileTimes(9.0, 5.0, L1), since(40.0, key=L1)),  # L0 그대로: 유지
+        (None, FileTimes(6.0, 5.0, L1), since(100.0, 7.0, K1)),  # DB 가 새로워짐: 처음 관측
+        (since(40.0, key=K1), FileTimes(9.0, 5.0, L1), since(40.0, key=K1)),  # L0 그대로: 유지
         # L0 가 바뀌면(Litestream 이 진행 중) 새로 센다: 쓰기가 계속되는 DB 의 오탐 방지
-        (since(40.0, key=L1), FileTimes(9.0, 8.0, L2), since(100.0, 7.0, L2)),
-        (since(40.0, key=L1), FileTimes(8.0, 8.0, L2), None),  # 따라잡음
+        (since(40.0, key=K1), FileTimes(9.0, 8.0, L2), since(100.0, 7.0, K2)),
+        (since(40.0, key=K1), FileTimes(8.0, 8.0, L2), None),  # 따라잡음
     ],
 )
 def test_next_pending_since(prev, files, expected):
@@ -1451,10 +1454,10 @@ def test_relative_meta_path_keeps_dotdot(tmp_path, monkeypatch):
 def test_next_wal_pending_since():
     p1 = WalEvidence(PENDING, "", 4152, 8272, True, "k1")
     p2 = WalEvidence(PENDING, "", 8272, 12392, True, "k2")
-    assert next_wal_pending_since(None, p1, 100.0, 7.0) == Since(100.0, 7.0, ("wal", "k1"))
-    kept = Since(40.0, 1.0, ("wal", "k1"))
+    assert next_wal_pending_since(None, p1, 100.0, 7.0) == Since(100.0, 7.0, ("l0", "k1"))
+    kept = Since(40.0, 1.0, ("l0", "k1"))
     assert next_wal_pending_since(kept, p1, 100.0, 7.0) is kept  # 같은 L0: 유지
-    assert next_wal_pending_since(kept, p2, 100.0, 7.0) == Since(100.0, 7.0, ("wal", "k2"))
+    assert next_wal_pending_since(kept, p2, 100.0, 7.0) == Since(100.0, 7.0, ("l0", "k2"))
     assert next_wal_pending_since(kept, W_SYNC, 100.0, 7.0) is None
     assert next_wal_pending_since(kept, W_NONE, 100.0, 7.0) is None
     assert next_wal_pending_since(kept, None, 100.0, 7.0) is None

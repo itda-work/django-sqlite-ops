@@ -14,6 +14,9 @@ INSTALLED_APPS += ["notes"]  # noqa: F821
 _health = SQLITE_OPS["HEALTH"]  # noqa: F821
 _health["REFRESH"] = float(os.environ.get("LAB_HEALTH_REFRESH", "15"))
 _health["BACKLOG_GRACE"] = float(os.environ.get("LAB_HEALTH_GRACE", "60"))
+# L9a(#115): 컴팩션 지연 문턱. 비어 있으면 패키지 기본(300초)이다.
+if os.environ.get("LAB_HEALTH_COMPACTION_GRACE"):
+    _health["COMPACTION_GRACE"] = float(os.environ["LAB_HEALTH_COMPACTION_GRACE"])
 if os.environ.get("LAB_HEALTH_CONFIG"):
     # L8b: 헬스의 원격 조회만 다른 toxiproxy 경로로 보낸다(업로드만 끊긴 경우).
     _health["DATABASES"]["default"]["litestream_config"] = os.environ["LAB_HEALTH_CONFIG"]

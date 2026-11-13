@@ -755,3 +755,146 @@ def test_real_hanging_s3_endpoint_times_out(tmp_path, scheme):
     assert type(result) is RemoteError
     assert "timed out after 3s" in result.message
     assert elapsed < 3 + 6
+
+
+# --- 컴팩션 요약 (#115) -----------------------------------------------------------------
+#
+# 헬스가 같은 ``ltx -level all -json`` 출력에서 'L0 는 오는데 L1 이 안 오는' 정지를 본다.
+# 기준(컴팩션된 끝)은 레벨 1~8 의 최대 max_txid 다. L9(스냅샷)는 DB 의 현재 위치에서 새로
+# 만들어지므로(Litestream db.go WriteLTXFile(SnapshotLevel, 1, pos.TXID)) 넣으면 정지를 가린다.
+
+
+def _item(level, lo, hi, ts):
+    return {
+        "level": level,
+        "min_txid": f"{lo:016x}",
+        "max_txid": f"{hi:016x}",
+        "size": 100,
+        "timestamp": ts,
+    }
+
+
+def _ts(second):
+    return f"2026-11-13T00:{second // 60:02d}:{second % 60:02d}Z"
+
+
+def _listing(*items):
+    import json
+
+    return json.dumps(list(items))
+
+
+def test_fixture_summary_has_no_uncompacted_l0(lsfx):
+    """두 판의 fixture 는 L0 0x19 가 L1 0x17-0x19 에 이미 들어간 복제본이다."""
+    stdout, _, _ = lsfx.out("ltx_all_levels")
+    summary = ls.summarize_ltx_json(stdout)
+    assert summary.problem is None
+    assert summary.l0_files == 1
+    assert summary.compacted_txid == lsfx.max_txid
+    assert summary.uncompacted == 0
+    assert summary.compaction_lag == 0.0
+
+
+def test_summary_normal_sawtooth():
+    """L1 끝 뒤의 L0 만 센다. 지연 = 가장 새 객체 시각 − 가장 오래된 미컴팩션 L0 시각."""
+    out = _listing(
+        _item(0, 1, 1, _ts(1)),  # 컴팩션됨(보존 전)
+        _item(0, 2, 2, _ts(2)),
+        _item(0, 3, 3, _ts(31)),  # 미컴팩션
+        _item(0, 4, 4, _ts(40)),
+        _item(1, 1, 2, _ts(30)),
+    )
+    s = ls.summarize_ltx_json(out)
+    assert (s.l0_files, s.compacted_txid, s.uncompacted) == (4, 2, 2)
+    assert s.compaction_lag == 9.0
+
+
+def test_summary_stall_grows_with_new_l0():
+    items = [_item(1, 1, 5, _ts(0))] + [_item(0, t, t, _ts(t * 10)) for t in range(6, 40)]
+    s = ls.summarize_ltx_json(_listing(*items))
+    assert s.compacted_txid == 5
+    assert s.uncompacted == 34
+    assert s.compaction_lag == (39 - 6) * 10
+
+
+def test_summary_snapshot_does_not_move_the_compacted_end():
+    """L9 가 L1 끝보다 앞서도 기준은 L1 끝이다(스냅샷이 정지를 가리지 않는다)."""
+    out = _listing(
+        _item(1, 1, 5, _ts(0)),
+        _item(2, 1, 5, _ts(0)),
+        _item(0, 6, 6, _ts(10)),
+        _item(0, 7, 7, _ts(400)),
+        _item(9, 1, 7, _ts(401)),
+    )
+    s = ls.summarize_ltx_json(out)
+    assert s.compacted_txid == 5
+    assert s.uncompacted == 2
+    assert s.compaction_lag == 391.0
+
+
+def test_summary_uses_highest_of_levels_one_to_eight():
+    """보존으로 오래된 L1 이 지워지고 마지막 L1 만 남아도, L2 가 있어도 최대가 기준이다."""
+    out = _listing(_item(1, 9, 9, _ts(5)), _item(2, 1, 8, _ts(5)), _item(0, 10, 10, _ts(6)))
+    s = ls.summarize_ltx_json(out)
+    assert (s.compacted_txid, s.uncompacted) == (9, 1)
+    assert s.compaction_lag == 0.0  # 가장 새 객체가 그 L0 자신이다
+
+
+def test_summary_without_l1_counts_every_l0():
+    """새 복제본의 첫 컴팩션 전: L1 이 없으면 모든 L0 가 미컴팩션이다(Litestream 의 maxL1TXID 0)."""
+    s = ls.summarize_ltx_json(_listing(_item(0, 1, 1, _ts(0)), _item(0, 2, 2, _ts(20))))
+    assert (s.compacted_txid, s.uncompacted, s.compaction_lag) == (0, 2, 20.0)
+
+
+def test_summary_only_snapshot_and_no_l0():
+    s = ls.summarize_ltx_json(_listing(_item(9, 1, 7, _ts(0))))
+    assert (s.l0_files, s.uncompacted, s.compaction_lag) == (0, 0, 0.0)
+    assert ls.summarize_ltx_json("[]").compaction_lag == 0.0
+
+
+def test_summary_accepts_offset_timestamps():
+    """파일 복제본은 로컬 시간대의 오프셋으로 낼 수 있다(file/replica_client.go ModTime)."""
+    out = _listing(
+        _item(0, 1, 1, "2026-11-13T09:00:00+09:00"), _item(0, 2, 2, "2026-11-13T00:00:30Z")
+    )
+    assert ls.summarize_ltx_json(out).compaction_lag == 30.0
+
+
+@pytest.mark.parametrize(
+    "bad",
+    [
+        {"level": 0, "min_txid": "0000000000000001", "max_txid": "0000000000000001"},
+        {**_item(0, 1, 1, ""), "timestamp": ""},
+        {**_item(0, 1, 1, ""), "timestamp": "yesterday"},
+        {**_item(0, 1, 1, ""), "timestamp": 1700000000},
+        {**_item(0, 1, 1, ""), "timestamp": "2026-11-13T00:00:00"},  # 시간대 없음
+    ],
+)
+def test_summary_unreadable_timestamp_is_a_problem(bad):
+    s = ls.summarize_ltx_json(_listing(_item(1, 1, 1, _ts(0)), bad))
+    assert s.problem is not None and "timestamp" in s.problem
+    assert s.compaction_lag is None
+
+
+def test_summary_malformed_listing_is_a_problem():
+    for out in ("not json", "{}", "[1]", _listing({"level": "x"})):
+        s = ls.summarize_ltx_json(out)
+        assert s.problem is not None, out
+        assert s.compaction_lag is None
+
+
+def test_remote_listing_returns_txid_and_summary(tmp_path, lsfx):
+    binary = replay_binary(tmp_path, lsfx, "ltx_all_levels")
+    remote, summary = ls.remote_listing("/data/app.db", config="/etc/ls.yml", binary=binary)
+    assert remote == RemoteTxid(lsfx.max_txid)
+    assert summary is not None and summary.uncompacted == 0
+    # boot 가 쓰는 함수는 같은 조회의 TXID 만 돌려준다(동작 그대로)
+    assert ls.remote_max_txid("/data/app.db", config="/etc/ls.yml", binary=binary) == remote
+
+
+def test_remote_listing_has_no_summary_when_lookup_fails(tmp_path, lsfx):
+    for name in ("ltx_replica_missing", "ltx_config_missing"):
+        binary = replay_binary(tmp_path, lsfx, name)
+        remote, summary = ls.remote_listing("/data/app.db", config="/etc/ls.yml", binary=binary)
+        assert type(remote) in (RemoteEmpty, RemoteError), name
+        assert summary is None, name

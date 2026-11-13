@@ -40,6 +40,7 @@ __all__ = [
     "BACKLOG",
     "CAUGHT_UP",
     "DEFAULT_BACKLOG_GRACE",
+    "DEFAULT_COMPACTION_GRACE",
     "DEFAULT_REFRESH",
     "LOGGER_NAME",
     "SCHEMA_VERSION",
@@ -76,10 +77,13 @@ _SEVERITY = {CAUGHT_UP: 0, BACKLOG: 1, UNKNOWN: 2}
 
 DEFAULT_REFRESH = 15.0
 DEFAULT_BACKLOG_GRACE = 60.0
+# 컴팩션 지연(복제본의 가장 새 객체 − L1 이 덮지 않은 가장 오래된 L0)의 문턱(#115). Litestream 의
+# L1 주기 기본 30초의 10배이자 L0 보존 기본 5분. 정상 지연 실측 최대 27초(기획 §1-3).
+DEFAULT_COMPACTION_GRACE = 300.0
 # 마지막 결과가 REFRESH × 3 보다 오래됐으면 스레드가 멈춘 것으로 보고 unknown 이다.
 STALE_FACTOR = 3
 
-_HEALTH_KEYS = frozenset({"DATABASES", "REFRESH", "BACKLOG_GRACE"})
+_HEALTH_KEYS = frozenset({"DATABASES", "REFRESH", "BACKLOG_GRACE", "COMPACTION_GRACE"})
 _ALIAS_KEYS = frozenset({"litestream_config", "meta_path", "litestream"})
 # 부팅 상태 파일(DESIGN §7)에서 응답에 옮기는 키. 그 밖의 키는 옮기지 않는다.
 _BOOT_KEYS = (
@@ -154,6 +158,8 @@ class HealthConfig:
     databases: tuple[AliasConfig, ...]
     refresh: float = DEFAULT_REFRESH
     backlog_grace: float = DEFAULT_BACKLOG_GRACE
+    # None 이면 컴팩션 지연을 보지 않는다(운영자가 명시적으로 끈 것).
+    compaction_grace: float | None = DEFAULT_COMPACTION_GRACE
 
 
 def _path_text(value: Any) -> str | None:
@@ -215,6 +221,17 @@ def parse_config(
                 None,
             )
         )
+    compaction = raw.get("COMPACTION_GRACE", DEFAULT_COMPACTION_GRACE)
+    if compaction is not None:
+        compaction = _number(compaction)
+        if compaction is None or compaction <= 0:
+            errors.append(
+                (
+                    "SQLITE_OPS['HEALTH']['COMPACTION_GRACE'] must be a positive number of "
+                    f"seconds or None, got {raw.get('COMPACTION_GRACE')!r}.",
+                    None,
+                )
+            )
 
     entries = raw.get("DATABASES")
     aliases: list[AliasConfig] = []
@@ -258,7 +275,7 @@ def parse_config(
         )
     if errors:
         return None, errors
-    return HealthConfig(tuple(aliases), refresh, grace), []
+    return HealthConfig(tuple(aliases), refresh, grace, compaction), []
 
 
 def load_config() -> tuple[HealthConfig | None, list[tuple[str, str | None]]]:
@@ -324,6 +341,8 @@ class Sample:
     wal: WalEvidence | None = None
     backwards: bool = False
     db_file: str | None = None
+    # 원격 목록의 컴팩션 요약(#115). 요약을 주지 않는 조회(Remote 만 돌려주는 주입 함수)면 None.
+    ltx: litestream.LtxSummary | None = None
 
 
 def read_boot_state(db_path: str) -> tuple[dict[str, Any] | None, str | None]:
@@ -386,17 +405,31 @@ def next_backlog_since(
     return Since(observed, wall, local)
 
 
+def _l0_key(key: Any) -> tuple[str, Any]:
+    """pending 의 키: 최신 로컬 L0 의 이름(#115).
+
+    WAL 근거의 키는 ``(L0 이름, WAL 끝, salt1, salt2)``, 파일 시각 근거의 키는
+    ``(L0 이름, mtime_ns)`` 다. 둘을 L0 이름 하나로 맞춰, 최신 L0 가 그대로이면 근거가 바뀌어도
+    이어 센다. ``CONN_MAX_AGE=0`` 앱 + Litestream 없음에서는 마지막 연결 닫기마다 ``-wal`` 이
+    지워졌다 생겨 두 근거가 번갈아 나온다(#106 Q3 dead) — 키가 다르면 매번 다시 세어
+    ``backlog`` 가 되지 않았다. L0 이름은 TXID 범위라 Litestream 이 진행하면 바뀐다.
+    """
+    name = key[0] if isinstance(key, tuple) and key else key
+    return ("l0", name)
+
+
 def next_wal_pending_since(
     prev: Since | None, wal: WalEvidence | None, observed: float, wall: float
 ) -> Since | None:
     """WAL 에 최신 L0 가 담지 않은 커밋이 있음을 처음 관측한 시점. 아니면 ``None``.
 
-    판정의 주 근거다(시계를 쓰지 않는다). 최신 L0 의 WAL 위치가 바뀌면(``wal.key``) 다시 센다:
-    Litestream 이 진행하는 한 바쁜 DB 에서도 지속 시간이 쌓이지 않는다.
+    판정의 주 근거다(시계를 쓰지 않는다). 최신 L0 가 바뀌면(``wal.key`` 의 L0 이름) 다시 센다:
+    Litestream 이 진행하는 한 바쁜 DB 에서도 지속 시간이 쌓이지 않는다. 키는
+    ``next_pending_since()`` 와 같은 꼴이다(``_l0_key``).
     """
     if wal is None or wal.state != PENDING:
         return None
-    key = ("wal", wal.key)
+    key = _l0_key(wal.key)
     if prev is not None and prev.key == key:
         return prev
     return Since(observed, wall, key)
@@ -429,7 +462,7 @@ def next_pending_since(
     L0 가 생긴다. 최신 L0 가 바뀌면(이름·
     mtime) 새로 센다: 쓰기가 계속되는 DB 에서 매 관측 순간 DB 가 조금 더 새로워도 Litestream 이
     진행하는 한 지속 시간이 쌓이지 않는다. mtime 끼리의 차이는 지속 시간으로 쓰지 않는다(오래된
-    유휴 DB 에 첫 쓰기가 오면 차이가 바로 커 보인다).
+    유휴 DB 에 첫 쓰기가 오면 차이가 바로 커 보인다). 키는 WAL 근거와 같은 꼴이다(``_l0_key``).
     """
     if (
         files is None
@@ -438,9 +471,10 @@ def next_pending_since(
         or files.db_changed_at <= files.ltx_at
     ):
         return None
-    if prev is not None and prev.key == files.ltx_key:
+    key = _l0_key(files.ltx_key)
+    if prev is not None and prev.key == key:
         return prev
-    return Since(observed, wall, files.ltx_key)
+    return Since(observed, wall, key)
 
 
 def _wal_fields(wal: WalEvidence | None) -> dict[str, Any] | None:
@@ -514,6 +548,45 @@ def _stale_cause(
 
 
 def _verdict(
+    sample: Sample | None,
+    now: float,
+    refresh: float,
+    grace: float,
+    compaction_grace: float | None,
+    alias: str | None = None,
+    checking: tuple[str, float] | None = None,
+    slowest: tuple[str, float] | None = None,
+) -> tuple[str, str, str]:
+    """``(상태, 사유 코드, 사유)``. 기존 판정(``_base_verdict``)이 ``caught_up`` 일 때만 복제본의
+    컴팩션 진행을 본다(#115): 바뀌는 것은 ``caught_up`` 이 좁아지는 것뿐이다."""
+    verdict = _base_verdict(sample, now, refresh, grace, alias, checking, slowest)
+    if verdict[0] != CAUGHT_UP or compaction_grace is None or sample is None:
+        return verdict
+    ltx = sample.ltx
+    if ltx is None:  # 요약을 주지 않는 조회(주입 함수)
+        return verdict
+    lag = ltx.compaction_lag
+    if lag is None:
+        return (
+            UNKNOWN,
+            "no_compaction_evidence",
+            f"cannot tell whether L1 compaction is progressing: {ltx.problem}",
+        )
+    if lag >= compaction_grace:
+        return (
+            BACKLOG,
+            "compaction_stalled",
+            (
+                f"the oldest L0 not compacted into L1 is {lag:.0f}s older than the newest "
+                f"replica object (COMPACTION_GRACE {compaction_grace:g}s; {ltx.uncompacted} L0 "
+                f"files not compacted, L1 ends at {ltx.compacted_txid:016x}); check the "
+                "Litestream log for 'compaction failed'"
+            ),
+        )
+    return verdict
+
+
+def _base_verdict(
     sample: Sample | None,
     now: float,
     refresh: float,
@@ -672,6 +745,7 @@ def alias_status(
     *,
     refresh: float,
     grace: float,
+    compaction_grace: float | None = DEFAULT_COMPACTION_GRACE,
     alias: str | None = None,
     checking: tuple[str, float] | None = None,
     slowest: tuple[str, float] | None = None,
@@ -684,17 +758,25 @@ def alias_status(
     로컬 TXID 가 앞선 지속 시간 ≥ ``grace`` → ``backlog``. 그다음 WAL 위치(주 근거)로 판단할 수
     없으면: 파일 시각 역행 → ``unknown``, 파일 시각(보조)이 grace 이상 L0 보다 새로움 →
     ``backlog``, 그 밖 → ``unknown``(``caught_up`` 으로 단정하지 않는다). WAL 에 L0 뒤 커밋이
-    grace 이상 남음 → ``backlog``. 그 밖은 ``caught_up``. 지속 시간은 monotonic 관측
-    시각(``observed``)끼리의 차이다. ``stale`` 사유에는 갱신 스레드가 지금 조회 중인 별칭
-    (``checking``)과 그 경과 초, 조회 중이 아니면 직전 라운드의 가장 느린 조회(``slowest``)를
-    덧붙인다(#72).
+    grace 이상 남음 → ``backlog``. 그 밖은 ``caught_up`` — 단 ``compaction_grace`` 가 있고
+    원격 목록의 요약이 있으면: 시각을 읽을 수 없음 → ``unknown``(``no_compaction_evidence``),
+    컴팩션 지연 ≥ ``compaction_grace`` → ``backlog``(``compaction_stalled``, #115).
+    지속 시간은 monotonic 관측 시각(``observed``)끼리의 차이다. ``stale`` 사유에는 갱신
+    스레드가 지금 조회 중인 별칭(``checking``)과 그 경과 초, 조회 중이 아니면 직전 라운드의
+    가장 느린 조회(``slowest``)를 덧붙인다(#72).
     """
-    status, code, reason = _verdict(sample, now, refresh, grace, alias, checking, slowest)
+    status, code, reason = _verdict(
+        sample, now, refresh, grace, compaction_grace, alias, checking, slowest
+    )
     return {"status": status, "code": code, "reason": _one_line(reason), **_fields(sample, now)}
 
 
 def overall_status(statuses: Mapping[str, Mapping[str, Any]] | list[str]) -> str:
-    """가장 나쁜 상태(``unknown`` > ``backlog`` > ``caught_up``). 별칭이 없으면 ``unknown``."""
+    """가장 나쁜 상태(``unknown`` > ``backlog`` > ``caught_up``). 별칭이 없으면 ``unknown``.
+
+    ``backlog`` 는 "복제 파이프라인이 제때 진행하지 않는 것을 안다"(업로드 지연·L0 기록 지연·
+    컴팩션 정지)이고, ``unknown`` 은 그것조차 말할 수 없다는 뜻이다.
+    """
     values = [s["status"] for s in statuses.values()] if isinstance(statuses, Mapping) else statuses
     if not values:
         return UNKNOWN
@@ -815,14 +897,16 @@ def wal_evidence(db: str, meta: str | None) -> WalEvidence:
     return dataclasses.replace(evidence, key=key)
 
 
-Probe = Callable[[AliasConfig, str], Remote]
+# 원격 조회는 Remote 또는 (Remote, 컴팩션 요약) 을 돌려준다. 기본 조회는 후자다(#115).
+Probe = Callable[[AliasConfig, str], "Remote | tuple[Remote, litestream.LtxSummary | None]"]
 LocalProbe = Callable[[str, str | None], int | None]
 FileProbe = Callable[[str, str | None], FileTimes | None]
 WalProbe = Callable[[str, str | None], WalEvidence | None]
 
 
-def _remote(cfg: AliasConfig, db: str) -> Remote:
-    return litestream.remote_max_txid(db, config=cfg.litestream_config, binary=cfg.litestream)
+def _remote(cfg: AliasConfig, db: str) -> tuple[Remote, litestream.LtxSummary | None]:
+    # 모듈 속성으로 찾는다(테스트가 바꿔 끼울 수 있게).
+    return litestream.remote_listing(db, config=cfg.litestream_config, binary=cfg.litestream)
 
 
 def _local(db: str, meta: str | None) -> int | None:
@@ -897,7 +981,8 @@ class Monitor:
             self._log_once(cfg.alias, db_detail, "db_file")
         else:
             self._logged.pop((cfg.alias, "db_file"), None)
-        remote = self.remote(cfg, real)
+        got = self.remote(cfg, real)
+        remote, ltx = got if isinstance(got, tuple) else (got, None)
         if type(remote) is RemoteError:
             self._log_once(cfg.alias, f"remote lookup failed: {remote.message}")
         else:
@@ -931,6 +1016,7 @@ class Monitor:
             wal=wal,
             backwards=backwards,
             db_file=db_file,
+            ltx=ltx,
         )
 
     def refresh_once(self) -> None:
@@ -1031,6 +1117,7 @@ class Monitor:
                 now,
                 refresh=self.config.refresh,
                 grace=self.config.backlog_grace,
+                compaction_grace=self.config.compaction_grace,
                 alias=cfg.alias,
                 checking=checking,
                 slowest=slowest,

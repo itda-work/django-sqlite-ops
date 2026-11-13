@@ -1957,3 +1957,25 @@ def test_walcp_window_latency_uses_whole_intervals_only():
     rows = [{"t": t, "write": {"p95_ms": t}} for t in (0, 5, 10, 15, 20)]
     got = w.window_latency(rows, 3, 20, 5)
     assert got["first"]["t"] == 5 and got["last"]["t"] == 15
+
+
+# --- L9a·L9b 판정(#115) ----------------------------------------------------------------------
+
+
+def test_stall_problems():
+    c = _checks()
+    ok_before = [(0.0, "caught_up", "in_sync"), (2.0, "caught_up", "local_ahead_within_grace")]
+    want = ("backlog", "compaction_stalled")
+    after = [(2.0, "caught_up", "in_sync"), (70.0, "backlog", "compaction_stalled")]
+    assert c.stall_problems(ok_before, after, want, 130) == []
+    # 정상 구간의 오경보
+    bad = [*ok_before, (4.0, "backlog", "compaction_stalled")]
+    assert c.stall_problems(bad, after, want, 130) == ["before: backlog/compaction_stalled at 4.0s"]
+    # 늦음·없음
+    assert "only at 70.0s" in c.stall_problems(ok_before, after, want, 60)[0]
+    assert "no backlog/compaction_stalled" in c.stall_problems(ok_before, after[:1], want, 60)[0]
+    # 기대 전의 다른 사유는 문제다. no_wal_evidence 는 허용한다(Litestream 없음 동안 -wal 삭제)
+    mid = [(2.0, "unknown", "no_wal_evidence"), (4.0, "unknown", "remote_error"), *after[1:]]
+    assert c.stall_problems(ok_before, mid, want, 130) == [
+        "unexpected unknown/remote_error at 4.0s before compaction_stalled"
+    ]

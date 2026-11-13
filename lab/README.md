@@ -1,12 +1,12 @@
 # 회귀 랩 (#10)
 
-Docker 로 Litestream·boot·헬스의 실패 경계(L1–L8, [DESIGN §10](../docs/DESIGN.md#10-회귀-랩-실패-경계))를 재현하고, 배포 프로필 문서의 Dockerfile·compose 를 그대로 띄워 종단 검증한다. PRAGMA 후보 벤치도 여기서 돈다. 결과는 `docs/research/lab-<날짜>.md` 에 적는다.
+Docker 로 Litestream·boot·헬스의 실패 경계(L1–L9, [DESIGN §10](../docs/DESIGN.md#10-회귀-랩-실패-경계))를 재현하고, 배포 프로필 문서의 Dockerfile·compose 를 그대로 띄워 종단 검증한다. PRAGMA 후보 벤치도 여기서 돈다. 결과는 `docs/research/lab-<날짜>.md` 에 적는다.
 
 기본 `pytest` 와 CI 에는 들어가지 않는다. `RUN_LAB=1` 일 때만 수집되고(`lab/conftest.py`), 실행 입구는 `scripts/lab.sh` 하나다.
 
 ```bash
-scripts/lab.sh run all        # L1–L8, P1·P2 (약 8분 + P2 채널 시나리오 약 3분, #66). 끝나면 성공·실패와 관계없이 down -v
-scripts/lab.sh run L6         # pytest -k 로 좁힌다 (L1..L8, L8c 처럼 하나만, P1, P2)
+scripts/lab.sh run all        # L1–L9, P1·P2 (약 8분 + P2 채널 시나리오 약 3분(#66) + L9 약 4분 30초(#115). 2026-11-13 colima 에서 전체 18분 30초). 끝나면 성공·실패와 관계없이 down -v
+scripts/lab.sh run L6         # pytest -k 로 좁힌다 (L1..L9, L8c·L9a 처럼 하나만, P1, P2)
 scripts/lab.sh bench          # PRAGMA 벤치 + 포화 측정 (약 50분). pytest 인자를 넘길 수 있다(-k saturation)
 scripts/lab.sh soak           # fd·RSS 장시간 실행, CONN_MAX_AGE None·0 각 30분 (약 70분, #33)
 scripts/lab.sh dbconfig       # Django 기본 SQLite 대 권장 설정, 동시 쓰기 (약 30분, #83)
@@ -30,7 +30,7 @@ LAB_LITESTREAM_VERSION=0.5.17 scripts/lab.sh run L8c   # 검증한 다른 판으
 `.github/workflows/lab.yml` 은 `workflow_dispatch` 전용 잡이다(#25). 기본 CI(push/PR)에는 들어가지 않는다.
 
 ```bash
-gh workflow run lab.yml -f scenarios=all    # 또는 P1, P2, L1..L8, L8c, L8d (pytest -k 로 좁힌다)
+gh workflow run lab.yml -f scenarios=all    # 또는 P1, P2, L1..L9, L8c, L8d, L9a, L9b (pytest -k 로 좁힌다)
 gh run watch                                # 진행 보기
 gh run download <run-id>                    # artifact lab-<선택>-<run-id> = lab/.out/ 전체
 ```
@@ -103,6 +103,8 @@ P2 는 channels-nats 를 넣은 이미지로 워커 사이 채널 전달을 런�
 | L8b | 헬스 조회는 `s3h` 로 두고 업로드 경로 `s3` 만 20초 끔 | `backlog`(`local_ahead`) → 복구 뒤 `caught_up` |
 | L8c | 쓰기를 계속하며 `s3` 를 90초 끔(조회 타임아웃 30초의 3배, 연결 거부) | 판별(#99, `_checks.REFUSED_LOOKUP`). 먼저 단절 중 헬스의 조회 실패 줄이 모두 그 판의 종류인지(0.5.17 `timed out`, 0.5.18 `exited with 1`) 본다. 시간은 랩의 허용 시간(가정, `_checks.long_outage_bounds`): 10초 안에 `stale`. **0.5.17**: 첫 `remote_error` 는 29–36초, 그 뒤 `remote_error`(약 6초)와 `stale`(약 26초)이 32±2초 주기로 번갈아(90초에 2구간 이상). **0.5.18**: 조회가 약 7초 뒤 rc 1 로 끝나 첫 `remote_error` 2–21초, 구간 간격 11±8초(4구간 이상, 경계 근거는 `_checks.py`). 두 판 모두 단절 내내 `unknown`. strict 는 단절 내내 503·복구 뒤 200. 앱 컨테이너의 `litestream ltx`(`lab_tools/procs.py` 로 `/proc` 를 3초마다)는 1개 이하·좀비 없음·한 PID 가 40초 넘게 보이지 않음·복구 뒤 단절 중 PID 없음, 그리고 검출기가 동작한다는 하한(단절 중 `ltx` 를 본 표본 ≥ 3, 서로 다른 PID ≥ 2). 시각 판정의 표본 여유는 실제 최대 헬스 표본 간격이고, 그 간격이 1.5초를 넘으면 '표본이 거칠다'로 판정 실패와 따로 알린다. 쓰기 오류 0, 복구 뒤 120초 안 `caught_up`, 복제본 행 수 = 최종 행 수. Litestream WARN/ERROR 줄 수·대표 줄을 기록 |
 | L8d | 같은 90초를 양방향 무응답으로: `s3` 에 `timeout` toxic(`timeout` 0 = 연결은 받고 데이터를 버림)을 `stream` `downstream`·`upstream` 둘 다(기본값은 `downstream` 뿐이라 하나만 넣으면 요청은 S3 에 닿는다 — toxiproxy 2.12.0 README) | 두 판 모두 0.5.17 의 L8c 와 같다(30초 타임아웃, 사유 `timed out`) |
+| L9a | 프로필 그대로(`labapp`), 쓰기 1회/초(`/lab/write?n=5`), `LAB_HEALTH_COMPACTION_GRACE=60`. `caught_up` 뒤 L1 주기 + 10초 정상 표본, 그다음 컨테이너 안에서 로컬 메타의 **최신이 아닌** 미컴팩션 L0 하나(L1 경계 2초 뒤에 생긴 것, 다음 경계까지 5초 넘게 남을 때)의 가운데 64바이트를 뒤집는다 (#115) | 정상 구간 모두 `caught_up`, 손상 뒤 `COMPACTION_GRACE` + L1 30 + 40초 안에 `backlog/compaction_stalled`(그 전 다른 비정상 상태 없음, `unknown/no_wal_evidence` 만 허용), 로그 `compaction failed` > 0·`sync error` 0, 쓰기 오류 0. 판정 `_checks.stall_problems` |
+| L9b | 감독 변형(`labapp-sup`, `CONN_MAX_AGE=0` 단언), 겹치는 요청(`walcp_load`, 30 + 60 + 60초). `caught_up` 뒤 Litestream 만 SIGTERM(`lsctl`) 60초 → 재기동 (#115) | `BACKLOG_GRACE` 10 + 30초 안에 `backlog/db_not_replicated`, 그 뒤 Litestream 이 없는 동안 다른 상태 없음(번갈아 나오는 근거가 다시 세지 않음), 재기동 뒤 180초 안에 `caught_up`, 부하 오류 0 |
 
 P2 채널 시나리오(`CHANNEL_SPECS`, N=200, 수신 워커 2). 준비 확인: 두 워커가 probe 를 1건 이상 받을 때까지 보낸 뒤 본 메시지를 보낸다. 수신이 멈추면 꼬리 probe 를 한 번 더 보내 다시 기다린다(용량 드롭 합계 "has room again after dropping N" 은 다음 메시지가 들어올 때만 나온다).
 
@@ -122,7 +124,7 @@ P2 채널 시나리오(`CHANNEL_SPECS`, N=200, 수신 워커 2). 준비 확인: 
 
 면제는 없다. #88 전(channels-nats 0.10.0)에는 구독 확인이 취소되면 nats-py 읽기 루프가 `InvalidStateError` 로 끝나는 결함([이관 문서](../docs/research/handoff-marco-nats-flush-cancel.md))이 있어, 1ms 판을 strict xfail 로, P-cancel·D2 를 `defect_ok`(결함 기록만, 시도마다 새 인스턴스)로 두었다. 0.10.1 로 올리자 xfail 이 XPASS 로 알렸고(2026-10-27) 그 장치를 걷어 냈다. 폴링 시나리오는 여전히 별도 레이어 인스턴스를 쓴다 — 회귀가 나도 기본 레이어를 쓰는 시나리오(LIVE 등)로 번지지 않고 그 시나리오의 `-after` 에서 드러난다.
 
-L8 은 `LAB_HEALTH_REFRESH=2`, `LAB_HEALTH_GRACE=10` 으로 줄여 돈다(기본 15·60초면 20초 끊김이 grace 안에 든다). 헬스의 원격 조회 타임아웃은 `boot/litestream.py` 의 `DEFAULT_LTX_TIMEOUT`(30초)이고 `HEALTH` 설정으로 바꿀 수 없다(2026-10-25 확인). L8c·L8d 가 각각 약 2분 30초 걸린다.
+L8 은 `LAB_HEALTH_REFRESH=2`, `LAB_HEALTH_GRACE=10` 으로 줄여 돈다(기본 15·60초면 20초 끊김이 grace 안에 든다). 헬스의 원격 조회 타임아웃은 `boot/litestream.py` 의 `DEFAULT_LTX_TIMEOUT`(30초)이고 `HEALTH` 설정으로 바꿀 수 없다(2026-10-25 확인). L8c·L8d 가 각각 약 2분 30초 걸린다. L9a·L9b 도 `REFRESH` 2·`BACKLOG_GRACE` 10 으로 돈다. L9a 의 `COMPACTION_GRACE` 는 `LAB_HEALTH_COMPACTION_GRACE`(비우면 패키지 기본 300초)로 60초로 줄인다. L9 의 기대는 두 판(0.5.17·0.5.18)이 같다. 최신 L0 손상은 판마다 다르므로(0.5.17 은 sync 가 멈춘다) 랩은 최신이 아닌 L0 만 깨뜨린다.
 
 L6 의 훅은 `LAB_RENAME_DELAY` 가 있을 때만 `os.rename` 뒤에 한 줄(`[lab-hook] rename k: ...`)을 남기고 잠든다. `PYTHONPATH=/app/lab_hooks` 로만 켜고 패키지 코드는 그대로다.
 
@@ -238,11 +240,12 @@ lab/
 ├── multiproc-override.yaml P2 추가분
 ├── nats.Dockerfile         P2 이미지 층([nats] extra, #66)
 ├── _lab.py                 compose·toxiproxy·조사 도구
-├── _checks.py              L6·L8a·L8c·L8d·P2 채널 판정(순수 함수, tests/test_lab.py 가 Docker 없이 검사)
+├── _checks.py              L6·L8a·L8c·L8d·L9·P2 채널 판정(순수 함수, tests/test_lab.py 가 Docker 없이 검사)
 ├── _benchstat.py           벤치 집계·재현 판정(순수 함수, 같은 테스트가 검사)
 ├── _soakstat.py            soak 분석(순수 함수, 같은 테스트가 검사)
 ├── conftest.py             RUN_LAB 게이트, 결과 기록
 ├── test_scenarios.py       P1·P2, L1–L8
+├── test_pipeline.py        L9a·L9b 파이프라인 정지와 헬스(#115, run all 에 든다)
 ├── test_bench.py           PRAGMA 벤치, 포화 측정
 ├── test_soak.py            fd·RSS 장시간 실행(#33)
 ├── soak_report.py          soak 원자료 → 결과 문서의 표(_soakstat 로 계산)

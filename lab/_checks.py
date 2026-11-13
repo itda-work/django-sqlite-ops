@@ -604,3 +604,33 @@ def spec_outcome(spec: dict, data: dict | None, error: str | None) -> tuple[dict
         f"trial {i}: {p}" for i, t in enumerate(trials) for p in delivery_problems(spec, t)
     ]
     return result, problems
+
+
+# --- L9a·L9b: 멈춘 복제 파이프라인을 caught_up 이 감추지 않는다(#115) ----------------------------
+
+
+def stall_problems(
+    before: list[tuple[float, str, str]],
+    after: list[tuple[float, str, str]],
+    want: tuple[str, str],
+    deadline: float,
+) -> list[str]:
+    """L9a·L9b 판정. 표본은 ``(사건 뒤 초, status, code)`` 다.
+
+    - ``before``(손상·정지 전 정상 구간): 모두 ``caught_up`` 이어야 한다(정상 운용의 오경보 없음).
+    - ``after``: ``deadline`` 초 안에 ``want``(status, code)가 나와야 하고, 그 전까지는
+      ``caught_up`` 이나 ``want`` 가 아닌 다른 ``backlog``·``unknown`` 이 없어야 한다 — 단
+      ``unknown(no_wal_evidence)`` 는 Litestream 이 없는 동안 -wal 이 지워진 표본이라 허용한다.
+    """
+    problems = [f"before: {s}/{c} at {t}s" for t, s, c in before if s != "caught_up"]
+    hit = next((t for t, s, c in after if (s, c) == want), None)
+    if hit is None:
+        problems.append(f"no {want[0]}/{want[1]} within {deadline}s (last {after[-3:]})")
+    elif hit > deadline:
+        problems.append(f"{want[0]}/{want[1]} only at {hit}s > {deadline}s")
+    for t, s, c in after:
+        if hit is not None and t >= hit:
+            break
+        if s != "caught_up" and (s, c) != ("unknown", "no_wal_evidence"):
+            problems.append(f"unexpected {s}/{c} at {t}s before {want[1]}")
+    return problems
