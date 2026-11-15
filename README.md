@@ -52,7 +52,7 @@ Litestream 만 쓰면 옛 볼륨으로 재부팅했을 때 최신 복제본이 �
 
 ## 현재 상태
 
-PyPI 에 **실험적 사전 릴리스**로 배포한다([D-28](docs/DECISIONS.md), 2026-10-26 결정). 첫 버전은 `0.1.0a1`(2026-10-26), 지금은 `0.1.0a2` 다. 사전 릴리스는 버전을 명시해 설치한다(아래 [설치](#설치)). 바뀐 점은 [CHANGELOG](CHANGELOG.md) 에 적는다. 외부 홍보는 하지 않는다. 패키지 이름 `django-sqlite-ops` 는 확정이다(D-28 이 D-6 을 갱신).
+PyPI 에 **실험적 사전 릴리스**로 배포한다([D-28](docs/DECISIONS.md), 2026-10-26 결정). 첫 버전은 `0.1.0a1`(2026-10-26), 지금은 `0.1.0a3` 이다. 사전 릴리스는 버전을 명시해 설치한다(아래 [설치](#설치)). 바뀐 점은 [CHANGELOG](CHANGELOG.md) 에 적는다. 외부 홍보는 하지 않는다. 패키지 이름 `django-sqlite-ops` 는 확정이다(D-28 이 D-6 을 갱신).
 
 | 기능 | 상태 | 이슈·근거 |
 |---|---|---|
@@ -74,16 +74,16 @@ PyPI 에 **실험적 사전 릴리스**로 배포한다([D-28](docs/DECISIONS.md
 PyPI 에서 설치한다. 사전 릴리스는 버전을 명시해 설치한다. 실험적 프로젝트이므로 그 버전으로 고정해 둔다.
 
 ```bash
-pip install "django-sqlite-ops==0.1.0a2"
+pip install "django-sqlite-ops==0.1.0a3"
 # 또는
-uv add "django-sqlite-ops==0.1.0a2"
+uv add "django-sqlite-ops==0.1.0a3"
 ```
 
 필수 의존성은 Django 하나다. 채널 레이어는 extra 로 고른다: `[nats]`(channels-nats), `[channels-lite]`(channels-lite 만. aio 레이어에 필요한 의존성은 [channels-lite 패치 '함정'](#channels-lite-패치)). **channels-nats 는 0.10.1 이상을 쓴다** — 0.10.0 이하는 구독 확인이 취소되면 그 워커가 채널 메시지를 더 받지 못한다([문제 해결 '채널 레이어'](#채널-레이어)). 0.1.0a2 부터 `[nats]` 가 `channels-nats>=0.10.1` 을 요구한다(#91). 0.1.0a1 을 쓴다면 `[nats]` 에 하한이 없으므로 `channels-nats>=0.10.1` 을 함께 적는다. lock 파일에 0.10.0 이하가 잠겨 있으면 `uv lock --upgrade-package channels-nats` 처럼 그 패키지를 올린다.
 
 ```bash
-pip install "django-sqlite-ops[nats]==0.1.0a2"
-uv add "django-sqlite-ops[channels-lite]==0.1.0a2"
+pip install "django-sqlite-ops[nats]==0.1.0a3"
+uv add "django-sqlite-ops[channels-lite]==0.1.0a3"
 ```
 
 `pip install --pre` 나 `uv add --prerelease=allow` 는 쓰지 않는다. 이 패키지뿐 아니라 Django 를 비롯한 **모든 의존성**의 사전 릴리스까지 허용한다(`uv add --prerelease=allow` 는 `uv.lock` 에 `prerelease-mode = "allow"` 로 남아 이후의 해석에도 적용된다). 버전을 지정자에 명시하면 그 사전 릴리스만 받아들여진다. 정식 릴리스가 나온 뒤에는 명시하지 않으면 사전 릴리스를 고르지 않는다.
