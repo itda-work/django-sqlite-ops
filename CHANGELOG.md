@@ -14,6 +14,7 @@
 
 ### Changed
 
+- **배포 프로필의 Dockerfile 이 WAL-reset 버그가 고쳐진 SQLite 로 Python 을 돌린다.** 기준 이미지가 `python:3.13-slim`(SQLite 3.46.1, 영향 범위)에서 `debian:trixie-slim` + uv 가 받는 Python 3.14(python-build-standalone, SQLite 3.53.1 정적 포함)로 바뀌었다. 빌드 중 SQLite 가 3.51.3 미만이면 빌드가 멈춘다. Debian(trixie `deb13u2`·bookworm `deb12u2`)에는 수정이 없고 Ubuntu 수정은 `-proposed` 에만 있다(2026-11-13 확인). 이 Dockerfile 을 따라 쓰던 운영자에게 바뀌는 것: 패키지는 `/opt/venv`(`PATH` 첫 자리)에 들어가고 **`pip` 가 없다** — 더할 패키지는 `uv pip install` 로 넣는다. Python 판은 `ARG PYTHON_VERSION`(기본 3.14)이다. Python·SQLite·OpenSSL 의 보안 업데이트는 `apt` 가 아니라 **uv 판(`ghcr.io/astral-sh/uv:<판>`)을 올리고 다시 빌드**할 때 들어온다. 이미지가 커진다(로컬 측정 arm64 376→475MB, amd64 355→492MB). Litestream 0.5.17·0.5.18 은 자체 SQLite 3.53.0 을 품어 원래 영향 범위가 아니었다. 패키지 코드는 바뀌지 않았다 (#117)
 - **Litestream 0.5.18 을 검증한 판으로 받는다.** boot·`sqlite_doctor` 의 Litestream 설정 대조·헬스·`--restore-test` 가 0.5.17 과 0.5.18 을 받고 그 밖의 판은 계속 거부한다. 0.5.18 실측 fixture(`file://` 복제본의 `ltx`·`databases`·`restore`)의 출력 형식·rc·오류 문구는 0.5.17 과 같았다(시각·크기·압축 묶음만 다름). 배포 프로필 `single-server` 의 Dockerfile 이 0.5.18 을 설치한다 (#99)
 - **S3 가 연결을 거부할 때 0.5.18 은 더 빨리 실패한다.** 0.5.17 의 `ltx` 는 30초 타임아웃까지 매달려 사유가 `timed out` 이었고, 0.5.18 은 약 8초 뒤 `exited with 1: … exceeded maximum number of attempts` 로 끝난다. boot 의 거부(exit 2, `remote_error`)와 헬스의 `unknown` 은 두 판에서 같고, 헬스의 `stale`↔`remote_error` 주기만 짧아진다. 0.5.18 은 이때 Litestream ERROR 로그도 남긴다 (#99)
 

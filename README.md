@@ -968,16 +968,21 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 
 #### SQLite WAL-reset 버그
 
-SQLite 공식 문서([wal.html §11](https://sqlite.org/wal.html#the_wal_reset_bug), 2026-11-12 확인)는 WAL 모드에서 드물게 DB 를 손상시키는 버그를 적는다.
+SQLite 공식 문서([wal.html §11](https://sqlite.org/wal.html#the_wal_reset_bug), 2026-11-12·2026-11-13 확인)는 WAL 모드에서 드물게 DB 를 손상시키는 버그를 적는다.
 
-- 영향 범위: 3.7.0 ~ 3.51.2. 3.51.3 에서 고쳐졌고 3.44.6·3.50.7 로 백포트됐다.
+- 영향 범위: 3.7.0 ~ 3.51.2. 3.51.3 에서 고쳐졌고(수정은 2026-03-03) 3.44.6·3.50.7 로 백포트됐다.
 - 조건: WAL 모드 DB 에 연결이 둘 이상(스레드든 프로세스든) 있고, 쓰기나 체크포인트가 같은 순간에 겹칠 때. 이 패키지가 권하는 구성(WAL + 여러 연결 + Litestream 의 체크포인트)은 이 조건에 해당한다.
 - SQLite 의 평가: 결과는 심각하지만 긴급 사안은 아니고 발생률이 매우 낮다. 업그레이드 외의 우회책은 없다.
 
 실행 중인 판은 `sqlite_doctor` 의 `sqlite_version` 줄이나 `python -c "import sqlite3; print(sqlite3.sqlite_version)"` 로 확인한다. Python 의 `sqlite3` 모듈이 연결된 SQLite 가 기준이다(`sqlite3` 명령줄 도구의 판과 다를 수 있다).
 
-- 배포판은 판 번호를 바꾸지 않고 패치할 수 있다. 그래서 doctor 는 경고(`warn`)가 아니라 메시지로만 알린다. Ubuntu 는 22.04(`3.37.2-2ubuntu0.9`)·24.04(`3.45.1-1ubuntu2.10`)에 "Fix WAL-Reset corruption race" 를 `-proposed` 에 올렸다([Launchpad changelog](https://launchpad.net/ubuntu/+source/sqlite3/+changelog), 2026-11-12 확인 — 아직 `-updates` 전이고, 상류 3.51.3 수정과 같은지는 미확인). Debian 은 bookworm(`3.40.1-2+deb12u2`)·trixie(`3.46.1-7+deb13u1`)의 changelog 에 해당 항목이 없다(2026-11-12 확인. trixie `deb13u2` 는 미확인). 이런 패치 판에서도 판 번호는 영향 범위로 보이므로 메시지가 나온다.
-- uv 가 받는 Python 은 SQLite 를 정적으로 품는다(CI 주석). 이 저장소의 로컬 실측(macOS, 2026-11-12)은 3.53.1 로 영향 범위가 아니다. 배포 프로필의 `python:3.13-slim` 은 3.46.1 이다([프로필](docs/profiles/single-server.md#dockerfile)).
+- 배포판은 상류 판 번호(`sqlite_version`)를 바꾸지 않고 패치할 수 있다. 그래서 doctor 는 경고(`warn`)가 아니라 메시지로만 알린다. 2026-11-13 확인한 상태(`apt-get changelog`·`apt-cache policy`, [기록](docs/research/lab-2026-11-13-profile-image.md)):
+  - Ubuntu 22.04(`3.37.2-2ubuntu0.9`)·24.04(`3.45.1-1ubuntu2.10`)는 "Fix WAL-Reset corruption race. (LP: #2171337)"를 `-proposed` 에만 올렸다. `-updates`·`-security` 의 판(`ubuntu0.8`·`ubuntu2.9`)에는 없다. 상류 3.51.3 수정과 같은 패치인지는 미확인이다.
+  - Debian bookworm(`3.40.1-2+deb12u2`)·trixie(`3.46.1-7+deb13u2`)의 changelog 에는 해당 항목이 없다. testing·unstable 은 상류 3.54.1 이다.
+  - 이런 패치 판에서도 판 번호는 영향 범위로 보이므로 메시지가 나온다.
+- 철회된 3.52.0(2026-03-06)은 수정 check-in([`7168988acb`](https://sqlite.org/src/info/7168988acb), 2026-03-03, trunk)을 조상으로 둔다(sqlite.org 타임라인, 2026-11-13 확인). 그래서 영향 범위로 보지 않는다.
+- uv 가 받는 Python(python-build-standalone)은 SQLite 를 정적으로 품는다. 3.13·3.14·3.15 모두 3.53.1 로 영향 범위가 아니다(Linux arm64·amd64, 2026-11-13). 배포 프로필의 Dockerfile 은 #117 부터 이 Python 을 쓰고, SQLite 가 3.51.3 미만이면 빌드를 멈춘다([프로필](docs/profiles/single-server.md#dockerfile)). 공식 `python:*-slim` 이미지(Debian trixie)는 3.46.1, `-slim-bookworm` 은 3.40.1 이다.
+- Litestream 0.5.17·0.5.18 바이너리는 SQLite 3.53.0(modernc.org/sqlite v1.49.1)을 정적으로 품는다. Litestream 쪽 연결은 영향 범위가 아니다(#117).
 - 이 패키지 구성에서 실제로 일어나는지는 재현을 시도하지 않았다(미검증).
 
 ### boot

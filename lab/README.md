@@ -35,7 +35,7 @@ gh run watch                                # 진행 보기
 gh run download <run-id>                    # artifact lab-<선택>-<run-id> = lab/.out/ 전체
 ```
 
-ubuntu-latest(amd64)에서 `scripts/lab.sh run <선택>` 을 그대로 돌리고, 성공·실패와 관계없이 `lab/.out/`(pytest 로그·`results-*.jsonl`·콘솔 `lab-run-<선택>.console`)을 artifact 로 올린다. 시작할 때 러너의 아키텍처·Docker·Compose 판과, 고정한 이미지 digest·`python:3.13-slim` 의 플랫폼 목록(`docker buildx imagetools inspect`)을 로그에 찍는다. 타임아웃 45분. 벤치는 공유 러너의 소음이 커서 넣지 않았다. act(`scripts/ci-local.sh`)는 Docker 소켓을 넘기지 않으므로 이 잡은 로컬에서 act 로 돌릴 수 없다 — 로컬에서는 `scripts/lab.sh` 를 쓴다.
+ubuntu-latest(amd64)에서 `scripts/lab.sh run <선택>` 을 그대로 돌리고, 성공·실패와 관계없이 `lab/.out/`(pytest 로그·`results-*.jsonl`·콘솔 `lab-run-<선택>.console`)을 artifact 로 올린다. 시작할 때 러너의 아키텍처·Docker·Compose 판과, 고정한 이미지 digest·문서 Dockerfile 의 베이스(`FROM`·`COPY --from` 줄에서 읽은 `debian:trixie-slim`·`ghcr.io/astral-sh/uv:<판>`)의 플랫폼 목록(`docker buildx imagetools inspect`)을 로그에 찍는다. 타임아웃 45분. 벤치는 공유 러너의 소음이 커서 넣지 않았다. act(`scripts/ci-local.sh`)는 Docker 소켓을 넘기지 않으므로 이 잡은 로컬에서 act 로 돌릴 수 없다 — 로컬에서는 `scripts/lab.sh` 를 쓴다.
 
 첫 실행(run 37790075326, 11 passed)의 결과와 arm64 대조는 [`lab-2026-10-08.md`](../docs/research/lab-2026-10-08.md#amd64-실행-github-actions-25) 에 있다.
 
@@ -67,7 +67,9 @@ ubuntu-latest(amd64)에서 `scripts/lab.sh run <선택>` 을 그대로 돌리고
 | P1 `app` | 같은 이미지 | **single-server 문서의 compose.yaml 그대로** + `profile-override.yaml` |
 | P2 `app`·`nats` | `dso-lab-app-nats:<태그>`(위 이미지 + channels-nats, #66), `nats:2.15.0@sha256:cd3fcd4e…` | **multiproc 문서의 compose.yaml 그대로** + 두 override |
 
-앱 이미지의 베이스는 문서 Dockerfile 의 `python:3.13-slim` 그대로다(digest 고정 안 함 — 문서를 바꾸지 않기 위해서). 실행 때 받은 digest 는 결과 문서에 적는다.
+앱 이미지의 베이스는 문서 Dockerfile 그대로다: `debian:trixie-slim` + uv(`ghcr.io/astral-sh/uv:<판>`)가 받는 Python 3.14, SQLite 3.53.1(#117, 2026-11-13. 그 전에는 `python:3.13-slim`·SQLite 3.46.1). digest 는 고정하지 않는다(문서를 바꾸지 않기 위해서). 실행 때 받은 digest 는 결과 문서에 적는다. **#117 전후의 측정은 Python·SQLite 판이 달라 직접 비교하지 않는다**(bench·soak·dbconfig·cache·walcp 의 기존 기록은 3.13 + 3.46.1). 이미지에는 `pip` 가 없고 패키지는 `/opt/venv` 에 `uv pip` 로 넣는다(`nats.Dockerfile` 도 같다).
+
+`cache` 의 메모리 통계(`sqlite3_status`)는 #117 뒤로 빈다. uv 의 Python 은 SQLite 를 정적으로 품어 ctypes 로 닿지 않고, `find_library` 는 Debian 의 `libsqlite3.so.0`(3.46.1)을 찾아 판이 달라 쓰지 않는다(`cache_probe._sqlite_lib()` 가 `None`. 2026-11-13 재현함 — `CDLL(None)` 은 `undefined symbol: sqlite3_libversion`).
 
 ## 문서와 다른 점 (이것뿐이다)
 

@@ -41,11 +41,14 @@ jobs:
           docker version
           docker compose version
           docker buildx version
-      # 고정한 이미지 digest 와 문서 Dockerfile 의 베이스가 러너 아키텍처를 포함하는지 로그에 남긴다.
+      # 고정한 이미지 digest 와 문서 Dockerfile 의 베이스(FROM·COPY --from)가 러너 아키텍처를 포함하는지
+      # 로그에 남긴다. 베이스는 문서에서 읽는다(#117 에서 python:3.13-slim → debian:trixie-slim + uv).
       - name: Image platforms
         run: |
           images="$(grep -hoE 'image: [^ ]+@sha256:[0-9a-f]{64}' lab/*.yaml | sed 's/^image: //' | sort -u)"
-          for image in $images python:3.13-slim; do
+          bases="$(grep -hoE '^(FROM |COPY --from=)[^ ]+' docs/profiles/single-server.md | sed -E 's/^(FROM |COPY --from=)//' | sort -u)"
+          test -n "$bases"
+          for image in $images $bases; do
             echo "== $image"
             docker buildx imagetools inspect "$image"
           done
