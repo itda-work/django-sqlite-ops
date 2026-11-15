@@ -2,18 +2,23 @@
 
 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/) 형식을 따르고, 버전은 [PEP 440](https://peps.python.org/pep-0440/) 으로 매긴다. 릴리스할 때 `[Unreleased]` 의 항목을 새 버전 절로 옮긴다(`scripts/release_check.py` 가 확인한다).
 
-> ⚠️ **실험적 프로젝트다.** 1.0 전에는 API·동작·지원 범위가 예고 없이 바뀔 수 있다. 사전 릴리스(`a`·`b`·`rc`)는 버전을 명시해 설치한다(`pip install "django-sqlite-ops==0.1.0a2"`). `--pre` 는 모든 의존성의 사전 릴리스까지 허용하므로 쓰지 않는다. 운영 환경에서는 버전을 고정한다.
+> ⚠️ **실험적 프로젝트다.** 1.0 전에는 API·동작·지원 범위가 예고 없이 바뀔 수 있다. 사전 릴리스(`a`·`b`·`rc`)는 버전을 명시해 설치한다(`pip install "django-sqlite-ops==0.1.0a3"`). `--pre` 는 모든 의존성의 사전 릴리스까지 허용하므로 쓰지 않는다. 운영 환경에서는 버전을 고정한다.
 
 ## [Unreleased]
+
+## [0.1.0a3] - 2026-11-15
+
+헬스 판정을 좁히고 지원 범위를 넓힌 사전 릴리스다. Python 3.15 와 Litestream 0.5.18 을 받고, 시스템 체크·doctor·boot 의 안내를 더했으며, 헬스의 `caught_up` 이 멈춘 복제 파이프라인을 감추지 않게 했다. 배포 프로필의 Dockerfile 기준 이미지가 바뀌었다. 저장소 안의 CI·회귀 랩·측정(#104·#105·#106)은 배포물에 영향이 없으므로 여기 적지 않는다.
 
 ### Added
 
 - **Python 3.15 를 지원한다.** Django 6.1(3.15 를 지원하는 6.1.3 이상)과 함께다. Django 5.2 는 Python 3.14 까지 지원하므로 3.15 × Django 5.2 는 지원 범위가 아니다. CI 가 3.15 에서 전체 테스트와 실제 Litestream(0.5.17·0.5.18)·channels-lite 통합 테스트를 돌고, classifier 에 `Programming Language :: Python :: 3.15` 를 넣었다 (#101)
 - **시스템 체크 `sqlite_ops.W006`: `ATOMIC_REQUESTS` 와 `transaction_mode` `IMMEDIATE`(또는 `EXCLUSIVE`)를 함께 쓰면 알린다.** 이 조합에서는 뷰마다 `BEGIN IMMEDIATE` 가 쓰기 잠금을 뷰 끝까지 쥐어 읽기만 하는 뷰도 직렬로 돈다(0.3초 뷰 4개 동시 호출에 0.32·0.67·0.99·1.31초, 끄면 모두 0.32초 — 재현함). 항상 도는 체크이고 DB 를 열지 않는다. 읽기 전용·VFS·메모리 DB 별칭에는 내지 않는다. 힌트는 `ATOMIC_REQUESTS` 를 끄고 쓰는 뷰에만 `transaction.atomic()` 을 쓰거나 읽기 뷰에 `transaction.non_atomic_requests` 를 붙이라고 안내한다. 설정은 바꾸지 않는다. 의도한 구성이면 `SILENCED_SYSTEM_CHECKS` 로 끈다. `check --fail-level WARNING` 을 쓰는 CI 는 이 조합에서 실패로 바뀐다 (#102)
-- **`sqlite_doctor` 가 SQLite WAL-reset 버그의 영향 범위인 판을 알린다.** SQLite 공식 문서(https://sqlite.org/wal.html#the_wal_reset_bug, 2026-11-12 확인)의 범위(3.7.0~3.51.2, 3.51.3 에서 수정, 3.44.6·3.50.7 로 백포트)에 들면 `sqlite_version` 줄에 메시지를 적는다. 판 번호만 보므로 배포판이 판 번호를 바꾸지 않고 패치했을 수 있다. **수준은 `ok` 이고 종료 코드는 바뀌지 않는다**(프로필 이미지 `python:3.13-slim` 의 3.46.1 도 범위 안이다). `--json` 의 키는 그대로다. 판정 함수 `doctor.wal_reset_affected()` 를 둔다 (#103)
+- **`sqlite_doctor` 가 SQLite WAL-reset 버그의 영향 범위인 판을 알린다.** SQLite 공식 문서(https://sqlite.org/wal.html#the_wal_reset_bug, 2026-11-12 확인)의 범위(3.7.0~3.51.2, 3.51.3 에서 수정, 3.44.6·3.50.7 로 백포트)에 들면 `sqlite_version` 줄에 메시지를 적는다. 판 번호만 보므로 배포판이 판 번호를 바꾸지 않고 패치했을 수 있다. **수준은 `ok` 이고 종료 코드는 바뀌지 않는다**(공식 `python:*-slim` 이미지의 3.46.1 은 범위 안이다. 배포 프로필 이미지는 #117 부터 SQLite 3.53.1 이라 메시지가 나오지 않는다). 철회판 3.52.0 은 수정 check-in 을 조상으로 두므로 범위로 보지 않는다(sqlite.org 타임라인, 2026-11-13 확인). `--json` 의 키는 그대로다. 판정 함수 `doctor.wal_reset_affected()` 를 둔다 (#103·#117)
 
 ### Changed
 
+- **헬스의 `caught_up` 이 좁아졌다 — 복제 파이프라인이 멈춘 것을 알면 `backlog` 다.** `caught_up` 은 "TXID·WAL 위치가 맞고 파이프라인이 멈췄다는 근거가 없다"는 뜻이 됐다. 새로 나오는 판정은 셋이다. (1) `backlog`/`compaction_stalled`: 다른 판정이 `caught_up` 인데 L1 이 덮지 않은 가장 오래된 원격 L0 가 가장 새 원격 객체보다 `COMPACTION_GRACE` 이상 오래됨 — 로컬 L0 손상 등으로 L1 컴팩션이 멈춘 것이다(예전에는 TXID 가 같아 `caught_up` 이었다). 새 설정 `SQLITE_OPS["HEALTH"]["COMPACTION_GRACE"]`(기본 300초, `None` 이면 끔)이고, Litestream 의 `levels` 에서 L1 `interval` 을 바꿨다면 그 10배 이상으로 둔다. (2) `backlog`/`db_not_replicated`: Litestream 없이 DB 가 바뀐 채 `BACKLOG_GRACE` 가 지남 — 요청마다 연결을 닫는 앱에서 WAL 근거와 파일 시각 근거가 번갈아 나와도 같은 최신 L0 면 이어 센다(예전에는 그때마다 다시 세어 `unknown`·`caught_up` 을 오갔다). (3) `unknown`/`no_compaction_evidence`: 복제본 객체의 시각을 읽지 못해 컴팩션 진행을 판정할 수 없음(검증한 판에서는 나오지 않는다). 응답 필드와 `version` 은 그대로이고 원격 호출은 늘지 않는다(이미 부르는 `ltx -level all -json` 을 쓴다). 한계: 쓰기가 없는 동안의 정지(유휴 중 Litestream 없음 포함)는 다음 쓰기 전까지 `caught_up` 으로 남는다. **운영 영향: `?strict=1` 이나 "`caught_up` 이 아니면 경보" 규칙이 이 상태들에서 새로 울릴 수 있다** (#115)
 - **배포 프로필의 Dockerfile 이 WAL-reset 버그가 고쳐진 SQLite 로 Python 을 돌린다.** 기준 이미지가 `python:3.13-slim`(SQLite 3.46.1, 영향 범위)에서 `debian:trixie-slim` + uv 가 받는 Python 3.14(python-build-standalone, SQLite 3.53.1 정적 포함)로 바뀌었다. 빌드 중 SQLite 가 3.51.3 미만이면 빌드가 멈춘다. Debian(trixie `deb13u2`·bookworm `deb12u2`)에는 수정이 없고 Ubuntu 수정은 `-proposed` 에만 있다(2026-11-13 확인). 이 Dockerfile 을 따라 쓰던 운영자에게 바뀌는 것: 패키지는 `/opt/venv`(`PATH` 첫 자리)에 들어가고 **`pip` 가 없다** — 더할 패키지는 `uv pip install` 로 넣는다. Python 판은 `ARG PYTHON_VERSION`(기본 3.14)이다. Python·SQLite·OpenSSL 의 보안 업데이트는 `apt` 가 아니라 **uv 판(`ghcr.io/astral-sh/uv:<판>`)을 올리고 다시 빌드**할 때 들어온다. 이미지가 커진다(로컬 측정 arm64 376→475MB, amd64 355→492MB). Litestream 0.5.17·0.5.18 은 자체 SQLite 3.53.0 을 품어 원래 영향 범위가 아니었다. 패키지 코드는 바뀌지 않았다 (#117)
 - **Litestream 0.5.18 을 검증한 판으로 받는다.** boot·`sqlite_doctor` 의 Litestream 설정 대조·헬스·`--restore-test` 가 0.5.17 과 0.5.18 을 받고 그 밖의 판은 계속 거부한다. 0.5.18 실측 fixture(`file://` 복제본의 `ltx`·`databases`·`restore`)의 출력 형식·rc·오류 문구는 0.5.17 과 같았다(시각·크기·압축 묶음만 다름). 배포 프로필 `single-server` 의 Dockerfile 이 0.5.18 을 설치한다 (#99)
 - **S3 가 연결을 거부할 때 0.5.18 은 더 빨리 실패한다.** 0.5.17 의 `ltx` 는 30초 타임아웃까지 매달려 사유가 `timed out` 이었고, 0.5.18 은 약 8초 뒤 `exited with 1: … exceeded maximum number of attempts` 로 끝난다. boot 의 거부(exit 2, `remote_error`)와 헬스의 `unknown` 은 두 판에서 같고, 헬스의 `stale`↔`remote_error` 주기만 짧아진다. 0.5.18 은 이때 Litestream ERROR 로그도 남긴다 (#99)
@@ -53,6 +58,7 @@
 
 - 미검증 항목은 [DESIGN §12](docs/DESIGN.md#12-미검증확인-필요) 에 있다. 실제 클라우드 S3·R2·Tigris, Windows 의 boot CLI, ASGI 에서의 VFS 별칭 동작은 검증하지 않았다.
 
-[Unreleased]: https://github.com/itda-work/django-sqlite-ops/compare/v0.1.0a2...HEAD
+[Unreleased]: https://github.com/itda-work/django-sqlite-ops/compare/v0.1.0a3...HEAD
+[0.1.0a3]: https://github.com/itda-work/django-sqlite-ops/compare/v0.1.0a2...v0.1.0a3
 [0.1.0a2]: https://github.com/itda-work/django-sqlite-ops/compare/v0.1.0a1...v0.1.0a2
 [0.1.0a1]: https://github.com/itda-work/django-sqlite-ops/releases/tag/v0.1.0a1
