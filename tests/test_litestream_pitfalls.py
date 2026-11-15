@@ -12,7 +12,8 @@ CLAUDE.md '함정'·README 문제 해결·DESIGN 이 말하는 Litestream 동작
 ``test_real_hanging_s3_endpoint_times_out`` 이 본다.
 """
 
-import http.server
+import re
+import socket
 import sqlite3
 import subprocess
 import threading
@@ -62,16 +63,15 @@ NO_SCHEME_RESTORE_TIMEOUT = 40
 HTTPS_TO_HTTP = "http: server gave HTTP response to HTTPS client"
 
 
-class _PlainHandler(http.server.BaseHTTPRequestHandler):
-    def do_GET(self) -> None:  # noqa: N802
-        body = b"plain http"
-        self.send_response(200)
-        self.send_header("Content-Length", str(len(body)))
-        self.end_headers()
-        self.wfile.write(body)
-
-    def log_message(self, *args: object) -> None:
-        pass
+# 평문 서버는 HTTP 가 아닌 첫 바이트(TLS ClientHello)에 **늘 `HTTP/1.0 400` 상태 줄로** 답해야 한다.
+# Go 의 net/http 는 TLS 레코드 헤더 오류의 첫 5바이트가 `HTTP/` 일 때만 HTTPS_TO_HTTP 를 쓰고,
+# 아니면 `tls: first record does not look like a TLS handshake` 를 쓴다
+# (go1.27 net/http/client.go 276, crypto/tls/conn.go 669). 표준 http.server 는 판에 따라 이 경우
+# 상태 줄 없이(HTTP/0.9 식) 답해서 쓰지 않는다(CPython 3.14.4 재현함. 3.13.15·3.14.7·3.14.8·3.15.2
+# 는 상태 줄로 답한다 — #119).
+_PLAIN_OK = b"HTTP/1.0 200 OK\r\nContent-Length: 10\r\nConnection: close\r\n\r\nplain http"
+_PLAIN_BAD = b"HTTP/1.0 400 Bad Request\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+_REQUEST_LINE = re.compile(rb"[A-Z]+ \S+ HTTP/1\.[01]\r\n")
 
 
 @dataclass
@@ -80,23 +80,59 @@ class PlainHttp:
     errors: list[str]
 
 
+def _serve_plain(conn: socket.socket, errors: list[str]) -> None:
+    with conn:
+        conn.settimeout(5)
+        data = b""
+        try:
+            # 요청 줄로 판정한다. 첫 바이트가 대문자가 아니면 HTTP 가 아니므로 더 읽지 않는다.
+            while b"\r\n" not in data and len(data) < 8192:
+                chunk = conn.recv(4096)
+                if not chunk:
+                    return
+                data += chunk
+                if not data[:1].isupper():
+                    break
+            if _REQUEST_LINE.match(data):
+                while b"\r\n\r\n" not in data and len(data) < 65536:
+                    chunk = conn.recv(4096)
+                    if not chunk:
+                        break
+                    data += chunk
+                conn.sendall(_PLAIN_OK)
+            else:
+                errors.append(f"not an HTTP request: {data[:16]!r}")
+                conn.sendall(_PLAIN_BAD)
+        except OSError as exc:
+            errors.append(f"connection error: {exc!r}")
+
+
 @pytest.fixture
 def plain_http() -> Iterator[PlainHttp]:
-    """평문 HTTP 서버. TLS ClientHello 가 오면 400 을 내고 ``errors`` 에 남긴다."""
+    """평문 HTTP 서버. HTTP 가 아닌 요청(TLS ClientHello)에는 상태 줄과 함께 400 을 낸다.
+
+    그런 요청은 ``errors`` 에 남긴다.
+    """
     errors: list[str] = []
+    listener = socket.create_server(("127.0.0.1", 0))
+    stop = threading.Event()
 
-    class Handler(_PlainHandler):
-        def log_error(self, fmt: str, *args: object) -> None:
-            errors.append(fmt % args)
+    def accept_loop() -> None:
+        while not stop.is_set():
+            try:
+                conn, _ = listener.accept()
+            except OSError:
+                return
+            threading.Thread(target=_serve_plain, args=(conn, errors), daemon=True).start()
 
-    server = http.server.ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread = threading.Thread(target=accept_loop, daemon=True)
     thread.start()
     try:
-        yield PlainHttp(server.server_address[1], errors)
+        yield PlainHttp(listener.getsockname()[1], errors)
     finally:
-        server.shutdown()
-        server.server_close()
+        stop.set()
+        listener.close()
+        thread.join(timeout=5)
 
 
 def s3_replica(endpoint: str) -> str:
