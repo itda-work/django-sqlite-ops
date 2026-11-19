@@ -31,7 +31,7 @@ SUBSTITUTIONS = {
     ],
     "requirements.txt": [
         (
-            "django-sqlite-ops==0.1.0a3",
+            "django-sqlite-ops==0.1.0a4",
             f"django-sqlite-ops @ file:///app/{WHEEL_PLACEHOLDER}",
         ),
     ],

@@ -2,13 +2,17 @@
 
 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/) 형식을 따르고, 버전은 [PEP 440](https://peps.python.org/pep-0440/) 으로 매긴다. 릴리스할 때 `[Unreleased]` 의 항목을 새 버전 절로 옮긴다(`scripts/release_check.py` 가 확인한다).
 
-> ⚠️ **실험적 프로젝트다.** 1.0 전에는 API·동작·지원 범위가 예고 없이 바뀔 수 있다. 사전 릴리스(`a`·`b`·`rc`)는 버전을 명시해 설치한다(`pip install "django-sqlite-ops==0.1.0a3"`). `--pre` 는 모든 의존성의 사전 릴리스까지 허용하므로 쓰지 않는다. 운영 환경에서는 버전을 고정한다.
+> ⚠️ **실험적 프로젝트다.** 1.0 전에는 API·동작·지원 범위가 예고 없이 바뀔 수 있다. 사전 릴리스(`a`·`b`·`rc`)는 버전을 명시해 설치한다(`pip install "django-sqlite-ops==0.1.0a4"`). `--pre` 는 모든 의존성의 사전 릴리스까지 허용하므로 쓰지 않는다. 운영 환경에서는 버전을 고정한다.
 
 ## [Unreleased]
 
+## [0.1.0a4] - 2026-11-19
+
+boot 의 복원 보호를 더한 사전 릴리스다. 판정 때 조회한 원격 TXID 보다 뒤인 복원본을 설치하지 않는다(#122). Litestream 0.5.18 에서 최신 로컬 L0 가 깨진 뒤 만든 복원본의 행·값을 실제 바이너리로 검증해 테스트에 고정했다(#124 — 검증 범위가 넓어졌을 뿐 패키지 동작은 바뀌지 않는다). 검증한 Litestream 판(0.5.17·0.5.18)과 지원 범위는 0.1.0a3 과 같다.
+
 ### Fixed
 
-- **boot 가 판정 때 조회한 원격 TXID 보다 뒤인 복원본을 설치하지 않는다.** `restore`·`quarantine_and_restore` 에서 임시 복원의 TXID 가 판정에 쓴 원격 최대 TXID 보다 낮으면 격리·설치·exec 전에 exit 4(복원 실패)로 끝난다. 로컬은 바뀌지 않고 `<db>.restore-…/` 는 조사용으로 남는다. 예전에는 조회와 복원 사이에 복제본이 뒤로 가면(롤백·덮어쓰기·둘째 쓰기자) 그 복원본을 설치했고, `remote_ahead` 격리 경로에서는 더 새로운 로컬을 치우고 더 오래된 DB 를 설치할 수 있었다(실제 Litestream 0.5.17 `file://` 복제본으로 재현함). 같거나 앞서면 그대로 설치한다(복원 중 새 업로드는 정상, `--restore-test` 와 같은 규칙). Litestream 호출은 늘지 않고 판정·사유 코드는 그대로다. 조회 전에 이미 뒤로 간 복제본은 잡지 못한다 (#122)
+- **boot 가 판정 때 조회한 원격 TXID 보다 뒤인 복원본을 설치하지 않는다.** `restore`·`quarantine_and_restore` 에서 임시 복원의 TXID 가 판정에 쓴 원격 최대 TXID 보다 낮으면 격리·설치·exec 전에 exit 4(복원 실패)로 끝난다. 로컬은 바뀌지 않고 `<db>.restore-…/` 는 조사용으로 남는다. 예전에는 조회와 복원 사이에 복제본이 뒤로 가면(롤백·덮어쓰기·둘째 쓰기자) 그 복원본을 설치했고, `remote_ahead` 격리 경로에서는 더 새로운 로컬을 치우고 더 오래된 DB 를 설치할 수 있었다(실제 Litestream 0.5.17·0.5.18 `file://` 복제본으로 재현함). 같거나 앞서면 그대로 설치한다(복원 중 새 업로드는 정상, `--restore-test` 와 같은 규칙). Litestream 호출은 늘지 않고 판정·사유 코드는 그대로다. 조회 전에 이미 뒤로 간 복제본은 잡지 못한다 (#122)
 
 ## [0.1.0a3] - 2026-11-15
 
@@ -62,7 +66,8 @@
 
 - 미검증 항목은 [DESIGN §12](docs/DESIGN.md#12-미검증확인-필요) 에 있다. 실제 클라우드 S3·R2·Tigris, Windows 의 boot CLI, ASGI 에서의 VFS 별칭 동작은 검증하지 않았다.
 
-[Unreleased]: https://github.com/itda-work/django-sqlite-ops/compare/v0.1.0a3...HEAD
+[Unreleased]: https://github.com/itda-work/django-sqlite-ops/compare/v0.1.0a4...HEAD
+[0.1.0a4]: https://github.com/itda-work/django-sqlite-ops/compare/v0.1.0a3...v0.1.0a4
 [0.1.0a3]: https://github.com/itda-work/django-sqlite-ops/compare/v0.1.0a2...v0.1.0a3
 [0.1.0a2]: https://github.com/itda-work/django-sqlite-ops/compare/v0.1.0a1...v0.1.0a2
 [0.1.0a1]: https://github.com/itda-work/django-sqlite-ops/releases/tag/v0.1.0a1
