@@ -52,7 +52,7 @@ Litestream 만 쓰면 옛 볼륨으로 재부팅했을 때 최신 복제본이 �
 
 ## 현재 상태
 
-PyPI 에 **실험적 사전 릴리스**로 배포한다([D-28](docs/DECISIONS.md), 2026-10-26 결정). 첫 버전은 `0.1.0a1`(2026-10-26), 지금은 `0.1.0a3` 이다. 사전 릴리스는 버전을 명시해 설치한다(아래 [설치](#설치)). 바뀐 점은 [CHANGELOG](CHANGELOG.md) 에 적는다. 외부 홍보는 하지 않는다. 패키지 이름 `django-sqlite-ops` 는 확정이다(D-28 이 D-6 을 갱신).
+PyPI 에 **실험적 사전 릴리스**로 배포한다([D-28](docs/DECISIONS.md), 2026-10-26 결정). 첫 버전은 `0.1.0a1`(2026-10-26), 지금은 `0.1.0a4`(2026-11-19) 다. 사전 릴리스는 버전을 명시해 설치한다(아래 [설치](#설치)). 바뀐 점은 [CHANGELOG](CHANGELOG.md) 에 적는다. 외부 홍보는 하지 않는다. 패키지 이름 `django-sqlite-ops` 는 확정이다(D-28 이 D-6 을 갱신).
 
 | 기능 | 상태 | 이슈·근거 |
 |---|---|---|
@@ -74,16 +74,16 @@ PyPI 에 **실험적 사전 릴리스**로 배포한다([D-28](docs/DECISIONS.md
 PyPI 에서 설치한다. 사전 릴리스는 버전을 명시해 설치한다. 실험적 프로젝트이므로 그 버전으로 고정해 둔다.
 
 ```bash
-pip install "django-sqlite-ops==0.1.0a3"
+pip install "django-sqlite-ops==0.1.0a4"
 # 또는
-uv add "django-sqlite-ops==0.1.0a3"
+uv add "django-sqlite-ops==0.1.0a4"
 ```
 
 필수 의존성은 Django 하나다. 채널 레이어는 extra 로 고른다: `[nats]`(channels-nats), `[channels-lite]`(channels-lite 만. aio 레이어에 필요한 의존성은 [channels-lite 패치 '함정'](#channels-lite-패치)). **channels-nats 는 0.10.1 이상을 쓴다** — 0.10.0 이하는 구독 확인이 취소되면 그 워커가 채널 메시지를 더 받지 못한다([문제 해결 '채널 레이어'](#채널-레이어)). 0.1.0a2 부터 `[nats]` 가 `channels-nats>=0.10.1` 을 요구한다(#91). 0.1.0a1 을 쓴다면 `[nats]` 에 하한이 없으므로 `channels-nats>=0.10.1` 을 함께 적는다. lock 파일에 0.10.0 이하가 잠겨 있으면 `uv lock --upgrade-package channels-nats` 처럼 그 패키지를 올린다.
 
 ```bash
-pip install "django-sqlite-ops[nats]==0.1.0a3"
-uv add "django-sqlite-ops[channels-lite]==0.1.0a3"
+pip install "django-sqlite-ops[nats]==0.1.0a4"
+uv add "django-sqlite-ops[channels-lite]==0.1.0a4"
 ```
 
 `pip install --pre` 나 `uv add --prerelease=allow` 는 쓰지 않는다. 이 패키지뿐 아니라 Django 를 비롯한 **모든 의존성**의 사전 릴리스까지 허용한다(`uv add --prerelease=allow` 는 `uv.lock` 에 `prerelease-mode = "allow"` 로 남아 이후의 해석에도 적용된다). 버전을 지정자에 명시하면 그 사전 릴리스만 받아들여진다. 정식 릴리스가 나온 뒤에는 명시하지 않으면 사전 릴리스를 고르지 않는다.
@@ -1001,7 +1001,7 @@ SQLite 공식 문서([wal.html §11](https://sqlite.org/wal.html#the_wal_reset_b
 | exit 2, `--meta-path ... is not a directory`·`broken symbolic link` | 메타 경로에 정규 파일·FIFO·끊어진 링크가 있다 | 메타 경로를 확인해 디렉터리로 두거나 경로를 고친다. boot 는 그 파일을 격리하지 않는다 | 코드상 확인(#39 테스트) |
 | exit 5 | 같은 볼륨에서 boot 나 그것이 exec 한 앱이 이미 돈다(잠금은 exec 된 명령에 상속) | 앞선 컨테이너를 멈춘다. `<db>.boot.lock` 은 지우지 않는다([함정](#boot-cli)) | 코드상 확인 |
 | 옛 볼륨으로 다시 띄우자 exit 2, `remote_ahead` | 복제본이 이 볼륨보다 새롭다. 보호가 없으면 최신본이 옛 볼륨으로 덮인다 | 복제본이 정본이면 `--on-unknown restore` 로 한 번([사유 코드별 대처](#거부됐을-때-exit-2-사유-코드별-대처)) | 실측(docker D4: 150건이 55건으로 덮임), 재현함(회귀 랩 L2: boot 가 exit 2 로 막고 복제본 무변경) |
-| exit 4, `restored txid R is behind remote txid N observed before restore; not installing` | boot 가 판정 때 조회한 원격 최대 TXID(N)보다 복원본(R)이 뒤다. 조회와 복원 사이에 복제본이 뒤로 갔다(버킷 롤백·객체 삭제·덮어쓰기, 같은 경로에 쓰는 둘째 `replicate`). 같거나 앞서면 정상으로 설치한다(복원 중 새 업로드) | `hint:` 줄대로 복제본이 롤백·덮어써졌는지, 다른 머신·컨테이너가 같은 경로로 복제하는지 확인한 뒤 다시 띄운다. 로컬은 바뀌지 않았고 `<db>.restore-…/` 는 조사 뒤 지운다. 조회 전에 이미 뒤로 간 복제본은 이 검사로 잡지 못한다 | 재현함(실제 Litestream 0.5.17 `file://` 복제본을 restore 직전에 옛 사본으로 되돌림 → 수정 전에는 TXID 1 을 설치하고 exec, `tests/test_boot_cli.py` 의 `test_replica_rolled_back_between_lookup_and_restore_exits_4`, 2026-11-19 #122). 실제 S3 에서의 발생 빈도는 미확인 |
+| exit 4, `restored txid R is behind remote txid N observed before restore; not installing` | boot 가 판정 때 조회한 원격 최대 TXID(N)보다 복원본(R)이 뒤다. 조회와 복원 사이에 복제본이 뒤로 갔다(버킷 롤백·객체 삭제·덮어쓰기, 같은 경로에 쓰는 둘째 `replicate`). 같거나 앞서면 정상으로 설치한다(복원 중 새 업로드) | `hint:` 줄대로 복제본이 롤백·덮어써졌는지, 다른 머신·컨테이너가 같은 경로로 복제하는지 확인한 뒤 다시 띄운다. 로컬은 바뀌지 않았고 `<db>.restore-…/` 는 조사 뒤 지운다. 조회 전에 이미 뒤로 간 복제본은 이 검사로 잡지 못한다 | 재현함(실제 Litestream 0.5.17·0.5.18 `file://` 복제본을 restore 직전에 옛 사본으로 되돌림 → 수정 전에는 TXID 1 을 설치하고 exec, `tests/test_boot_cli.py` 의 `test_replica_rolled_back_between_lookup_and_restore_exits_4`, 2026-11-19 #122). 실제 S3 에서의 발생 빈도는 미확인 |
 | 복원 직후 컨테이너가 죽은 뒤 exit 2, `no_local_meta` | 복원한 DB 옆에는 Litestream 메타가 없고 `replicate` 가 첫 변경을 기록해야 생긴다 | `--on-unknown restore` 로 한 번([복원 직후 크래시 복구](#복원-직후-크래시-복구)) | 실측(restore 결과에 메타 없음. 0.5.17·0.5.18, #105), [D-14](docs/DECISIONS.md) |
 | 직접 만든 entrypoint 의 `litestream restore -if-db-not-exists` 가 복원을 건너뛴다 | 0바이트 DB 파일이 있으면 rc 0 으로 건너뛴다(`database already exists, skipping`) | boot 를 쓴다. `manage.py` 를 boot 앞에서 부르지 않는다([boot CLI](#boot-cli)) | 재현함([DESIGN §4-1](docs/DESIGN.md#4-1-왜-django-관리-명령이-아닌가). 0.5.17·0.5.18, #105) |
 
