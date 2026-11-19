@@ -310,7 +310,13 @@ class Writer:
         self.paused = threading.Event()
         self.errors: list[BaseException] = []
         self.rows = 0
+        self.lock = threading.Lock()  # 쓰는 동안 쥔다. ``pause()`` 가 진행 중인 쓰기를 기다린다
         self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def pause(self):
+        """쓰기를 멈춘다. 돌아오면 진행 중인 쓰기도 끝나 있다(더 쓰지 않는다)."""
+        with self.lock:
+            self.paused.set()
 
     def _connect(self):
         con = sqlite3.connect(self.db, isolation_level=None, timeout=10)
@@ -321,14 +327,15 @@ class Writer:
         con = self._connect() if self.hold else None
         try:
             while not self.stop.is_set():
-                if not self.paused.is_set():
-                    c = con or self._connect()
-                    try:
-                        c.execute("insert into t(v) values (randomblob(500))")
-                        self.rows += 1
-                    finally:
-                        if con is None:
-                            c.close()
+                with self.lock:
+                    if not self.paused.is_set():
+                        c = con or self._connect()
+                        try:
+                            c.execute("insert into t(v) values (randomblob(500))")
+                            self.rows += 1
+                        finally:
+                            if con is None:
+                                c.close()
                 self.stop.wait(self.interval)
         except BaseException as exc:  # noqa: BLE001
             self.errors.append(exc)
@@ -519,15 +526,46 @@ def test_real_corrupt_uncompacted_l0_is_compaction_stalled(tmp_path, litestream_
 # - 0.5.18: 마지막으로 쓴 L0 의 마지막 페이지를 메모리에 두고(db.go `lastLTXPage`, 82·2369–2371행)
 #   lastPageMatch() 가 그것과 비교하므로(1946행) 디스크의 손상을 읽지 않는다. sync error 0줄,
 #   L0 기록은 계속되고 L1 컴팩션만 그 L0 를 읽다 실패한다 → compaction_stalled.
+# 손상 뒤 복원본(#124, 재현함): 손상 전후에 쓴 행을 확정 근거(WAL 위치·원격 TXID)로 나눠 복원본과
+# 값까지 비교한다. 0.5.18 은 손상 뒤 커밋도 원격에 닿으므로 모든 행이, 0.5.17 은 sync 가 멈추므로
+# 손상 전 행만 복원된다. 어느 판도 깨뜨린 L0 의 커밋은 원격 사본으로 온전히 돌아온다.
 # 표에 없는 판은 기대가 없으므로 실패한다(통과시키지 않는다).
 LATEST_L0_CORRUPTION = {
-    "0.5.17": {"code": "db_not_replicated", "sync_error": True},
-    "0.5.18": {"code": "compaction_stalled", "sync_error": False},
+    "0.5.17": {"code": "db_not_replicated", "sync_error": True, "restored_rows": "pre_corruption"},
+    "0.5.18": {"code": "compaction_stalled", "sync_error": False, "restored_rows": "all"},
 }
+
+AFTER_CORRUPTION_ROWS = 10
+
+
+def _rows(path: Path) -> list[tuple[int, bytes]]:
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        return con.execute("select id, v from t order by id").fetchall()
+    finally:
+        con.close()
+
+
+def _count(path: Path) -> int:
+    con = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        return con.execute("select count(*) from t").fetchone()[0]
+    finally:
+        con.close()
+
+
+def _remote_txid(db: Path, config: Path, binary: str) -> int:
+    remote = litestream.remote_max_txid(db, config=config, binary=binary)
+    assert type(remote) is RemoteTxid, remote
+    return remote.txid
 
 
 def test_real_corrupt_latest_l0(tmp_path, litestream_binary):
-    """최신 로컬 L0 손상: 두 판 모두 caught_up 이 아니게 되지만 사유는 판별이다(위 표)."""
+    """최신 로컬 L0 손상: 두 판 모두 caught_up 이 아니게 되지만 사유는 판별이다(위 표).
+
+    그 뒤 복원본(#124): 복원 직전 관측한 원격 최대 TXID ``N`` 까지의 커밋이 모두 있고 값이 같으며
+    ``integrity_check`` 가 ok 다. 기대 행은 판별 표의 ``restored_rows`` 다.
+    """
     version = litestream.version(binary=litestream_binary)
     want = LATEST_L0_CORRUPTION.get(version or "")
     assert want is not None, f"no expectation for litestream {version}"
@@ -536,6 +574,15 @@ def test_real_corrupt_latest_l0(tmp_path, litestream_binary):
     try:
         with Writer(db, hold=True) as w:
             _until(m, lambda e: e["status"] == CAUGHT_UP, 30)
+            # 로컬 L0 가 TXID 3 에 닿을 때까지 쓴다. 그러면 깨뜨리는 최신 L0 는 TXID ≥ 3 이라 첫
+            # L0(TXID 1, DB 전체) 도, 그 바로 뒤 첫 증분도 아니다: 복원이 온전한 증분을 하나 이상
+            # 적용한 뒤 깨뜨린 증분을 원격 사본으로 읽어야 한다. 2 로도 '증분'은 되지만 앞선 증분이
+            # 없다. 3 이 꼭 필요하다는 실측은 아니다(#124 게이트 전 실행은 0.5.17 이 TXID 1,
+            # 0.5.18 이 2 를 깨뜨렸고 그때도 통과했다). 흔한 경우를 고정하려는 선택이다.
+            deadline = time.monotonic() + 30
+            while (litestream.local_max_txid(db) or 0) < 3:
+                assert time.monotonic() < deadline, "litestream wrote no incremental L0"
+                time.sleep(0.2)
             # 쓰기를 멈추고 Litestream 이 마지막 커밋을 L0 로 쓸 때까지 기다린다(그 L0 가 최신).
             # 그 L0 가 이미 L1 로 컴팩션됐으면 0.5.18 은 디스크의 L0 를 다시 읽지 않아 손상이
             # 드러나지 않는다(전체 실행에서 1회 재현함). 그래서 마지막 L1 경계 0.5초 뒤에 생겼고
@@ -544,27 +591,90 @@ def test_real_corrupt_latest_l0(tmp_path, litestream_binary):
             tries = []
             while True:
                 assert time.monotonic() < deadline, f"no uncompacted latest L0 to corrupt: {tries}"
-                w.paused.set()
+                w.pause()
+                # caught_up/in_sync: -wal 의 모든 커밋이 최신 L0 안이고 원격 TXID ≥ 로컬 TXID
                 _until(m, lambda e: e["code"] == "in_sync", 30)
                 now = time.time()
                 boundary = now - (now % L1_INTERVAL)
                 latest, mtime = _l0_mtimes(db)[-1]
                 tries.append((round(mtime - boundary, 2), round(now % L1_INTERVAL, 2)))
                 if mtime > boundary + 0.5 and now % L1_INTERVAL < L1_INTERVAL - 0.5:
+                    # 손상 전 확정 묶음: 지금까지의 행 전부(위 in_sync), 깨뜨리는 L0 의 TXID 구간
+                    pre_rows = _count(db)
+                    corrupted = tuple(int(x, 16) for x in latest.name[:-4].split("-"))
+                    local_at_corruption = litestream.local_max_txid(db)
                     _corrupt(latest)
                     break
                 # 다음 경계 1초 뒤까지 쓴다. 0.3초만 넘기면 Litestream 의 1초 tick 위상이 경계
                 # 바로 뒤(0.5초 안)일 때 마지막 L0 가 매번 그 tick 에 생겨 창을 영영 못 찾았다(1회).
                 w.paused.clear()
                 time.sleep(1.0 + (L1_INTERVAL - now % L1_INTERVAL))
+            assert local_at_corruption == corrupted[1] >= 3, (local_at_corruption, corrupted)
             w.paused.clear()
             e, seen = _until(m, lambda e: e["status"] != CAUGHT_UP, 60)
             assert (e["status"], e["code"]) == (BACKLOG, want["code"]), seen
+            # 손상 뒤 묶음: 행을 더 쓰고 멈춘다
+            deadline = time.monotonic() + 30
+            while _count(db) < pre_rows + AFTER_CORRUPTION_ROWS:
+                assert time.monotonic() < deadline, "writer did not add rows after corruption"
+                time.sleep(0.2)
+            w.pause()
+            all_rows = _count(db)
+            # 원격 반영의 확정 근거(시간 경과로 추정하지 않는다)
+            if want["restored_rows"] == "all":
+                # -wal 의 모든 커밋이 최신 L0 안(WAL 위치)이고 원격 최대 TXID 가 그 L0 와 같다
+                deadline = time.monotonic() + 30
+                while True:
+                    ev = health.wal_evidence(str(db), None)
+                    local = litestream.local_max_txid(db)
+                    remote = _remote_txid(db, config, litestream_binary)
+                    if ev.state == IN_SYNC and local is not None and remote == local:
+                        break
+                    assert time.monotonic() < deadline, (ev, local, remote)
+                    time.sleep(0.5)
+                observed = remote
+                assert observed > corrupted[1]
+            else:
+                # sync 가 멈춰 -wal 에 최신 L0 뒤 커밋이 남고, 원격은 깨뜨린 L0 에서 멈춘다
+                assert health.wal_evidence(str(db), None).state == PENDING
+                assert litestream.local_max_txid(db) == corrupted[1]
+                observed = _remote_txid(db, config, litestream_binary)
+                assert observed == corrupted[1]
     finally:
         _stop(proc, log)
     text = (lab / "litestream.log").read_text()
     assert ('msg="sync error"' in text) is want["sync_error"], text[-2000:]
     assert "compaction failed" in text or want["sync_error"], text[-2000:]
+
+    # 복원: Litestream 을 멈춘 뒤 원격 최대 TXID N 을 다시 보고 복원한다. 앱 쓰기 없이도
+    # Litestream 자체 쓰기(`_litestream_seq`)로 N 이 오를 수 있으나(실측에서는 오르지 않았다)
+    # `t` 의 행은 바뀌지 않으므로 기대 행은 그대로다
+    n = _remote_txid(db, config, litestream_binary)
+    assert n >= observed, (n, observed)
+    out = lab / "restored.sqlite3"
+    result = litestream.restore(
+        db, out, config=config, binary=litestream_binary, integrity_check="none"
+    )
+    assert result.ok, result.reason
+    assert result.txid is not None and result.txid >= n, (result.txid, n)
+    expected = all_rows if want["restored_rows"] == "all" else pre_rows
+    assert pre_rows < all_rows  # 손상 뒤 커밋이 실제로 있었다(0.5.17 은 그것이 빠진다)
+    con = sqlite3.connect(f"file:{out}?mode=ro", uri=True)
+    try:
+        assert con.execute("pragma integrity_check").fetchall() == [("ok",)]
+    finally:
+        con.close()
+    live = _rows(db)
+    restored = _rows(out)
+    assert len(live) == all_rows and [i for i, _ in live] == list(range(1, all_rows + 1))
+    # id 구멍 없이 1..expected, 값(500바이트 blob)까지 라이브 DB 와 같다
+    assert [i for i, _ in restored] == list(range(1, expected + 1)), (len(restored), expected)
+    assert restored == live[:expected]
+    print(
+        f"#124 litestream {version}: pre_rows={pre_rows} all_rows={all_rows} "
+        f"corrupted_l0={corrupted[0]:#x}-{corrupted[1]:#x} N={n:#x} "
+        f"restored_txid={result.txid:#x} restored_rows={len(restored)}"
+    )
 
 
 def test_real_no_litestream_with_closing_connections_is_backlog(tmp_path, litestream_binary):
