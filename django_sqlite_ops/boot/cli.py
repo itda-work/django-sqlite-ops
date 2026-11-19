@@ -721,6 +721,36 @@ def restore_to_temp(db: Path, args: argparse.Namespace) -> tuple[Path, int]:
     return out, result.txid
 
 
+_BEHIND_HINT = (
+    "the replica went backwards between lookup and restore; check whether it was rolled "
+    "back or overwritten, or whether a second replicate writes to the same path, then rerun"
+)
+
+
+def check_restored_txid(restored: Path, restored_txid: int, remote_txid: int | None) -> None:
+    """복원 TXID 가 판정에 쓴 원격 TXID 보다 낮으면 exit 4. 격리·설치 전에 부른다(#122).
+
+    같거나 높으면 통과한다(복원 중 새 업로드로 원격이 앞서는 것은 정상이다, D-22). 낮으면
+    조회 뒤 복제본이 뒤로 간 것이라 판정할 수 없다. 격리 경로에서는 더 새로운 로컬을 치우고
+    더 오래된 복원본을 설치하게 되므로 로컬을 그대로 두고 임시 디렉터리는 조사용으로 남긴다.
+    """
+    if remote_txid is None:
+        # 판정표(§4-3)상 복원 조치는 원격 TXID 가 있을 때만 난다. 없으면 하한을 모르니 거부한다.
+        raise _Exit(
+            EXIT_RESTORE,
+            f"no remote txid was observed for this restore; not installing "
+            f"(left {restored.parent} for inspection)",
+        )
+    if restored_txid >= remote_txid:
+        return
+    log(f"hint: {_BEHIND_HINT}")
+    raise _Exit(
+        EXIT_RESTORE,
+        f"restored txid {restored_txid} is behind remote txid {remote_txid} observed "
+        f"before restore; not installing (left {restored.parent} for inspection)",
+    )
+
+
 def install(restored: Path, db: Path) -> None:
     """임시 복원 DB 를 DB 경로로 rename 한다. 그 자리에 무엇이 있으면 거부한다."""
     if os.path.lexists(db):
@@ -869,6 +899,8 @@ class _Plan:
     reason: str
     # 사유 코드의 기본 힌트 대신 쓸 힌트. 같은 사유 코드라도 입력에 따라 안내가 다를 때만 쓴다.
     hint: str | None = None
+    # 판정에 쓴 원격 최대 TXID. 복원 조치에서 복원 TXID 의 하한이다(#122).
+    remote_txid: int | None = None
 
 
 _HINTS = {
@@ -980,7 +1012,9 @@ def _plan(args: argparse.Namespace) -> _Plan:
     remote = ls.remote_max_txid(
         db, config=args.config, binary=args.litestream, timeout=args.ltx_timeout
     )
+    remote_txid = None
     if type(remote) is RemoteTxid:
+        remote_txid = remote.txid
         remote_text = f"txid {remote.txid}"
     elif type(remote) is RemoteError:
         remote_text = f"error: {remote.message}"
@@ -995,7 +1029,13 @@ def _plan(args: argparse.Namespace) -> _Plan:
     if not local_exists and orphans:
         reason = f"no local db but {', '.join(orphans)} exist; remote {remote_text}"
         if args.on_unknown == OnUnknown.RESTORE.value and type(remote) is RemoteTxid:
-            return _Plan(State.UNKNOWN, Action.QUARANTINE_AND_RESTORE, ORPHAN_SIDECARS, reason)
+            return _Plan(
+                State.UNKNOWN,
+                Action.QUARANTINE_AND_RESTORE,
+                ORPHAN_SIDECARS,
+                reason,
+                remote_txid=remote_txid,
+            )
         hint = None
         if type(remote) is RemoteError:
             hint = _lookup_failed_hint(ORPHAN_SIDECARS, remote, args.litestream)
@@ -1022,7 +1062,7 @@ def _plan(args: argparse.Namespace) -> _Plan:
     elif type(remote) is RemoteError:
         # 사유 코드가 무엇이든(remote_error·stale_meta·empty_db) 조회 실패를 먼저 안내한다.
         hint = _lookup_failed_hint(d.reason_code, remote, args.litestream)
-    return _Plan(d.state, d.action, d.reason_code, reason, hint)
+    return _Plan(d.state, d.action, d.reason_code, reason, hint, remote_txid)
 
 
 def _act(args: argparse.Namespace, plan: _Plan) -> None:
@@ -1035,7 +1075,8 @@ def _act(args: argparse.Namespace, plan: _Plan) -> None:
     if plan.action in (Action.RESTORE, Action.QUARANTINE_AND_RESTORE):
         # 복원·검증을 먼저 끝낸다. 실패하면 로컬은 그대로다(L7).
         check_quarantinable(db, meta)
-        restored, _ = restore_to_temp(db, args)
+        restored, restored_txid = restore_to_temp(db, args)
+        check_restored_txid(restored, restored_txid, plan.remote_txid)
         stale = quarantine(db, meta)
         if stale is None and plan.action == Action.QUARANTINE_AND_RESTORE:
             log("quarantine: nothing to move")

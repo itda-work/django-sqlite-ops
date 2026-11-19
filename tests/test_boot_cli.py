@@ -111,7 +111,12 @@ def snapshot(root: Path, *, skip: tuple[str, ...] = ()) -> dict[str, tuple[str, 
 
 
 class Fake:
-    """가짜 litestream. ``ltx`` 출력·rc 와 ``restore`` 결과를 파일로 조종한다."""
+    """가짜 litestream. ``ltx`` 출력·rc 와 ``restore`` 결과를 파일로 조종한다.
+
+    ``restore`` 가 보고하는 TXID 는 기본으로 ``remote_txid()`` 로 둔 원격 TXID 를 따라간다
+    (정상 복제본에서는 복원 TXID ≥ 조회 TXID 다, #122). 둘을 떼어 놓을 때만
+    ``remote_txid()`` 뒤에 ``restore_txid()`` 를 부른다.
+    """
 
     def __init__(self, root: Path) -> None:
         self.dir = root / "fake"
@@ -130,7 +135,7 @@ class Fake:
             f'    if [ -f "{d}/restore.fail" ]; then echo "Error: boom" >&2; exit 1; fi\n'
             f'    cp "{d}/restore.db" "$out"\n'
             f'    [ -f "{d}/restore.extra" ] && cp "{d}/restore.db" "$out-wal"\n'
-            '    echo \'{"txid": "0000000000000005"}\'; exit 0 ;;\n'
+            f'    printf \'{{"txid": "%016x"}}\\n\' "$(cat "{d}/restore.txid")"; exit 0 ;;\n'
             "esac\n"
             "exit 9\n"
         )
@@ -154,6 +159,12 @@ class Fake:
         )
         (self.dir / "ltx.out").write_text(json.dumps(items))
         (self.dir / "ltx.rc").write_text("0")
+        if txid is not None:
+            self.restore_txid(txid)
+
+    def restore_txid(self, txid: int) -> None:
+        """``restore`` 가 ``-json`` 요약에 보고할 TXID. ``remote_txid()`` 가 덮어쓴다."""
+        (self.dir / "restore.txid").write_text(f"{txid}\n")
 
     def remote_error(self) -> None:
         (self.dir / "ltx.out").write_text("")
@@ -2015,6 +2026,102 @@ def test_restore_failure_leaves_local_untouched(lab, fake, no_exec):
     assert not no_exec[0]
 
 
+# --- 복원 TXID 하한: 판정에 쓴 원격 TXID (#122) ---
+
+
+def restore_dirs(lab: Path) -> list[Path]:
+    return sorted(p for p in lab.iterdir() if ".restore-" in p.name)
+
+
+def assert_behind_refused(lab: Path, fake: Fake, no_exec, err: str, *, observed: int, got: int):
+    """복원 TXID 가 조회 TXID 에 못 미쳐 설치 전에 exit 4 로 끝났는지."""
+    assert f"restored txid {got} is behind remote txid {observed}" in err
+    (tmp,) = restore_dirs(lab)
+    assert (tmp / "app.db").is_file()  # 조사용으로 남긴다
+    assert f"left {tmp} for inspection" in err
+    assert "hint:" in err and "rolled back" in err
+    assert not stale_dirs(lab)
+    assert not [p for p in lab.iterdir() if p.name.endswith(".partial")]
+    assert not (lab / "app.db.boot-state.json").exists()
+    assert not no_exec[0]
+    # 하한 검사는 새 조회를 하지 않는다(조회 1번, 복원 1번).
+    calls = fake.calls()
+    assert (calls.count("ltx"), calls.count("restore")) == (1, 1)
+    assert calls[-1] == "restore"
+
+
+def test_fresh_restore_behind_observed_remote_exits_4(lab, fake, no_exec, capsys):
+    fake.remote_txid(0x20)
+    fake.restore_txid(0x1F)
+    assert main_inproc(boot_args(lab, fake), no_exec) == cli.EXIT_RESTORE
+    err = capsys.readouterr().err
+    assert "action=restore" in err
+    assert not (lab / "app.db").exists()
+    assert_behind_refused(lab, fake, no_exec, err, observed=0x20, got=0x1F)
+
+
+def test_remote_ahead_restore_behind_observed_remote_leaves_local_untouched(
+    lab, fake, no_exec, capsys
+):
+    """로컬 0x19 < 원격 0x20 인데 복원본이 0x5 면 더 새로운 로컬을 격리하지 않는다."""
+    local_volume(lab)
+    fake.remote_txid(0x20)
+    fake.restore_txid(0x5)
+    before = snapshot(lab)
+    assert main_inproc(boot_args(lab, fake, "--on-unknown", "restore"), no_exec) == 4
+    err = capsys.readouterr().err
+    assert "reason_code=remote_ahead" in err
+    after = snapshot(lab, skip=("app.db.boot.lock",))
+    assert {k: v for k, v in after.items() if ".restore-" not in k} == before
+    assert_behind_refused(lab, fake, no_exec, err, observed=0x20, got=0x5)
+
+
+@pytest.mark.parametrize("volume", ["orphan_sidecars", "empty_db"])
+def test_quarantine_paths_restore_behind_observed_remote_leave_local_untouched(
+    lab, fake, no_exec, capsys, volume
+):
+    """``orphan_sidecars`` 조기 반환과 ``empty_db`` 경로도 조회 TXID 를 하한으로 쓴다."""
+    if volume == "orphan_sidecars":
+        (lab / "app.db-wal").write_bytes(b"x")
+    else:
+        empty_volume(lab)
+    fake.remote_txid(0x19)
+    fake.restore_txid(0x18)
+    before = snapshot(lab)
+    assert main_inproc(boot_args(lab, fake, "--on-unknown", "restore"), no_exec) == 4
+    err = capsys.readouterr().err
+    assert f"reason_code={volume}" in err
+    after = snapshot(lab, skip=("app.db.boot.lock",))
+    assert {k: v for k, v in after.items() if ".restore-" not in k} == before
+    assert_behind_refused(lab, fake, no_exec, err, observed=0x19, got=0x18)
+
+
+def test_check_restored_txid_without_observed_remote_refuses(tmp_path):
+    """판정표상 나지 않는 입력이지만, 하한을 모르면 설치하지 않는다(``-O`` 에서도)."""
+    restored = tmp_path / "app.db.restore-x" / "app.db"
+    with pytest.raises(cli._Exit) as exc:
+        cli.check_restored_txid(restored, 5, None)
+    assert exc.value.code == cli.EXIT_RESTORE
+    cli.check_restored_txid(restored, 5, 5)
+    cli.check_restored_txid(restored, 6, 5)
+
+
+@pytest.mark.parametrize("local", [False, True], ids=["fresh", "remote_ahead"])
+@pytest.mark.parametrize("delta", [0, 1], ids=["equal", "ahead"])
+def test_restore_at_or_ahead_of_observed_remote_installs(lab, fake, no_exec, local, delta):
+    """복원 중 새 업로드로 원격이 앞서는 것은 정상이다. 같거나 앞서면 설치한다(D-22 규칙)."""
+    if local:
+        local_volume(lab)
+    fake.remote_txid(0x20)
+    fake.restore_txid(0x20 + delta)
+    assert main_inproc(boot_args(lab, fake, "--on-unknown", "restore"), no_exec) == "exec"
+    assert count_rows(lab / "app.db") == 7
+    assert len(stale_dirs(lab)) == (1 if local else 0)
+    assert not restore_dirs(lab)
+    # 수정 전과 같은 호출(판 확인은 조회·복원·상태 파일마다 한 번씩).
+    assert fake.calls() == ["version", "ltx", "version", "restore", "version"]
+
+
 def test_integrity_failure_exits_3(lab, fake, no_exec):
     (lab / "app.db").write_bytes(b"garbage" * 1000)
     write_meta(lab / "app.db")
@@ -2393,7 +2500,10 @@ def _insert(db: Path, start: int, n: int) -> None:
 
 @pytest.fixture(scope="module")
 def seed(tmp_path_factory) -> Path:
-    """복제본과 두 볼륨: ``old``(10행까지 복제) · ``vol``(20행까지 복제). 테스트마다 복사해 쓴다."""
+    """복제본과 두 볼륨: ``old``(10행까지 복제) · ``vol``(20행까지 복제). 테스트마다 복사해 쓴다.
+
+    ``replica-old`` 는 10행까지 복제한 시점의 복제본 사본이다(#122 의 역행 재현용).
+    """
     require_litestream()
     root = tmp_path_factory.mktemp("seed").resolve()
     data = root / "data"
@@ -2403,6 +2513,7 @@ def seed(tmp_path_factory) -> Path:
     _insert(db, 0, 10)
     first = _replicate_until_caught_up(db, config)
     shutil.copytree(data, root / "old")
+    shutil.copytree(root / "replica", root / "replica-old")
     _insert(db, 10, 10)
     _replicate_until_caught_up(db, config, above=first)
     shutil.copytree(data, root / "vol")
@@ -2458,6 +2569,47 @@ def test_l1_fresh_container_restores(real):
     real_version = ls.version(binary=LITESTREAM)
     assert real_version in ls.VERIFIED_VERSIONS
     assert (s["state"], s["action"], s["litestream_version"]) == ("fresh", "restore", real_version)
+
+
+# restore 직전에 복제본을 옛 사본으로 되돌린 뒤 실제 litestream 을 exec 하는 래퍼(#122).
+ROLLBACK_WRAPPER = """#!{python}
+import os, shutil, sys
+if sys.argv[1:2] == ["restore"]:
+    shutil.rmtree({replica!r})
+    shutil.copytree({old!r}, {replica!r})
+os.execv({binary!r}, [{binary!r}, *sys.argv[1:]])
+"""
+
+
+@pytest.mark.parametrize("volume", [None, "old"], ids=["fresh", "remote_ahead"])
+def test_replica_rolled_back_between_lookup_and_restore_exits_4(real, seed, volume):
+    """조회는 20행(TXID n), restore 직전 복제본을 10행 사본으로 되돌린다 → 설치 전에 exit 4."""
+    data, db, config = real(volume)
+    replica = config.parent / "replica"
+    wrapper = config.parent / "litestream-rollback"
+    wrapper.write_text(
+        ROLLBACK_WRAPPER.format(
+            python=sys.executable,
+            replica=str(replica),
+            old=str(seed / "replica-old"),
+            binary=LITESTREAM,
+        )
+    )
+    wrapper.chmod(0o755)
+    before = snapshot(data)
+    args = real_args(db, config, "--on-unknown", "restore", cmd=marker_command(data, db))
+    args[args.index("--litestream") + 1] = str(wrapper)
+    result = run_boot(args)
+    assert result.returncode == cli.EXIT_RESTORE, result.stderr
+    assert "is behind remote txid" in result.stderr
+    assert read_marker(data) is None
+    after = snapshot(data, skip=("app.db.boot.lock",))
+    assert {k: v for k, v in after.items() if ".restore-" not in k} == before
+    assert not stale_dirs(data)
+    if volume is None:
+        assert not db.exists()
+    else:
+        assert count_rows(db) == 10
 
 
 def test_l2_old_volume_refuses_and_replica_untouched(real):
