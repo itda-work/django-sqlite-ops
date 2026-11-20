@@ -2,9 +2,13 @@
 
 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/) 형식을 따르고, 버전은 [PEP 440](https://peps.python.org/pep-0440/) 으로 매긴다. 릴리스할 때 `[Unreleased]` 의 항목을 새 버전 절로 옮긴다(`scripts/release_check.py` 가 확인한다).
 
-> ⚠️ **실험적 프로젝트다.** 1.0 전에는 API·동작·지원 범위가 예고 없이 바뀔 수 있다. 사전 릴리스(`a`·`b`·`rc`)는 버전을 명시해 설치한다(`pip install "django-sqlite-ops==0.1.0a4"`). `--pre` 는 모든 의존성의 사전 릴리스까지 허용하므로 쓰지 않는다. 운영 환경에서는 버전을 고정한다.
+> ⚠️ **실험적 프로젝트다.** 1.0 전에는 API·동작·지원 범위가 예고 없이 바뀔 수 있다. 사전 릴리스(`a`·`b`·`rc`)는 버전을 명시해 설치한다(`pip install "django-sqlite-ops==0.1.0a5"`). `--pre` 는 모든 의존성의 사전 릴리스까지 허용하므로 쓰지 않는다. 운영 환경에서는 버전을 고정한다.
 
 ## [Unreleased]
+
+## [0.1.0a5] - 2026-11-20
+
+정기 복원 검증을 boot 와 같은 기준으로 맞춘 사전 릴리스다. `sqlite_doctor --restore-test` 가 복원 직전 원격 TXID 보다 뒤인 복원본을 `error`(exit 2)로 보고 산출물을 남긴다(#128). 검증한 Litestream 판(0.5.17·0.5.18)과 지원 범위는 0.1.0a4 와 같다.
 
 ### Changed
 
@@ -70,7 +74,8 @@ boot 의 복원 보호를 더한 사전 릴리스다. 판정 때 조회한 원�
 
 - 미검증 항목은 [DESIGN §12](docs/DESIGN.md#12-미검증확인-필요) 에 있다. 실제 클라우드 S3·R2·Tigris, Windows 의 boot CLI, ASGI 에서의 VFS 별칭 동작은 검증하지 않았다.
 
-[Unreleased]: https://github.com/itda-work/django-sqlite-ops/compare/v0.1.0a4...HEAD
+[Unreleased]: https://github.com/itda-work/django-sqlite-ops/compare/v0.1.0a5...HEAD
+[0.1.0a5]: https://github.com/itda-work/django-sqlite-ops/compare/v0.1.0a4...v0.1.0a5
 [0.1.0a4]: https://github.com/itda-work/django-sqlite-ops/compare/v0.1.0a3...v0.1.0a4
 [0.1.0a3]: https://github.com/itda-work/django-sqlite-ops/compare/v0.1.0a2...v0.1.0a3
 [0.1.0a2]: https://github.com/itda-work/django-sqlite-ops/compare/v0.1.0a1...v0.1.0a2
