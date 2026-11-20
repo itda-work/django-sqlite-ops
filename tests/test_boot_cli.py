@@ -24,7 +24,13 @@ import unicodedata
 from pathlib import Path
 
 import pytest
-from _litestream import LITESTREAM, SilentServer, require_litestream, write_config
+from _litestream import (
+    LITESTREAM,
+    ROLLBACK_WRAPPER,
+    SilentServer,
+    require_litestream,
+    write_config,
+)
 from _nodjango import ROOT, assert_runs_without_django
 
 from django_sqlite_ops.boot import cli
@@ -2569,16 +2575,6 @@ def test_l1_fresh_container_restores(real):
     real_version = ls.version(binary=LITESTREAM)
     assert real_version in ls.VERIFIED_VERSIONS
     assert (s["state"], s["action"], s["litestream_version"]) == ("fresh", "restore", real_version)
-
-
-# restore 직전에 복제본을 옛 사본으로 되돌린 뒤 실제 litestream 을 exec 하는 래퍼(#122).
-ROLLBACK_WRAPPER = """#!{python}
-import os, shutil, sys
-if sys.argv[1:2] == ["restore"]:
-    shutil.rmtree({replica!r})
-    shutil.copytree({old!r}, {replica!r})
-os.execv({binary!r}, [{binary!r}, *sys.argv[1:]])
-"""
 
 
 @pytest.mark.parametrize("volume", [None, "old"], ids=["fresh", "remote_ahead"])

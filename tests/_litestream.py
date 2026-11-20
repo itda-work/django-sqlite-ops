@@ -98,6 +98,17 @@ def write_config(lab: Path, db: Path, replica_block: str) -> Path:
     return config
 
 
+# restore 직전에 복제본을 옛 사본으로 되돌린 뒤 실제 litestream 을 exec 하는 래퍼(#122·#128).
+# ``{python}``·``{replica}``·``{old}``·``{binary}`` 를 채워 실행 파일로 쓴다.
+ROLLBACK_WRAPPER = """#!{python}
+import os, shutil, sys
+if sys.argv[1:2] == ["restore"]:
+    shutil.rmtree({replica!r})
+    shutil.copytree({old!r}, {replica!r})
+os.execv({binary!r}, [{binary!r}, *sys.argv[1:]])
+"""
+
+
 class SilentServer:
     """연결은 받지만 아무 응답도 하지 않는 TCP 서버."""
 

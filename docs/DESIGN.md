@@ -96,7 +96,7 @@ python -m django_sqlite_ops.boot \
 
 **조치 실행** (순서가 안전성이다)
 - `PROCEED`: 아무것도 바꾸지 않는다. `fresh/new_db` 여도 DB 파일을 만들지 않는다(앱이 만든다, §4-1). `adopt` 나 `new_db` 로 진행하면 "첫 배포/도입 뒤에는 이 옵션을 끈다(D-11/D-13)" 한 줄을 남긴다.
-- `RESTORE`·`QUARANTINE_AND_RESTORE`: **먼저** DB 와 같은 디렉터리(같은 파일시스템이어야 rename 이 원자적이다)에 매번 새 `<db>.restore-<ts>-<rand>/` 를 만들고 그 안으로 `restore()` 한다. 실패하면 로컬은 **하나도 바꾸지 않고** exit 4 다(L7). 실패한 임시 디렉터리는 조사용으로 남기고, 다음 부팅은 이를 판정에 쓰지 않는다. `restore` 가 성공해도 **복원 TXID 가 판정에 쓴 원격 최대 TXID 보다 낮으면** 같은 실패다(격리·설치 전에 exit 4, 사유 `restored txid R is behind remote txid N observed before restore`, #122). 같거나 높으면 통과한다 — 복원 중 새 업로드로 원격이 앞서는 것은 정상이다. 비교 규칙은 `--restore-test` 의 TXID 판정(D-22)과 같고 수준만 다르다(진단은 `warn`, boot 는 설치 직전이라 거부). 낮으면 조회 뒤 복제본이 뒤로 간 것(객체 삭제·버킷 롤백·같은 경로의 둘째 쓰기자)이라 판정할 수 없다. 특히 `remote_ahead` 의 격리 경로에서는 더 새로운 로컬을 치우고 더 오래된 복원본을 설치하게 된다. 하한 R ≥ N 이면 N > 로컬 TXID 이므로 로컬보다 앞선 복원본만 설치된다. 이 검사는 새 Litestream 호출을 하지 않으며, 조회 **전에** 이미 뒤로 간 복제본은 잡지 못한다(조회와 복원 사이의 변화만 본다. 실제 Litestream 0.5.17·0.5.18 `file://` 복제본을 restore 직전에 되돌려 재현함, 실제 S3 에서의 발생 빈도는 미확인, 2026-11-19). 복원 디렉터리에 DB 와 `-shm` 말고 다른 파일(`-wal` 등)이 있으면 DB 만 옮기면 내용이 빠지므로 실패로 본다. 복원이 성공했을 때만 격리 대상 중 **있는 것**(DB·사이드카·메타)을 격리한다. `RESTORE` 는 로컬 DB 가 없을 때이므로 보통 옮길 것이 없지만, TXID 를 읽을 수 없는 메타 디렉터리가 남아 있으면 그것을 옮긴다. 그다음 임시 DB 를 `os.rename` 으로 DB 경로에 놓는다(설치). 그 순간 DB 경로나 사이드카 자리에 무엇이 있으면 exit 2. 임시 디렉터리는 비운 뒤 지운다.
+- `RESTORE`·`QUARANTINE_AND_RESTORE`: **먼저** DB 와 같은 디렉터리(같은 파일시스템이어야 rename 이 원자적이다)에 매번 새 `<db>.restore-<ts>-<rand>/` 를 만들고 그 안으로 `restore()` 한다. 실패하면 로컬은 **하나도 바꾸지 않고** exit 4 다(L7). 실패한 임시 디렉터리는 조사용으로 남기고, 다음 부팅은 이를 판정에 쓰지 않는다. `restore` 가 성공해도 **복원 TXID 가 판정에 쓴 원격 최대 TXID 보다 낮으면** 같은 실패다(격리·설치 전에 exit 4, 사유 `restored txid R is behind remote txid N observed before restore`, #122). 같거나 높으면 통과한다 — 복원 중 새 업로드로 원격이 앞서는 것은 정상이다. 비교 규칙은 `--restore-test` 의 TXID 판정(D-22)과 같다(진단은 `error`·exit 2 로 실패하고 복원본을 남긴다 — 2026-11-20 개정 #128, boot 는 설치 전에 거부). 낮으면 조회 뒤 복제본이 뒤로 간 것(객체 삭제·버킷 롤백·같은 경로의 둘째 쓰기자)이라 판정할 수 없다. 특히 `remote_ahead` 의 격리 경로에서는 더 새로운 로컬을 치우고 더 오래된 복원본을 설치하게 된다. 하한 R ≥ N 이면 N > 로컬 TXID 이므로 로컬보다 앞선 복원본만 설치된다. 이 검사는 새 Litestream 호출을 하지 않으며, 조회 **전에** 이미 뒤로 간 복제본은 잡지 못한다(조회와 복원 사이의 변화만 본다. 실제 Litestream 0.5.17·0.5.18 `file://` 복제본을 restore 직전에 되돌려 재현함, 실제 S3 에서의 발생 빈도는 미확인, 2026-11-19). 복원 디렉터리에 DB 와 `-shm` 말고 다른 파일(`-wal` 등)이 있으면 DB 만 옮기면 내용이 빠지므로 실패로 본다. 복원이 성공했을 때만 격리 대상 중 **있는 것**(DB·사이드카·메타)을 격리한다. `RESTORE` 는 로컬 DB 가 없을 때이므로 보통 옮길 것이 없지만, TXID 를 읽을 수 없는 메타 디렉터리가 남아 있으면 그것을 옮긴다. 그다음 임시 DB 를 `os.rename` 으로 DB 경로에 놓는다(설치). 그 순간 DB 경로나 사이드카 자리에 무엇이 있으면 exit 2. 임시 디렉터리는 비운 뒤 지운다.
 - `KEEP_LOCAL`: 바꾸지 않는다. stderr 에 `WARNING: unknown_at_boot` 한 줄, 상태 파일에 `unknown_at_boot: true`.
 - `REFUSE`: exit 2. 사유와 사유 코드별 안내 한 줄.
 - 격리·설치 도중의 파일 오류는 exit 4 다. 격리 도중 실패해 `.partial` 이 남으면 다음 부팅이 재개한다. 격리 완료·설치 이후 실패는 남은 상태에 따라 다음 부팅이 fresh 복원(로컬 DB·메타 없음) 또는 D-14 복구(DB 있음·메타 없음 → `no_local_meta`)를 따른다.
@@ -348,7 +348,7 @@ django_sqlite_ops/
 |---|---|---|---|
 | 복원 위치 | `--restore-dir DIR` **명시 필수**. 없으면 거부(exit 2) | `/tmp` 가 tmpfs 인 서버에서 큰 DB 가 RAM 을 먹는 사고를 막는다. 운영 DB 디렉터리에 쓰지 않는다 | D-20 |
 | 무결성 기본 | `full`(`--integrity quick` 로 낮춤) | 주기 실행·별도 사본이라 운영 부담이 없다. 부팅(quick)과 목적이 다르다 | D-21 |
-| TXID 비교 | 복원 TXID 가 **복원 직전 조회한 원격 최대 TXID 이상**이면 ok, 미만이면 warn | 복원 중 새 업로드로 원격이 앞서는 것은 정상이므로 '이상'만 본다 | D-22 |
+| TXID 비교 | 복원 TXID 가 **복원 직전 조회한 원격 최대 TXID 이상**이면 ok, 미만이면 error(산출물 보존, 무결성 검사는 계속) | 복원 중 새 업로드로 원격이 앞서는 것은 정상이므로 '이상'만 본다. 미만은 boot 가 거부할 복원본이다(#122) | D-22(2026-11-20 개정, #128) |
 | 실행 방식 | **단독 모드**: `--restore-test` 를 주면 `restore` 섹션만 낸다 | 무겁고 주기가 다른 작업이라 다른 진단과 섞지 않는다 | D-23 |
 | 무결성 실행 | `restore(..., integrity_check="none")` 으로 받은 뒤 **우리가** 복원본에 `PRAGMA integrity_check`/`quick_check` 를 실행한다 | `restore()` 는 실패를 사유 한 줄로만 돌려줘 Litestream 의 무결성 실패와 내려받기 실패가 구분되지 않는다(코드상 확인). `restore`·`integrity` 를 따로 판정한다 | D-24 |
 | 운영 경로 보호 | 메타 경로는 헬스 설정의 `meta_path`, 없으면 기본 `.<db>-litestream/`. 그와 별도로 `DIR` 이 **운영 DB 의 부모 디렉터리와 같거나 그 안이거나 그것을 포함하면 무조건 거부**한다. 보호 대상은 실행 대상과 무관하게 `settings.DATABASES` 의 SQLite 백엔드(`vendor == "sqlite"`) 별칭 전부와 Litestream 설정의 DB 전부의 운영 경로 합집합. 백엔드를 불러오지 못하는 별칭이 있으면 거부(2026-10-18 변경, 설정 DB 는 2026-10-25 #57) | Litestream YAML 의 `meta-path` 는 `databases -json` 이 내주지 않아(0.5.17 재현함) 사용자 지정 메타를 다 알 수 없으므로 보수적으로 막는다 | D-25 |
@@ -382,8 +382,9 @@ django_sqlite_ops/
    - 시간 예산: `--integrity-timeout`(기본 1800초, 복원과 별도). 검사를 시작할 때 타이머 스레드를 걸고, 시간이 넘으면 그 스레드에서 `sqlite3.Connection.interrupt()` 로 검사를 중단한다(검사 스레드에서 `OperationalError: interrupted`). 실행 중인 문장이 없을 때의 `interrupt()` 는 no-op 이라(SQLite c3ref/interrupt 문서), 시한이 문장 시작 전에 지나면 한 번으로는 끊지 못한다. 그래서 타이머 스레드는 발동 뒤 검사 종료 Event 가 설 때까지 10ms 간격으로 `interrupt()` 를 다시 부른다(#63, 2026-10-25 확인: 문장 전 발동을 강제한 100MB full 검사가 끝까지 돌지 않고 끊긴다). 검사 스레드는 종료 Event 를 세우고 타이머 스레드를 join 한 뒤에만 구조 요약 문장을 연다 — 문장 사이에 걸린 interrupt 는 다음 문장 시작에서 풀리므로 구조 요약을 끊지 않는다(손상 DB 로 재현함). 초과면 `integrity` `error`(사유 `timeout`, 걸린 시간 포함. 타이머가 발동했는데 예외가 `interrupted` 가 아니면 그 오류와 타이머 발동을 함께 적는다. 타이머가 발동했는데 검사가 끊기지 않고 ok 로 끝나도 시간 초과다(`was not interrupted`) — 재시도 사이에 검사가 끝나 `interrupt()` 가 한 번도 실행 중인 문장에 닿지 못한 경계다(#60·#63). 예산을 넘긴 검사를 성공으로 보고하지 않는다. 손상 결과와 타이머 발동이 겹치면 오류 줄 뒤에 `(the --integrity-timeout Ns timer had also fired)` 를 덧붙인다), exit 2, 산출물은 보존한다. `interrupt()` 는 제때 멈춘다(재현함, #54): 707MB DB(SQLite 3.53.1, macOS)의 full 검사(제한 없이 2.6초)를 0.1·0.5·1·2초에 끊으면 타이머 발동 뒤 1ms 안에 `OperationalError: interrupted` 로 끝났다. `quick`(0.4초)도 같다. 페이지 캐시가 차가운 디스크 I/O 대기 중의 지연은 미검증이다(§12).
    - 구조 요약: `sqlite_master` 의 테이블 수·`page_count`·`page_size` 를 읽는다(보고 전용, 읽기 실패면 `error`).
 4. 판정·보고 뒤 정리:
-   - `restore`·`integrity` 가 **둘 다 `ok`** 면 작업 디렉터리를 지운다. `restored_txid` 가 `warn`(원격 미달)이거나 `remote_txid`·`restored_txid` 가 `unknown`(원격 조회 실패)이어도 지운다 — 산출물은 그 원인(원격 쪽 상태)을 설명하지 않는다.
-   - 둘 중 하나라도 `error`(무결성 시간 초과 포함)면 **남기고 경로를 `output` 으로 보고**한다. 3 단계 전에 실패한 경우(`restore_dir`·`space`·`remote_txid` 빈 목록)에 이미 만든 작업 디렉터리가 있으면 같이 남긴다.
+   - `restore`·`integrity` 가 **둘 다 `ok`** 이고 `restored_txid` 가 `error` 가 아니면 작업 디렉터리를 지운다. `remote_txid`·`restored_txid` 가 `unknown`(원격 조회 실패)이어도 지운다 — 산출물은 그 원인(원격 쪽 상태)을 설명하지 않는다.
+   - `restored_txid` 가 `error`(복원 TXID 가 원격 미달, D-22 개정 #128)면 무결성 검사는 그대로 한 뒤 **남긴다** — boot 라면 거부했을 복원본이라 무엇이 복원됐는지가 증거다.
+   - `restore`·`integrity` 중 하나라도 `error`(무결성 시간 초과 포함)면 **남기고 경로를 `output` 으로 보고**한다. 3 단계 전에 실패한 경우(`restore_dir`·`space`·`remote_txid` 빈 목록)에 이미 만든 작업 디렉터리가 있으면 같이 남긴다.
    - `--keep` 이면 늘 남긴다.
    - 정리 자체가 실패하면(`shutil.rmtree` 예외) `output` `warn` 이고 남은 경로를 보고한다.
    - `DIR` 의 오래된 산출물을 자동으로 정리하지 않는다(운영자가 치운다 — README 에 적는다).
@@ -396,7 +397,7 @@ django_sqlite_ops/
 | `space` | 여유 바이트(`expected` = 추정 필요량) | 부족 `error` |
 | `remote_txid` | 직전 원격 최대 TXID | 빈 목록 `error`, 조회 실패 `unknown` |
 | `restore` | 성공 여부·사유 | 실패·타임아웃 `error` |
-| `restored_txid` | 복원 TXID(`expected` = `remote_txid`) | 미만 `warn`, 원격 조회 실패면 `unknown` |
+| `restored_txid` | 복원 TXID(`expected` = `remote_txid`) | 미만 `error`(D-22 개정 #128, 산출물 보존), 원격 조회 실패면 `unknown` |
 | `integrity` | `full`/`quick` 결과(우리가 실행, D-24) | 열기·검사 실패·`--integrity-timeout` 초과 `error`(오류 줄 앞 N줄 또는 `timeout` 을 `message` 에). 복원 실패면 내지 않는다 |
 | `duration_ms` | 복원 소요 시간 | `ok`(보고) |
 | `size` | 복원본 바이트 | `ok`(보고) |
@@ -411,7 +412,7 @@ django_sqlite_ops/
 - **비용 경고**: 복원은 스냅샷 전체와 그 뒤 LTX 를 내려받는다. 시간과 S3 egress 가 DB 크기에 비례한다. 첫 실행의 `duration_ms` 를 보고 주기(cron·systemd timer)를 정하라고 README 에 적는다.
 - **겹치는 실행**: 고유 작업 디렉터리 덕에 이름은 충돌하지 않지만 복원·검사 부하는 쌓인다. 명령이 막지 않고 운영 안내로 다룬다: 주기는 1회 소요 시간(복원 + 무결성)보다 길게, 필요하면 cron 에서 `flock -n` 으로 감싼다(예: `flock -n /var/lock/dso-restore-test.lock python manage.py sqlite_doctor --restore-test ...`). README 에 같은 예를 둔다.
 - **헬스에 넣지 않는다**(§7): 헬스는 가볍고 자주 도는 판정이고, 복원 검증은 무겁고 드물다. 결과를 헬스 응답에 섞지 않는다.
-- 테스트 계획(구현 이슈): 실제 Litestream(`litestream` CI 잡)으로 정상 복제본, 빈 복제본, 손상(LTX 파일 변조), 원격 조회 불가 endpoint(타임아웃), 용량 부족(가짜 `disk_usage`), `--restore-dir` 겹침 거부(DB 부모 디렉터리와 같음·안·포함, 헬스 `meta_path`·기본 메타, 링크인 메타의 실체, 여러 별칭 중 다른 별칭의 경로), **`DIR` 자체가 운영 메타를 가리키는 링크면 아무것도 만들기 전에 거부**(리뷰 1 재현 사례), 운영 파일 불변, 무결성 시간 초과(제한을 넘긴 검사가 `interrupt()` 로 실제로 끝나고 `integrity/error`·exit 2·산출물 보존), 정리 규칙(둘 다 ok 면 TXID `warn`·`unknown` 이어도 삭제, `error` 면 보존, `--keep`, 정리 실패 `output/warn`).
+- 테스트 계획(구현 이슈): 실제 Litestream(`litestream` CI 잡)으로 정상 복제본, 빈 복제본, 손상(LTX 파일 변조), 원격 조회 불가 endpoint(타임아웃), 용량 부족(가짜 `disk_usage`), `--restore-dir` 겹침 거부(DB 부모 디렉터리와 같음·안·포함, 헬스 `meta_path`·기본 메타, 링크인 메타의 실체, 여러 별칭 중 다른 별칭의 경로), **`DIR` 자체가 운영 메타를 가리키는 링크면 아무것도 만들기 전에 거부**(리뷰 1 재현 사례), 운영 파일 불변, 무결성 시간 초과(제한을 넘긴 검사가 `interrupt()` 로 실제로 끝나고 `integrity/error`·exit 2·산출물 보존), 정리 규칙(둘 다 ok 면 TXID `unknown` 이어도 삭제, `error` 면 보존 — TXID 원격 미달 포함(#128, 조회 직후 복제본을 이전 사본으로 바꾸는 실제 Litestream 시험), `--keep`, 정리 실패 `output/warn`).
 
 ## 7. 헬스
 
