@@ -273,10 +273,12 @@ def _structure(conn: sqlite3.Connection, alias: str | None) -> list[Item]:
 
 
 def _finish(alias: str, work: Path, passed: bool, keep: bool) -> list[Item]:
-    """``restore``·``integrity`` 가 둘 다 ok 면 작업 디렉터리를 지우고, 아니면 남긴다.
+    """``restore``·``integrity`` 가 ok 이고 복원 TXID 가 원격에 못 미치지 않으면 작업 디렉터리를
+    지우고, 아니면 남긴다.
 
-    TXID 가 원격에 못 미치거나(``warn``) 원격을 조회하지 못했어도(``unknown``) 지운다: 산출물은
-    그 원인(원격 쪽 상태)을 설명하지 않는다.
+    복원 TXID 가 복원 직전 원격보다 낮으면(``error``, D-22 개정 #128) 남긴다: boot 라면 거부했을
+    복원본이므로 무엇이 복원됐는지가 조사의 증거다. 원격을 조회하지 못했으면(``unknown``) 지운다:
+    산출물은 그 원인(원격 쪽 상태)을 설명하지 않는다.
     """
     if keep:
         return [_item(alias, "output", "ok", str(work), None, "kept (--keep)")]
@@ -367,6 +369,7 @@ def _one(
         items.append(_item(alias, "duration_ms", "ok", duration))
         return items + _finish(alias, work, False, keep)
     items.append(_item(alias, "restore", "ok", "restored", None, str(out)))
+    behind = False
     if remote_txid is None:
         items.append(
             _item(
@@ -381,14 +384,18 @@ def _one(
     elif result.txid >= remote_txid:
         items.append(_item(alias, "restored_txid", "ok", _hex(result.txid), _hex(remote_txid)))
     else:
+        # boot 는 같은 복원본을 설치 전에 거부한다(exit 4, #122). 진단도 실패로 본다(D-22 개정,
+        # #128). 무결성 검사는 그대로 해서 복원본 자체의 상태도 남긴다.
+        behind = True
         items.append(
             _item(
                 alias,
                 "restored_txid",
-                "warn",
+                "error",
                 _hex(result.txid),
                 _hex(remote_txid),
-                "the restored TXID is below the remote TXID read just before the restore",
+                "the restored TXID is behind the remote TXID read just before the restore; boot "
+                "would refuse this restore (the replica went back after the lookup)",
             )
         )
     items.append(_item(alias, "duration_ms", "ok", duration))
@@ -397,7 +404,7 @@ def _one(
     # 5. 무결성(우리가 실행, 별도 시간 예산).
     passed, checked = check_integrity(out, integrity, integrity_timeout, alias=alias)
     items.extend(checked)
-    return items + _finish(alias, work, passed, keep)
+    return items + _finish(alias, work, passed and not behind, keep)
 
 
 # --- 조립 ---------------------------------------------------------------------------------

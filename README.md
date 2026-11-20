@@ -491,13 +491,13 @@ python manage.py sqlite_doctor --restore-test \
 | `restore_dir` | 만든 작업 디렉터리 | `--restore-dir` 이 없음·링크·디렉터리 아님·겹침(`DATABASES` 별칭 또는 `--litestream-config` 에만 있는 DB), TMPDIR 이 그 안(Linux `--restore-dir /tmp`), 설정을 읽는 동안 바뀜이면 `error`(별칭 `null`) |
 | `remote_txid` | 복원 직전 원격 최대 TXID(16자리 16진수) | 복제본이 비었으면 `error`(0.5.17 은 복제본 경로 오타도 같은 결과다), 조회 실패·타임아웃이면 `unknown` 이고 복원은 그대로 한다 |
 | `restore` | `restored`/`failed` | 실패·타임아웃이면 `error` 이고 `integrity` 는 내지 않는다 |
-| `restored_txid` | 복원 TXID(`expected` = `remote_txid`) | 원격보다 작으면 `warn`, 원격을 몰랐으면 `unknown` |
+| `restored_txid` | 복원 TXID(`expected` = `remote_txid`) | 원격보다 작으면 `error`(boot 라면 설치를 거부할 복원본이다. 무결성 검사는 그대로 하고 산출물을 남긴다), 원격을 몰랐으면 `unknown` |
 | `integrity` | `full`/`quick` | 열기·검사 실패, 시간 초과면 `error`. 오류 줄 앞 5줄 또는 `timeout` 을 `message` 에 |
 | `duration_ms`·`size`·`tables`·`page_count` | 복원 시간, 복원본 바이트, 테이블 수, 페이지 수 | 보고(`ok`) |
 | `output` | 남긴 작업 디렉터리 | 보고(`ok`). 정리하다 실패하면 `warn` |
 | `alias`·`database`·`config` | 별칭 종류, DB 경로, 설정 파일 | 기본 선택에서 쓰기 파일 DB 가 아니면 `alias` `ok`(skipped), 직접 고른 별칭이면 `unknown`, 복원할 쓰기 DB 가 하나도 없으면 별칭 `null` 의 `alias` `error`, 경로가 실제 경로가 아니거나 DB 파일이 링크이거나 설정에 없으면 `database` `error`, 설정을 읽지 못하거나 `dir:` 항목·상대 `path:` 가 있으면 `config` `error` |
 
-**정리 규칙.** `restore`·`integrity` 가 둘 다 `ok` 면 작업 디렉터리를 지운다. TXID 가 `warn`·`unknown` 이어도 지운다(그 원인은 원격 쪽에 있고 산출물로 설명되지 않는다). 하나라도 `error`(무결성 시간 초과 포함)거나 원격이 비어 멈췄으면 남기고 `output` 에 경로를 적는다. `--keep` 이면 늘 남긴다. **오래된 산출물은 자동으로 지우지 않는다** — 확인한 뒤 운영자가 치운다. 종료 코드는 위 표와 같다(0·1·2). `--restore-dir` 누락 같은 인자 오류도 2 다.
+**정리 규칙.** `restore`·`integrity` 가 둘 다 `ok` 이고 TXID 가 원격에 못 미치지 않으면 작업 디렉터리를 지운다. TXID 가 `unknown`(원격을 조회하지 못함)이어도 지운다(그 원인은 원격 쪽에 있고 산출물로 설명되지 않는다). 하나라도 `error`(무결성 시간 초과, 복원 TXID 의 원격 미달 포함)거나 원격이 비어 멈췄으면 남기고 `output` 에 경로를 적는다. `--keep` 이면 늘 남긴다. **오래된 산출물은 자동으로 지우지 않는다** — 확인한 뒤 운영자가 치운다. 종료 코드는 위 표와 같다(0·1·2). `--restore-dir` 누락 같은 인자 오류도 2 다.
 
 > **비용 경고.** 복원은 스냅샷 전체와 그 뒤 LTX 를 내려받는다. 시간과 S3 egress 가 DB 크기에 비례한다. 처음에 한 번 손으로 돌려 `duration_ms` 와 무결성 검사 시간(`integrity` 의 `message`)을 보고 주기를 정한다(참고: 700MB DB 의 `full` 검사가 macOS 에서 2.6초, `quick` 이 0.4초 — #54 실측). 주기는 1회 소요 시간보다 넉넉히 길게 잡는다.
 
@@ -520,7 +520,7 @@ Type=oneshot
 User=app
 WorkingDirectory=/srv/app
 ExecStart=/srv/app/.venv/bin/python manage.py sqlite_doctor --restore-test --restore-dir /var/backups/dso-restore --litestream-config /etc/litestream.yml --database default --json
-# 종료 코드 1(warn·unknown)은 성공으로 친다. 2(error)만 유닛을 failed 로 만든다
+# 종료 코드 1(unknown·정리 실패 warn)은 성공으로 친다. 2(error)만 유닛을 failed 로 만든다
 SuccessExitStatus=1
 
 # /etc/systemd/system/dso-restore-test.timer
@@ -536,7 +536,9 @@ Persistent=true
 WantedBy=timers.target
 ```
 
-`systemctl enable --now dso-restore-test.timer` 로 켠다. systemd 는 `Type=oneshot` 에서도 0 이 아닌 종료 코드를 실패로 보므로, `SuccessExitStatus=1` 이 없으면 exit 1 에도 유닛이 failed 가 되고 `OnFailure=` 가 돈다([systemd.service(5) `SuccessExitStatus=`](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#SuccessExitStatus=)). 위 예는 **2 만 실패로 본다** — `OnFailure=` 나 모니터링으로 2 를 알리고, 1(`warn`·`unknown`, 대개 원격 조회 실패)은 JSON 출력이나 헬스로 따로 본다.
+`systemctl enable --now dso-restore-test.timer` 로 켠다. systemd 는 `Type=oneshot` 에서도 0 이 아닌 종료 코드를 실패로 보므로, `SuccessExitStatus=1` 이 없으면 exit 1 에도 유닛이 failed 가 되고 `OnFailure=` 가 돈다([systemd.service(5) `SuccessExitStatus=`](https://www.freedesktop.org/software/systemd/man/latest/systemd.service.html#SuccessExitStatus=)). 위 예는 **2 만 실패로 본다** — `OnFailure=` 나 모니터링으로 2 를 알리고, 1(`unknown`, 대개 원격 조회 실패. 또는 정리 실패 `output` `warn`)은 JSON 출력이나 헬스로 따로 본다. 복원 TXID 가 복원 직전 원격보다 낮은 것(`restored_txid` `error`)은 2 다. 0.1.0a4 까지는 `warn`·exit 1 이라 이 설정에서 성공으로 지나갔다(#128).
+
+> **실패 산출물과 디스크.** exit 2 인 실행은 복원본 전체를 `--restore-dir` 아래 `dso-restore-*/` 로 남긴다. 원인이 남아 있으면 timer 가 돌 때마다 DB 크기만큼 쌓이고, 여유가 (로컬 DB + `-wal`) × 1.2 보다 적어지면 그 뒤 실행은 `space` `error` 로 복원하지 못한다(이것도 2 다). 실패를 알림받으면 `output` 경로의 복원본을 확인한다 — 예: `restored_txid` `error` 면 `sqlite3 <output>/<db> 'SELECT max(id) FROM …'` 로 어디까지 들어 있는지 보고 복제본 쪽(객체 삭제·버킷 롤백·같은 경로의 둘째 쓰기자)을 조사한다. 확인한 산출물은 지운다. `--restore-dir` 은 운영 DB 와 다른 볼륨이면 산출물이 쌓여도 운영 DB 의 여유 공간을 먹지 않는다.
 
 ### boot CLI
 
@@ -964,6 +966,7 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 | DB 파일이 없다는 `error` | 없는 파일에 연결하면 SQLite 가 빈 DB 를 만들어 다음 boot 의 복원을 막으므로 연결하지 않는다 | 경로를 확인하거나 boot 로 먼저 복원한다 | 코드상 확인(`doctor.py`) |
 | `--restore-test` 가 `restore_dir` `error` 로 바로 끝난다 | `--restore-dir` 이 없거나 링크이거나, 운영 DB 디렉터리·메타와 겹친다. 같은 `litestream.yml` 에만 있는 다른 서비스 DB 의 디렉터리와 겹쳐도 거부한다(메시지에 `litestream config database`). TMPDIR 이 `--restore-dir` 과 같거나 그 안이어도 거부한다(Linux 에서 `--restore-dir /tmp`). 모두 아무것도 만들지 않고 거부 | DB 디렉터리·메타 밖의 실제 디렉터리를 미리 만들어 준다. TMPDIR 이 걸리면 `TMPDIR=/var/tmp` 처럼 밖으로 옮기거나 다른 디렉터리를 준다([복원 검증](#복원-검증---restore-test)) | 재현함(#54·#57 테스트) |
 | `--restore-test` 의 `remote_txid` 가 `error`(복제본이 비었다) | 복제본에 LTX 가 없다. 0.5.17 은 복제본 경로·prefix 오타도 같은 결과다 | 설정의 복제본 경로를 확인하고 헬스(`remote_txid`)도 본다 | 재현함 |
+| `--restore-test` 의 `restored_txid` 가 `error`(exit 2) | 복원 직전에 조회한 원격 TXID 보다 복원본의 TXID 가 낮다. 조회와 복원 사이에 복제본이 뒤로 갔다(객체 삭제·버킷 롤백·같은 경로의 둘째 쓰기자). boot 라면 같은 복원본을 exit 4 로 거부한다(#122) | `output` 의 복원본에 어떤 행이 있는지 보고 복제본 쪽을 조사한다. 무결성 결과(`integrity`)도 함께 나온다 | 재현함(실제 Litestream 0.5.17·0.5.18 `file://` 복제본, #128) |
 | `--restore-test` 산출물이 `--restore-dir` 에 쌓인다 | 실패(또는 `--keep`)한 실행의 작업 디렉터리는 조사용으로 남기고 자동으로 지우지 않는다 | `output` 경로를 확인한 뒤 지운다 | 코드상 확인(`restore_check.py`) |
 
 #### SQLite WAL-reset 버그

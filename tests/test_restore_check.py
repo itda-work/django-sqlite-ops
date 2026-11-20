@@ -19,7 +19,13 @@ import time
 from pathlib import Path
 
 import pytest
-from _litestream import LITESTREAM, SilentServer, needs_litestream, write_config
+from _litestream import (
+    LITESTREAM,
+    ROLLBACK_WRAPPER,
+    SilentServer,
+    needs_litestream,
+    write_config,
+)
 
 from django_sqlite_ops import restore_check as rc
 from django_sqlite_ops.boot import litestream as ls
@@ -745,17 +751,47 @@ def test_fake_quick_and_keep(lab):
     assert (Path(out["value"]) / "app.db").is_file()
 
 
-def test_fake_restored_below_remote_warns_and_still_cleans_up(lab):
+@pytest.mark.parametrize("keep", [False, True], ids=["default", "keep"])
+def test_fake_restored_below_remote_is_error_and_keeps_the_output(lab, keep):
+    """복원 TXID 가 복원 직전 원격보다 낮으면 boot 가 거부할 복원본이다(D-22 개정, #128).
+
+    무결성 검사는 계속하고(복원본 자체의 상태도 남긴다) 작업 디렉터리를 남긴다.
+    """
     lab, db, fake = lab
     fake.spec["ltx"] = {"txid": 9}
     fake.save()
-    code, data, _ = run({"default": sqlite_db(db)}, *fake.args(lab / "restore"))
-    assert code == 1
+    before = fingerprint(lab / "app")
+    extra = ("--keep",) if keep else ()
+    code, data, _ = run({"default": sqlite_db(db)}, *fake.args(lab / "restore", *extra))
+    assert code == 2, data
     txid = one(data, "restored_txid")
     assert (txid["level"], txid["value"], txid["expected"]) == (
-        "warn",
+        "error",
         "0000000000000005",
         "0000000000000009",
+    )
+    assert "behind" in txid["message"]
+    assert one(data, "integrity")["level"] == "ok"
+    assert {"tables", "page_count"} <= set(keys(data))
+    out = one(data, "output")
+    expected = "kept (--keep)" if keep else "kept for inspection; remove it when done"
+    assert (out["level"], out["message"]) == ("ok", expected)
+    assert work_dirs(lab / "restore") == [Path(out["value"])]
+    with sqlite3.connect(Path(out["value"]) / "app.db") as conn:
+        assert conn.execute("SELECT count(*) FROM t").fetchone() == (12,)
+    assert fingerprint(lab / "app") == before
+
+
+def test_fake_restored_equal_to_remote_is_ok(lab):
+    """같으면 통과한다(D-22 '이상'). 경계값."""
+    lab, db, fake = lab
+    code, data, _ = run({"default": sqlite_db(db)}, *fake.args(lab / "restore"))
+    assert code == 0, data
+    txid = one(data, "restored_txid")
+    assert (txid["level"], txid["value"], txid["expected"]) == (
+        "ok",
+        "0000000000000005",
+        "0000000000000005",
     )
     assert items(data, "output") == []
     assert work_dirs(lab / "restore") == []
@@ -1456,6 +1492,57 @@ def test_real_tampered_replica_fails_and_keeps_output(real):
     failed = [i for i in items(data) if i["key"] in ("restore", "integrity")]
     assert failed[-1]["level"] == "error", data
     assert work_dirs(lab / "restore") == [Path(one(data, "output")["value"])]
+
+
+@needs_litestream
+def test_real_replica_rolled_back_before_restore_is_error_and_keeps_old_rows(tmp_path):
+    """조회는 20행(TXID n), restore 직전 복제본을 10행 사본으로 되돌린다(#128).
+
+    boot 는 같은 상황을 exit 4 로 거부한다(#122). 진단도 error·exit 2 로 실패하고, 복원본(실제로
+    과거 10행)을 남기며, 운영 DB·사이드카·메타는 건드리지 않는다.
+    """
+    lab = tmp_path.resolve()
+    (lab / "app").mkdir()
+    (lab / "restore").mkdir()
+    db = make_db(lab / "app" / "app.db", 10)
+    replica = lab / "replica"
+    config = write_config(lab, db, f"      type: file\n      path: {replica}\n")
+    earlier = replicate(db, config)
+    shutil.copytree(replica, lab / "replica-old")
+    with sqlite3.connect(db) as conn:
+        conn.executemany("INSERT INTO t(v) VALUES (?)", ((f"new-{i}",) for i in range(10)))
+    latest = replicate(db, config, above=earlier)
+    wrapper = lab / "litestream-rollback"
+    wrapper.write_text(
+        ROLLBACK_WRAPPER.format(
+            python=sys.executable,
+            replica=str(replica),
+            old=str(lab / "replica-old"),
+            binary=LITESTREAM,
+        )
+    )
+    wrapper.chmod(0o700)
+    args = real_args(lab, config)
+    args[args.index("--litestream") + 1] = str(wrapper)
+    assert ls.default_meta_path(db).is_dir()
+    before = fingerprint(lab / "app")
+    code, data, _ = run({"default": sqlite_db(db)}, *args)
+    assert fingerprint(lab / "app") == before
+    txid = one(data, "restored_txid")
+    assert (txid["level"], txid["value"], txid["expected"]) == (
+        "error",
+        f"{earlier:016x}",
+        f"{latest:016x}",
+    )
+    assert one(data, "integrity")["level"] == "ok"
+    assert code == 2, data
+    out = Path(one(data, "output")["value"])
+    assert work_dirs(lab / "restore") == [out]
+    with sqlite3.connect(out / "app.db") as conn:
+        assert conn.execute("SELECT count(*) FROM t").fetchone() == (10,)
+        assert conn.execute("SELECT count(*) FROM t WHERE v LIKE 'new-%'").fetchone() == (0,)
+    with sqlite3.connect(db) as conn:
+        assert conn.execute("SELECT count(*) FROM t").fetchone() == (20,)
 
 
 @needs_litestream
