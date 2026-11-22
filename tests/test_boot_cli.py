@@ -2238,6 +2238,51 @@ def test_leftovers_of_another_db_are_ignored(lab, fake, no_exec):
     assert count_rows(lab / "app.db") == 7
 
 
+def db_args(lab: Path, fake: Fake, name: str, *extra: str) -> list[str]:
+    args = boot_args(lab, fake, *extra)
+    args[args.index("--db") + 1] = str(lab / name)
+    return args
+
+
+@pytest.mark.parametrize(
+    ("db_name", "leftover"),
+    [
+        ("app.db", "APP.DB.restore-x"),
+        ("app.db", "App.Db.restore-20261122T000000.000001Z-abcd1234"),
+        # 완성형(NFC) DB 이름과 조합형(NFD) 산출물 이름
+        (
+            unicodedata.normalize("NFC", "café.db"),
+            unicodedata.normalize("NFD", "café.db") + ".restore-x",
+        ),
+    ],
+    ids=["upper", "mixed", "nfd"],
+)
+def test_folded_alias_of_leftover_also_refuses(lab, fake, no_exec, capsys, db_name, leftover):
+    """``_fold()`` 로 접어 같은 이름이면 같은 산출물로 보고 거부한다(D-19, #134 리뷰 1)."""
+    (lab / leftover).mkdir()
+    assert main_inproc(db_args(lab, fake, db_name), no_exec) == cli.EXIT_RESTORE
+    err = capsys.readouterr().err
+    assert "leftover restore output" in err
+    assert "restore" not in fake.calls()
+    assert not (lab / db_name).exists()
+
+
+def test_case_alias_retry_finds_the_earlier_leftover(ci_lab, fake, no_exec, capsys):
+    """대소문자 무시 볼륨: ``--db APP.DB`` 로 실패한 뒤 ``--db app.db`` 로 띄워도 한 벌뿐이다."""
+    lab = ci_lab
+    fake.remote_txid(0x20)
+    fake.fail_restore()
+    assert main_inproc(db_args(lab, fake, "APP.DB"), no_exec) == cli.EXIT_RESTORE
+    capsys.readouterr()
+    (left,) = [p for p in lab.iterdir() if ".restore-" in p.name]
+    assert left.name.startswith("APP.DB.restore-")
+    assert main_inproc(db_args(lab, fake, "app.db"), no_exec) == cli.EXIT_RESTORE
+    err = capsys.readouterr().err
+    assert "leftover restore output" in err and left.name in err
+    assert [p for p in lab.iterdir() if ".restore-" in p.name] == [left]
+    assert fake.calls().count("restore") == 1
+
+
 def test_integrity_failure_exits_3(lab, fake, no_exec):
     (lab / "app.db").write_bytes(b"garbage" * 1000)
     write_meta(lab / "app.db")

@@ -702,10 +702,13 @@ def check_no_restore_leftovers(db: Path) -> None:
     """DB 디렉터리에 ``<db>.restore-*`` 가 하나라도 있으면 exit 4. 복원 전에 부른다(#134, D-30).
 
     무엇이든(디렉터리·파일·링크) 남아 있으면 거부한다. boot 는 그것을 지우지 않는다.
+    이름은 모든 플랫폼에서 ``_fold()``(canonical caseless matching)로 접어 비교한다. 대소문자·
+    정규형이 다른 ``--db`` 철자로 다시 띄워도 같은 볼륨의 앞선 산출물을 찾고, 대소문자 구분
+    볼륨에서 접으면 같아지는 남의 이름도 판정할 수 없으므로 거부한다(D-19 와 같은 비교, #134).
     """
-    prefix = db.name + _RESTORE_INFIX
+    prefix = _fold(db.name + _RESTORE_INFIX)
     try:
-        found = sorted(n for n in os.listdir(db.parent) if n.startswith(prefix))
+        found = sorted(n for n in os.listdir(db.parent) if _fold(n).startswith(prefix))
     except OSError as exc:
         raise _Exit(EXIT_RESTORE, f"cannot list {db.parent}: {exc}") from None
     if not found:
