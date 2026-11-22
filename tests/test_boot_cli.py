@@ -2615,9 +2615,11 @@ def test_stderr_tells_the_story(lab, fake):
 # --- #133: boot 밖에서 DB 를 연 다른 프로세스 ------------------------------------------------
 # boot 를 돌리지 않고 같은 DB 를 여는 프로세스(같은 볼륨을 쓰는 둘째 컨테이너). 표준 입출력의
 # 한 줄로 진행을 주고받는다: "ready" 를 쓰고 stdin 의 "go" 를 기다린 뒤 결과 JSON 한 줄을 쓴다.
+# 둘째 인자는 새 연결이 할 일이다: "write" 는 표 ``t`` 에 한 행을 쓰고, "open" 은 열어서 표 수만
+# 센다(운영 경로에 DB 가 없을 때 — 표가 없어 INSERT 는 실패한다).
 HOLDER_SCRIPT = """
 import json, sqlite3, sys
-db = sys.argv[1]
+db, new_conn = sys.argv[1], sys.argv[2]
 old = sqlite3.connect(db, timeout=5)
 assert old.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
 old.execute("SELECT count(*) FROM t").fetchone()  # 트랜잭션 없는 유휴 연결
@@ -2631,8 +2633,11 @@ try:
 except Exception as exc:
     res["old"] = f"{type(exc).__name__}: {exc}"
 new = sqlite3.connect(db, timeout=5)
-new.execute("INSERT INTO t(v) VALUES ('holder-new-conn')")
-new.commit()
+if new_conn == "write":
+    new.execute("INSERT INTO t(v) VALUES ('holder-new-conn')")
+    new.commit()
+else:
+    res["new_tables"] = new.execute("SELECT count(*) FROM sqlite_master").fetchone()[0]
 new.close()
 old.close()  # 마지막 연결이라 WAL 을 DB 파일에 체크포인트한다
 print(json.dumps(res), flush=True)
@@ -2663,13 +2668,17 @@ def wal_db_with_rows(db: Path, rows: int) -> None:
     conn.close()
 
 
-def boot_while_another_process_holds_the_db(db: Path, boot) -> tuple[str, dict]:
+def boot_while_another_process_holds_the_db(
+    db: Path, boot, *, returncode: int = 0, new_conn: str = "write"
+) -> tuple[str, dict]:
     """다른 프로세스가 ``db`` 에 유휴 WAL 연결을 연 채 ``boot()`` 를 부른다.
 
-    ``(boot stderr, holder 결과)`` 를 돌려준다. holder 는 어느 경로로 끝나든 거둔다.
+    boot 의 종료 코드가 ``returncode`` 인지 본 뒤 holder 를 진행시킨다. ``new_conn`` 은
+    ``HOLDER_SCRIPT`` 의 새 연결이 할 일이다. ``(boot stderr, holder 결과)`` 를 돌려준다. holder 는
+    어느 경로로 끝나든 거둔다.
     """
     holder = subprocess.Popen(
-        [sys.executable, "-c", HOLDER_SCRIPT, str(db)],
+        [sys.executable, "-c", HOLDER_SCRIPT, str(db), new_conn],
         stdin=subprocess.PIPE,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
@@ -2683,7 +2692,7 @@ def boot_while_another_process_holds_the_db(db: Path, boot) -> tuple[str, dict]:
             _, err = holder.communicate()
             pytest.fail(f"holder did not report ready (got {line!r}): {err}")
         result = boot()
-        assert result.returncode == 0, result.stderr
+        assert result.returncode == returncode, result.stderr
         out, err = holder.communicate("go\n", timeout=60)
     finally:
         if holder.poll() is None:
@@ -2718,38 +2727,60 @@ def test_open_connection_from_another_process_keeps_writing_to_the_quarantined_d
     assert values(db) == {"other": 7, "holder-new-conn": 1}
 
 
-def test_resuming_an_interrupted_quarantine_without_options_also_moves_an_open_db(
-    lab, fake, monkeypatch
-):
+def test_resuming_an_interrupted_quarantine_without_options_also_moves_an_open_db(lab, fake):
     """옵션 없는 부팅도 중단된 격리(``<db>.stale-*.partial``)를 재개하면 열린 DB 를 옮긴다(#133).
 
     판정 전에 격리 재개가 돌기 때문이다(DESIGN §4-2). 그래서 프로필 문서는 「boot 컨테이너만 다시
     띄워도 된다」를 중단된 격리가 남지 않은 정상 상태의 ``match`` 재시작으로 한정하고, 재개를
     복원이 걸린 기동에 넣는다. 위 테스트와 같이 문서의 근거를 고정한다. boot 가 이 동작을 막게
     되면(#133 의 2단계) 이 테스트와 프로필 문서의 해당 절을 함께 고친다.
+
+    격리 도중 죽은 부팅은 ``.partial`` 과 함께 그 부팅의 ``<db>.restore-*`` 도 남긴다(복원을 먼저
+    끝낸 뒤 격리한다). 그래서 재개한 부팅은 DB 를 옮긴 뒤 복원하지 않고 exit 4 로 멈추고(D-30),
+    운영 경로에 DB 가 없는 동안 다른 프로세스의 새 연결은 빈 파일을 만든다. 그 0바이트 파일 때문에
+    산출물을 치운 다음 부팅도 복원하지 않고 ``no_local_meta`` 로 거부한다.
     """
     db = lab / "app.db"
     wal_db_with_rows(db, 3)
-    fake.remote_txid(5)
+    fake.remote_txid(5)  # 로컬 메타 없음 + 원격 TXID 5 → no_local_meta
+    args = boot_args(lab, fake, "--on-unknown", "restore")
 
     def interrupted_then_plain_boot():
-        # holder 가 연결을 연 뒤(-wal·-shm 이 생긴 뒤) 격리 manifest 를 쓰고 DB 를 옮기기 전에 죽은
-        # 부팅(rename 순서는 위 crash_on_rename 표). DB 는 아직 운영 경로에 있다.
-        with monkeypatch.context() as m:
-            crash_on_rename(m, 2)
-            with pytest.raises(KeyboardInterrupt):
-                cli.quarantine(db, ls.default_meta_path(db))
+        # holder 가 연결을 연 뒤(-wal·-shm 이 생긴 뒤) 실제 부팅을 격리 manifest 를 쓰고 DB 를
+        # 옮기기 전에 죽인다(rename 1 = manifest, 2 = app.db). 남은 산출물을 만드는 방식은
+        # test_kill_before_install_leaves_restore_dir_and_rerun_refuses 와 같다.
+        killed = run_killed(args, 2, lab.parent / "renames.log")
+        assert killed.returncode == 99, killed.stderr
         assert db.exists()
         assert [p.name for p in lab.iterdir() if ".stale-" in p.name][0].endswith(".partial")
+        assert len(restore_dirs(lab)) == 1
         return run_boot(boot_args(lab, fake))  # --on-unknown 없음
 
-    stderr, holder = boot_while_another_process_holds_the_db(db, interrupted_then_plain_boot)
+    stderr, holder = boot_while_another_process_holds_the_db(
+        db, interrupted_then_plain_boot, returncode=cli.EXIT_RESTORE, new_conn="open"
+    )
+    # 재개가 열린 DB 를 옮긴다. 옛 연결이 쓴 행은 격리본에만 있다.
     assert "quarantine: resuming interrupted" in stderr
     assert "reason_code=restore_from_remote" in stderr
-    assert holder == {"old": "ok"}
+    assert holder == {"old": "ok", "new_tables": 0}
     (quarantined,) = stale_dirs(lab)
     assert values(quarantined / "app.db") == {"other": 3, "holder-old-conn": 1}
-    assert values(db) == {"other": 7, "holder-new-conn": 1}
+    # 복원은 앞선 부팅의 산출물에 걸려 exit 4 다. 내려받지 않았다(죽은 부팅의 1번뿐).
+    assert "leftover restore output" in stderr
+    assert len(hint_lines(stderr)) == 1
+    assert fake.calls().count("restore") == 1
+    # 운영 경로에 boot 가 설치한 DB 는 없다. 있는 것은 holder 의 새 연결이 만든 0바이트 파일이다.
+    assert db.is_file() and db.stat().st_size == 0
+    assert not ls.default_meta_path(db).exists()
+
+    # 산출물을 치워도 그 0바이트 파일 때문에 옵션 없는 부팅은 복원하지 않고 거부한다(D-18).
+    (left,) = restore_dirs(lab)
+    shutil.rmtree(left)
+    rerun = run_boot(boot_args(lab, fake))
+    assert rerun.returncode == cli.EXIT_REFUSE, rerun.stderr
+    assert "reason_code=no_local_meta" in rerun.stderr
+    assert "local db is 0 bytes and local meta is missing" in rerun.stderr
+    assert fake.calls().count("restore") == 1
 
 
 # --- Django 차단 --------------------------------------------------------------------------

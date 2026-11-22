@@ -649,7 +649,7 @@ DB 파일이 0바이트면 도입할 데이터가 없으므로 `--adopt-existing
 
 `--on-unknown` 은 문제를 푼 그 한 번만 쓰고 원래(`refuse`)로 돌린다. 격리된 `<db>.stale-<ts>/` 는 boot 가 지우지 않는다. 확인한 뒤 직접 지운다.
 
-**복원이 걸린 부팅 전에는 DB 를 여는 다른 컨테이너·프로세스를 먼저 내린다.** `--on-unknown restore`, 종료 코드 3 복구의 파일 이동, 볼륨을 비운 뒤의 복원, 중단된 격리(`<db>.stale-…partial/`)의 재개가 여기 든다. 재개는 옵션이 없어도 판정 전에 일어나므로, 복구 도중 boot 가 실패했다면 옵션을 뺀 다음 부팅에서도 다른 컨테이너를 내려 둔다. boot 는 로컬 파일을 rename 으로 격리하므로, boot 밖에서 이미 열려 있던 연결은 격리본을 계속 쥐고 그 쓰기는 오류 없이 격리본에만 남는다(복제되지 않는다. 가짜 litestream·SQLite 3.53.1 로 재현함, #133). 같은 볼륨을 여는 컨테이너가 따로 있는 배포는 [`single-server-multiproc` 「boot 밖에서 DB 를 여는 컨테이너」](docs/profiles/single-server-multiproc.md#boot-밖에서-db-를-여는-컨테이너)를 본다. 옵션이 없고 `.partial` 이 남지 않은 정상 상태의 재시작(`match`)은 파일을 옮기지 않으므로 해당하지 않는다.
+**복원이 걸린 부팅 전에는 DB 를 여는 다른 컨테이너·프로세스를 먼저 내린다.** `--on-unknown restore`, 종료 코드 3 복구의 파일 이동, 볼륨을 비운 뒤의 복원, 중단된 격리(`<db>.stale-…partial/`)의 재개가 여기 든다. 재개는 옵션이 없어도 판정 전에 일어나므로, 복구 도중 boot 가 실패했다면 옵션을 뺀 다음 부팅에서도 다른 컨테이너를 내려 둔다. 재개한 부팅은 DB 를 옮긴 뒤 앞선 부팅의 `<db>.restore-…` 가 남아 있으면 `leftover restore output` 으로 exit 4 에서 멈추고(위 [종료 코드](#종료-코드) 4), 치울 때까지 운영 경로에 DB 가 없다. 그 사이 다른 프로세스가 DB 를 열면 0바이트 파일이 생겨 다음 부팅도 `no_local_meta` 로 거부된다(아래 '0바이트 DB 복구'의 '메타가 없을 때'). boot 는 로컬 파일을 rename 으로 격리하므로, boot 밖에서 이미 열려 있던 연결은 격리본을 계속 쥐고 그 쓰기는 오류 없이 격리본에만 남는다(복제되지 않는다. 가짜 litestream·SQLite 3.53.1 로 재현함, #133). 같은 볼륨을 여는 컨테이너가 따로 있는 배포는 [`single-server-multiproc` 「boot 밖에서 DB 를 여는 컨테이너」](docs/profiles/single-server-multiproc.md#boot-밖에서-db-를-여는-컨테이너)를 본다. 옵션이 없고 `.partial` 이 남지 않은 정상 상태의 재시작(`match`)은 파일을 옮기지 않으므로 해당하지 않는다.
 
 #### 복원 직후 크래시 복구
 
