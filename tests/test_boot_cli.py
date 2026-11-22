@@ -14,6 +14,7 @@ import hashlib
 import itertools
 import json
 import os
+import select
 import shutil
 import sqlite3
 import stat
@@ -2496,20 +2497,22 @@ def values(path: Path) -> dict[str, int]:
     return dict(rows)
 
 
-def test_open_connection_from_another_process_keeps_writing_to_the_quarantined_db(lab, fake):
-    """다른 프로세스의 열린 연결은 boot 의 격리·복원 뒤에도 격리본에 오류 없이 쓴다(#133).
+# 준비 신호("ready")를 기다리는 상한. 넘으면 holder 를 거두고 실패한다(sleep 으로 맞추지 않는다).
+HOLDER_READY_TIMEOUT = 60.0
 
-    결함 수정 테스트가 아니라 프로필 문서(``single-server-multiproc`` 「boot 밖에서 DB 를 여는
-    컨테이너」)의 근거를 고정한다. boot 가 이 동작을 막게 되면(#133 의 2단계) 이 테스트와 프로필
-    문서의 해당 절을 함께 고친다.
-    """
-    db = lab / "app.db"
-    make_db(db, 3)
+
+def wal_db_with_rows(db: Path, rows: int) -> None:
+    make_db(db, rows)
     conn = sqlite3.connect(db)
     assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
     conn.close()
-    fake.remote_txid(5)  # 로컬 메타 없음 + 원격 TXID 5 → no_local_meta
 
+
+def boot_while_another_process_holds_the_db(db: Path, boot) -> tuple[str, dict]:
+    """다른 프로세스가 ``db`` 에 유휴 WAL 연결을 연 채 ``boot()`` 를 부른다.
+
+    ``(boot stderr, holder 결과)`` 를 돌려준다. holder 는 어느 경로로 끝나든 거둔다.
+    """
     holder = subprocess.Popen(
         [sys.executable, "-c", HOLDER_SCRIPT, str(db)],
         stdin=subprocess.PIPE,
@@ -2518,23 +2521,79 @@ def test_open_connection_from_another_process_keeps_writing_to_the_quarantined_d
         text=True,
     )
     try:
-        assert holder.stdout.readline().strip() == "ready", holder.stderr.read()
-        result = run_boot(boot_args(lab, fake, "--on-unknown", "restore"))
+        ready, _, _ = select.select([holder.stdout], [], [], HOLDER_READY_TIMEOUT)
+        line = holder.stdout.readline().strip() if ready else None
+        if line != "ready":
+            holder.kill()
+            _, err = holder.communicate()
+            pytest.fail(f"holder did not report ready (got {line!r}): {err}")
+        result = boot()
         assert result.returncode == 0, result.stderr
-        assert "reason_code=no_local_meta" in result.stderr
-        assert "action=quarantine_and_restore" in result.stderr
         out, err = holder.communicate("go\n", timeout=60)
     finally:
         if holder.poll() is None:
             holder.kill()
             holder.communicate()
     assert holder.returncode == 0, err
+    return result.stderr, json.loads(out.splitlines()[-1])
+
+
+def test_open_connection_from_another_process_keeps_writing_to_the_quarantined_db(lab, fake):
+    """다른 프로세스의 열린 연결은 boot 의 격리·복원 뒤에도 격리본에 오류 없이 쓴다(#133).
+
+    결함 수정 테스트가 아니라 프로필 문서(``single-server-multiproc`` 「boot 밖에서 DB 를 여는
+    컨테이너」)의 근거를 고정한다. boot 가 이 동작을 막게 되면(#133 의 2단계) 이 테스트와 프로필
+    문서의 해당 절을 함께 고친다.
+    """
+    db = lab / "app.db"
+    wal_db_with_rows(db, 3)
+    fake.remote_txid(5)  # 로컬 메타 없음 + 원격 TXID 5 → no_local_meta
+
+    stderr, holder = boot_while_another_process_holds_the_db(
+        db, lambda: run_boot(boot_args(lab, fake, "--on-unknown", "restore"))
+    )
+    assert "reason_code=no_local_meta" in stderr
+    assert "action=quarantine_and_restore" in stderr
     # 옛 연결의 쓰기는 오류 없이 성공한다
-    assert json.loads(out.splitlines()[-1]) == {"old": "ok"}
+    assert holder == {"old": "ok"}
     (quarantined,) = stale_dirs(lab)
     # 옛 연결이 쓴 행은 격리본에만 있다(옛 로컬 3행 + 1행)
     assert values(quarantined / "app.db") == {"other": 3, "holder-old-conn": 1}
     # 같은 프로세스의 새 연결은 운영 경로의 복원본에 쓴다(복원본 7행 + 1행)
+    assert values(db) == {"other": 7, "holder-new-conn": 1}
+
+
+def test_resuming_an_interrupted_quarantine_without_options_also_moves_an_open_db(
+    lab, fake, monkeypatch
+):
+    """옵션 없는 부팅도 중단된 격리(``<db>.stale-*.partial``)를 재개하면 열린 DB 를 옮긴다(#133).
+
+    판정 전에 격리 재개가 돌기 때문이다(DESIGN §4-2). 그래서 프로필 문서는 「boot 컨테이너만 다시
+    띄워도 된다」를 중단된 격리가 남지 않은 정상 상태의 ``match`` 재시작으로 한정하고, 재개를
+    복원이 걸린 기동에 넣는다. 위 테스트와 같이 문서의 근거를 고정한다. boot 가 이 동작을 막게
+    되면(#133 의 2단계) 이 테스트와 프로필 문서의 해당 절을 함께 고친다.
+    """
+    db = lab / "app.db"
+    wal_db_with_rows(db, 3)
+    fake.remote_txid(5)
+
+    def interrupted_then_plain_boot():
+        # holder 가 연결을 연 뒤(-wal·-shm 이 생긴 뒤) 격리 manifest 를 쓰고 DB 를 옮기기 전에 죽은
+        # 부팅(rename 순서는 위 crash_on_rename 표). DB 는 아직 운영 경로에 있다.
+        with monkeypatch.context() as m:
+            crash_on_rename(m, 2)
+            with pytest.raises(KeyboardInterrupt):
+                cli.quarantine(db, ls.default_meta_path(db))
+        assert db.exists()
+        assert [p.name for p in lab.iterdir() if ".stale-" in p.name][0].endswith(".partial")
+        return run_boot(boot_args(lab, fake))  # --on-unknown 없음
+
+    stderr, holder = boot_while_another_process_holds_the_db(db, interrupted_then_plain_boot)
+    assert "quarantine: resuming interrupted" in stderr
+    assert "reason_code=restore_from_remote" in stderr
+    assert holder == {"old": "ok"}
+    (quarantined,) = stale_dirs(lab)
+    assert values(quarantined / "app.db") == {"other": 3, "holder-old-conn": 1}
     assert values(db) == {"other": 7, "holder-new-conn": 1}
 
 
