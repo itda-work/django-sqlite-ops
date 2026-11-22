@@ -25,7 +25,7 @@ from django.db import connections
 from .boot import litestream
 from .checks import _TRUE, _is_litestream_vfs, _options, _profile, _role, _uri
 from .compat import channels_lite
-from .database import DEFAULT_PROFILE, ENGINE, recommended
+from .database import COMPARISONS, DEFAULT_PROFILE, ENGINE, meets_recommendation, recommended
 
 try:
     import resource
@@ -543,8 +543,16 @@ def _diagnose_alias(alias: str, target: _Target, rec: dict[str, Any]) -> list[It
             items.append(Item(section, alias, key, "ok", actual, None, "read-only: not compared"))
         else:
             want = _canon(key, expected[key])
-            level = "ok" if actual == want else "warn"
-            message = "" if level == "ok" else "differs from the recommended value (DESIGN §6-0)"
+            met = meets_recommendation(key, actual, want)
+            if met is None:
+                level = "warn"
+                message = "cannot be compared with the recommended value (DESIGN §6-0)"
+            elif not met:
+                level, message = "warn", "differs from the recommended value (DESIGN §6-0)"
+            elif actual != want:
+                level, message = "ok", "above the recommended minimum; accepted (DESIGN §6-0)"
+            else:
+                level, message = "ok", ""
             items.append(Item(section, alias, key, level, actual, want, message))
     version = values["sqlite_version"]
     # journal_mode 와 무관하게 알린다. Litestream 은 복제를 시작하며 WAL 로 바꾸므로 진단 시점의
@@ -1072,7 +1080,9 @@ def format_text(items: list[Item]) -> str:
         for r in rows:
             value = _show(r.value)
             if r.expected is not None:
-                value += f" (expected {r.expected})"
+                # 최솟값 규칙은 ≥ 를 붙인다. 「정확히 그 값」으로 읽히지 않게 한다(#132)
+                at_least = r.section == "database" and COMPARISONS.get(r.key) == "at_least"
+                value += f" (expected {'≥ ' if at_least else ''}{r.expected})"
             text = f"  {r.level.upper():<7} {_show(r.alias):<{alias_w}}  {r.key:<{key_w}}  {value}"
             if r.message:
                 text += f"  — {r.message}"

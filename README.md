@@ -253,10 +253,12 @@ assert db["OPTIONS"]["check_same_thread"] is False
 
 둘 다 잠금을 기다리는 시간이지만 단위가 다르다. `options` 의 `timeout` 은 초, PRAGMA `busy_timeout` 은 밀리초다. Django 는 연결을 연 뒤에 `init_command` 를 실행하므로 `busy_timeout` 이 이긴다. 그래서 `options={"timeout": 20}` 만 주면 대기 시간은 여전히 5000ms 다.
 
+대기 시간을 늘리는 방법은 둘이다. 아래 첫째처럼 `busy_timeout` 을 덮는 쪽을 권한다 — 값이 `init_command` 한 곳에 남아 다른 설정과 섞이지 않는다. 둘째 형태도 실제 대기 시간은 같다(20000ms). [`sqlite_doctor`](#sqlite_doctor) 는 `busy_timeout` 이 권장값(5000) **이상**이면 받아들이므로 두 형태 모두 경고 없이 exit 0 이다. 5000 보다 짧게 줄이면 `warn` 이다.
+
 ```python
 from django_sqlite_ops.database import sqlite_database
 
-# 대기 시간을 20초로: busy_timeout 을 덮는다 (권장)
+# 대기 시간을 20초로: busy_timeout 을 덮는다 (이 방법을 권한다)
 db = sqlite_database("/srv/app/app.sqlite3", pragmas={"busy_timeout": 20000})
 
 # timeout 을 쓰고 싶다면 busy_timeout 을 함께 뺀다
@@ -395,13 +397,13 @@ python manage.py sqlite_doctor --json          # 모니터링·스크립트용
 
 무엇을 보나:
 
-- **database** — 별칭마다 Django 가 실제로 여는 경로(`OPTIONS["database"]` 가 있으면 `NAME` 대신 그것. 연결하지 않고 Django 의 연결 매개변수에서 읽는다)를 기준으로 역할(쓰기·읽기 전용·메모리·VFS), 파일 크기, `-wal` 크기(연결 전), 실제 `transaction_mode`·`journal_mode`·`synchronous`·`busy_timeout`·`foreign_keys`·SQLite 버전. [권장값](#기본값)과 다르면 `warn`. SQLite 버전이 [WAL-reset 버그](#sqlite-wal-reset-버그)의 영향 범위이면 `sqlite_version` 줄에 그 사실을 메시지로 적는다. **보고만 하므로 수준은 `ok` 이고 종료 코드를 바꾸지 않는다.** 읽기 전용 별칭은 쓰기 권고(`transaction_mode`·`journal_mode`·`synchronous`)를 비교하지 않는다. 메모리 DB 는 "메모리 DB" 로만 적는다. Litestream VFS 별칭과 역할을 판정할 수 없는 별칭(W004, 로컬이 아닌 URI authority 포함)은 연결하지 않고 `unknown`. 연결 실패는 `error`.
+- **database** — 별칭마다 Django 가 실제로 여는 경로(`OPTIONS["database"]` 가 있으면 `NAME` 대신 그것. 연결하지 않고 Django 의 연결 매개변수에서 읽는다)를 기준으로 역할(쓰기·읽기 전용·메모리·VFS), 파일 크기, `-wal` 크기(연결 전), 실제 `transaction_mode`·`journal_mode`·`synchronous`·`busy_timeout`·`foreign_keys`·SQLite 버전. [권장값](#기본값)에 어긋나면 `warn`. `transaction_mode`·`journal_mode` 는 권장값과 같아야 하고, `busy_timeout` 은 권장값(5000) 이상, `synchronous` 는 `NORMAL` 이상(`FULL`·`EXTRA`)이면 맞다 — 더 오래 기다리고 더 강하게 동기화하는 쪽은 권장값의 목적에 어긋나지 않는다. 그런 값은 `ok` 이고 `above the recommended minimum; accepted` 라고 적는다. 사람용 출력의 `(expected ≥ 5000)` 은 '이 값 이상'이라는 뜻이다(`--json` 의 `expected` 는 권장값 `5000` 그대로다). 더 약한 값(`busy_timeout` 이 5000 미만, `synchronous=OFF`)과 비교할 수 없는 값은 `warn` 이다. SQLite 버전이 [WAL-reset 버그](#sqlite-wal-reset-버그)의 영향 범위이면 `sqlite_version` 줄에 그 사실을 메시지로 적는다. **보고만 하므로 수준은 `ok` 이고 종료 코드를 바꾸지 않는다.** 읽기 전용 별칭은 쓰기 권고(`transaction_mode`·`journal_mode`·`synchronous`)를 비교하지 않는다. 메모리 DB 는 "메모리 DB" 로만 적는다. Litestream VFS 별칭과 역할을 판정할 수 없는 별칭(W004, 로컬이 아닌 URI authority 포함)은 연결하지 않고 `unknown`. 연결 실패는 `error`.
 - **mount** — 위의 실제 경로로 DB 파일(없으면 존재하는 상위 디렉터리)의 파일시스템 종류. NFS·SMB/CIFS·AFP·sshfs 같은 네트워크 파일시스템이면 `warn` 이다. SQLite 의 파일 잠금을 믿을 수 없고 WAL 이 동작하지 않는다([SQLite 문서](https://www.sqlite.org/useovernet.html)). 로컬로 확인되지 않은 종류(알 수 없는 FUSE 등)는 `unknown`.
 - **litestream** — `litestream databases -config PATH -json` 으로 설정의 DB 목록을 읽어 실제 경로로 대조한다. 쓰기 별칭이 설정에 없으면 `warn`(복제되지 않음). 단 channels-lite 전용 채널 DB(앱 DB 와 다른 파일)는 복제에서 빼는 것이 규칙이라 이 경고를 내지 않는다. 설정 경로가 실제 경로가 아니면(부모에 링크) `warn` — boot 가 거부하는 구성이다([경로 규칙](#경로-규칙)). 상대 경로·`dir:` 항목은 Litestream 의 작업 디렉터리 기준으로 풀려 대조할 수 없으므로 `warn`. 설정에만 있는 DB 는 `ok`(정보). 설정 파일 없음·깨진 YAML·바이너리 없음은 `error`.
 - **channels** — `CHANNEL_LAYERS` 를 읽기만 한다(`channels` 를 import 하지 않는다. 예외는 아래 `patch` 항목). 백엔드별 의미론을 한 줄로 요약한다. `InMemoryChannelLayer` 는 프로필이 `single-server-multiproc` 이면 `warn`. channels-lite 는 채널 DB 가 앱 DB 와 같은 파일이면 `warn`, Litestream 설정의 복제 대상이면 `warn`. 모르는 백엔드(`channels_redis` pub/sub 포함)는 `unknown`. `AIOSQLiteChannelLayer` 를 쓰거나 `PATCH_CHANNELS_LITE_AIO` 가 켜져 있으면 [중복 배달 패치](#channels-lite-패치) 상태를 `patch` 항목으로 보여 준다. 이때만 channels-lite 를 import 한다(DB 는 열지 않는다).
 - **process** — 명령을 실행한 프로세스의 열린 파일 한도(`RLIMIT_NOFILE`)를 `nofile_soft`·`nofile_hard` 로 보여 준다(무한대는 `unlimited`). **보고만 하고 판정하지 않으므로 늘 `ok` 이고 종료 코드를 바꾸지 않는다.** 필요한 값은 동시 접속 수에 달려 있어 근거 있는 경고 기준이 없기 때문이다. 표준 라이브러리 `resource` 가 없는 플랫폼(Windows)에서는 `nofile` 한 줄에 `unavailable` 로 적는다. 컨테이너에서는 `docker compose exec app python manage.py sqlite_doctor` 로 앱과 같은 한도를 본다(재현함: `exec` 프로세스도 컨테이너의 한도를 받는다). 설정법·계산법은 [fd 한도 가이드](docs/profiles/fd-limits.md).
 
-출력 예:
+출력 예(`pragmas={"busy_timeout": 20000}` 으로 대기 시간을 늘린 설정, Litestream 설정을 준 경우):
 
 ```text
 [settings]
@@ -413,8 +415,8 @@ python manage.py sqlite_doctor --json          # 모니터링·스크립트용
   OK      default  wal               -  — no -wal file
   OK      default  transaction_mode  IMMEDIATE (expected IMMEDIATE)
   OK      default  journal_mode      WAL (expected WAL)
-  WARN    default  synchronous       FULL (expected NORMAL)  — differs from the recommended value (DESIGN §6-0)
-  OK      default  busy_timeout      5000 (expected 5000)
+  OK      default  synchronous       NORMAL (expected ≥ NORMAL)
+  OK      default  busy_timeout      20000 (expected ≥ 5000)  — above the recommended minimum; accepted (DESIGN §6-0)
   OK      default  foreign_keys      1
   OK      default  sqlite_version    3.53.1
 
@@ -432,7 +434,7 @@ python manage.py sqlite_doctor --json          # 모니터링·스크립트용
   OK      -  nofile_soft  1024  — RLIMIT_NOFILE of this process; reported, not judged (docs/profiles/fd-limits.md)
   OK      -  nofile_hard  524288  — RLIMIT_NOFILE of this process; reported, not judged (docs/profiles/fd-limits.md)
 
-summary: 1 warning(s), 0 error(s), 0 unknown -> exit 1
+summary: 0 warning(s), 0 error(s), 0 unknown -> exit 0
 ```
 
 | 종료 코드 | 뜻 |

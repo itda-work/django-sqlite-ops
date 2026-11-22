@@ -9,7 +9,15 @@ from os import PathLike
 from types import MappingProxyType
 from typing import Any
 
-__all__ = ["DEFAULT_PROFILE", "PROFILES", "RECOMMENDED", "recommended", "sqlite_database"]
+__all__ = [
+    "COMPARISONS",
+    "DEFAULT_PROFILE",
+    "PROFILES",
+    "RECOMMENDED",
+    "meets_recommendation",
+    "recommended",
+    "sqlite_database",
+]
 
 ENGINE = "django.db.backends.sqlite3"
 DEFAULT_PROFILE = "single-server"
@@ -38,6 +46,19 @@ RECOMMENDED: Mapping[str, Mapping[str, Any]] = MappingProxyType(
 )
 PROFILES = tuple(RECOMMENDED)
 
+# 권장값과 실제 값의 비교 규칙(DESIGN §6-0 표의 「비교」 칸, #132). 프로필과 무관하다.
+# "equal" 은 일치, "at_least" 는 권장값 이상(대기가 길수록·동기화가 강할수록 권장 쪽)이다.
+COMPARISONS: Mapping[str, str] = MappingProxyType(
+    {
+        "transaction_mode": "equal",
+        "journal_mode": "equal",
+        "synchronous": "at_least",
+        "busy_timeout": "at_least",
+    }
+)
+# synchronous 의 강도 순서(약한 쪽부터). 정수 → 이름 매핑은 doctor._SYNCHRONOUS 가 맡는다.
+_SYNCHRONOUS_ORDER = ("OFF", "NORMAL", "FULL", "EXTRA")
+
 _IDENTIFIER = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
 # Django 는 init_command 를 ";" 로 나눠 실행한다. 값에 ";" 나 공백·따옴표가 들어오지 못하게 한다.
 _PRAGMA_VALUE = re.compile(r"-?[A-Za-z0-9_]+")
@@ -52,6 +73,24 @@ def recommended(profile: str = DEFAULT_PROFILE) -> dict[str, Any]:
             f"unknown profile {profile!r}; expected one of {', '.join(PROFILES)}"
         ) from None
     return {"transaction_mode": entry["transaction_mode"], "pragmas": dict(entry["pragmas"])}
+
+
+def meets_recommendation(key: str, actual: Any, want: Any) -> bool | None:
+    """``actual`` 이 권장값 ``want`` 의 비교 규칙(:data:`COMPARISONS`)에 맞는지.
+
+    두 값은 같은 표기로 맞춘 뒤 준다(``synchronous`` 는 대문자 이름). 비교할 수 없는 값
+    (``busy_timeout`` 이 정수가 아님, ``synchronous`` 가 알 수 없는 값)이면 ``None`` 이다.
+    """
+    rule = COMPARISONS.get(key, "equal")
+    if rule == "equal":
+        return actual == want
+    if key == "synchronous":
+        if actual not in _SYNCHRONOUS_ORDER or want not in _SYNCHRONOUS_ORDER:
+            return None
+        return _SYNCHRONOUS_ORDER.index(actual) >= _SYNCHRONOUS_ORDER.index(want)
+    if not all(isinstance(v, int) and not isinstance(v, bool) for v in (actual, want)):
+        return None
+    return actual >= want
 
 
 def _check_pragma_name(name: Any) -> None:

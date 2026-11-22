@@ -146,16 +146,96 @@ def test_missing_uri_file_is_not_created(tmp_path):
     assert rc == 2
 
 
-def test_values_differing_from_recommended_warn(tmp_path):
+def test_values_weaker_than_recommended_warn(tmp_path):
     db = make_db(tmp_path / "app.sqlite3")
-    config = sqlite_database(db, pragmas={"synchronous": "FULL", "busy_timeout": 100})
+    config = sqlite_database(db, pragmas={"synchronous": "OFF", "busy_timeout": 100})
     rc, data = doctor({"default": config})
     warned = {i["key"]: i for i in problems(data)}
     assert set(warned) == {"synchronous", "busy_timeout"}
-    assert warned["synchronous"]["value"] == "FULL"
+    assert warned["synchronous"]["value"] == "OFF"
     assert warned["synchronous"]["expected"] == "NORMAL"
     assert warned["busy_timeout"]["value"] == 100
     assert warned["busy_timeout"]["expected"] == 5000
+    for item in warned.values():
+        assert item["message"] == "differs from the recommended value (DESIGN §6-0)"
+    assert rc == 1
+
+
+@pytest.mark.parametrize(
+    ("pragmas", "options", "key", "value"),
+    [
+        ({"busy_timeout": 20000}, None, "busy_timeout", 20000),
+        ({"busy_timeout": 5001}, None, "busy_timeout", 5001),
+        ({"synchronous": "FULL"}, None, "synchronous", "FULL"),
+        ({"synchronous": "EXTRA"}, None, "synchronous", "EXTRA"),
+        ({"synchronous": 2}, None, "synchronous", "FULL"),
+        # README 「timeout 과 busy_timeout」의 둘째 형태: timeout 20초 = busy_timeout 20000
+        ({"busy_timeout": None}, {"timeout": 20}, "busy_timeout", 20000),
+    ],
+)
+def test_values_stronger_than_recommended_are_accepted(tmp_path, pragmas, options, key, value):
+    # busy_timeout·synchronous 는 권장값 이상이면 맞다(DESIGN §6-0 의 비교 규칙, #132)
+    db = make_db(tmp_path / "app.sqlite3")
+    rc, data = doctor({"default": sqlite_database(db, pragmas=pragmas, options=options)})
+    assert problems(data) == []
+    item = one(data, "database", "default", key)
+    assert item["level"] == "ok"
+    assert item["value"] == value
+    # expected 는 권장값 그대로다(스키마 version 1). 권장값과 다르면 받아들였다는 말을 남긴다
+    assert item["expected"] == {"busy_timeout": 5000, "synchronous": "NORMAL"}[key]
+    assert "accepted" in item["message"]
+    assert "DESIGN §6-0" in item["message"]
+    assert rc == 0
+
+
+@pytest.mark.parametrize(
+    ("pragmas", "key", "value"),
+    [
+        ({"busy_timeout": 4999}, "busy_timeout", 4999),
+        ({"busy_timeout": 0}, "busy_timeout", 0),
+        ({"synchronous": 0}, "synchronous", "OFF"),
+    ],
+)
+def test_values_just_below_recommended_warn(tmp_path, pragmas, key, value):
+    db = make_db(tmp_path / "app.sqlite3")
+    rc, data = doctor({"default": sqlite_database(db, pragmas=pragmas)})
+    assert [(i["key"], i["level"], i["value"]) for i in problems(data)] == [(key, "warn", value)]
+    assert rc == 1
+
+
+def test_incomparable_value_warns(tmp_path):
+    # SQLite 3.53.1 은 PRAGMA synchronous=4 를 4 로 읽는다. 순서에 없는 값은 ok 로 넘기지 않는다
+    db = make_db(tmp_path / "app.sqlite3")
+    rc, data = doctor({"default": sqlite_database(db, pragmas={"synchronous": 4})})
+    item = one(data, "database", "default", "synchronous")
+    if item["value"] != 4:
+        pytest.skip(f"this SQLite reads synchronous=4 back as {item['value']!r}")
+    assert item["level"] == "warn"
+    assert item["message"] == "cannot be compared with the recommended value (DESIGN §6-0)"
+    assert rc == 1
+
+
+def test_exact_recommended_values_have_no_message(tmp_path):
+    db = make_db(tmp_path / "app.sqlite3")
+    config = sqlite_database(db, pragmas={"busy_timeout": 5000, "synchronous": "NORMAL"})
+    rc, data = doctor({"default": config})
+    for key in ("busy_timeout", "synchronous", "journal_mode", "transaction_mode"):
+        item = one(data, "database", "default", key)
+        assert (item["level"], item["message"]) == ("ok", ""), item
+    assert rc == 0
+
+
+def test_text_output_shows_minimum_rules(tmp_path):
+    # 사람용 출력의 (expected …) 는 최솟값 규칙이면 ≥ 를 붙여 「정확히 그 값」으로 읽히지 않게 한다
+    db = make_db(tmp_path / "app.sqlite3")
+    config = sqlite_database(db, pragmas={"busy_timeout": 20000, "synchronous": "OFF"})
+    rc, out = doctor({"default": config}, json_output=False)
+    lines = {line.split()[2]: line for line in out.splitlines() if line.startswith("  ")}
+    assert "20000 (expected ≥ 5000)" in lines["busy_timeout"]
+    assert lines["busy_timeout"].split()[0] == "OK"
+    assert "OFF (expected ≥ NORMAL)" in lines["synchronous"]
+    assert lines["synchronous"].split()[0] == "WARN"
+    assert "WAL (expected WAL)" in lines["journal_mode"]
     assert rc == 1
 
 
@@ -163,8 +243,10 @@ def test_plain_settings_warn_on_actual_values(tmp_path):
     db = make_db(tmp_path / "app.sqlite3")
     rc, data = doctor({"default": raw(db)})
     warned = {i["key"]: i["value"] for i in problems(data)}
-    # Python sqlite3 기본 timeout 5초 = busy_timeout 5000 이라 그 항목은 맞는다
-    assert warned == {"transaction_mode": None, "journal_mode": "DELETE", "synchronous": "FULL"}
+    # Python sqlite3 기본 timeout 5초 = busy_timeout 5000 이라 그 항목은 맞는다.
+    # Django 기본 synchronous=FULL 은 NORMAL 보다 강하므로 받아들인다(#132)
+    assert warned == {"transaction_mode": None, "journal_mode": "DELETE"}
+    assert one(data, "database", "default", "synchronous")["value"] == "FULL"
     assert rc == 1
 
 
@@ -275,7 +357,7 @@ def test_json_schema(tmp_path):
 def test_text_output(tmp_path):
     db = make_db(tmp_path / "app.sqlite3")
     rc, out = doctor(
-        {"default": sqlite_database(db, pragmas={"synchronous": "FULL"})}, json_output=False
+        {"default": sqlite_database(db, pragmas={"synchronous": "OFF"})}, json_output=False
     )
     assert "[database]" in out
     assert any(line.split()[:3] == ["WARN", "default", "synchronous"] for line in out.splitlines())
