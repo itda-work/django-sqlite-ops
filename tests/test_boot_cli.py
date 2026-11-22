@@ -2456,6 +2456,88 @@ def test_stderr_tells_the_story(lab, fake):
         assert needle in text, needle
 
 
+# --- #133: boot 밖에서 DB 를 연 다른 프로세스 ------------------------------------------------
+# boot 를 돌리지 않고 같은 DB 를 여는 프로세스(같은 볼륨을 쓰는 둘째 컨테이너). 표준 입출력의
+# 한 줄로 진행을 주고받는다: "ready" 를 쓰고 stdin 의 "go" 를 기다린 뒤 결과 JSON 한 줄을 쓴다.
+HOLDER_SCRIPT = """
+import json, sqlite3, sys
+db = sys.argv[1]
+old = sqlite3.connect(db, timeout=5)
+assert old.execute("PRAGMA journal_mode").fetchone()[0] == "wal"
+old.execute("SELECT count(*) FROM t").fetchone()  # 트랜잭션 없는 유휴 연결
+print("ready", flush=True)
+assert sys.stdin.readline().strip() == "go"
+res = {}
+try:
+    old.execute("INSERT INTO t(v) VALUES ('holder-old-conn')")
+    old.commit()
+    res["old"] = "ok"
+except Exception as exc:
+    res["old"] = f"{type(exc).__name__}: {exc}"
+new = sqlite3.connect(db, timeout=5)
+new.execute("INSERT INTO t(v) VALUES ('holder-new-conn')")
+new.commit()
+new.close()
+old.close()  # 마지막 연결이라 WAL 을 DB 파일에 체크포인트한다
+print(json.dumps(res), flush=True)
+"""
+
+
+def values(path: Path) -> dict[str, int]:
+    """행 수를 값별로 센다. ``holder-`` 로 시작하지 않는 행(시드·복원본)은 ``other`` 로 모은다."""
+    conn = sqlite3.connect(f"file:{path}?mode=ro", uri=True)
+    try:
+        rows = conn.execute(
+            "SELECT CASE WHEN v LIKE 'holder-%' THEN v ELSE 'other' END AS k, count(*)"
+            " FROM t GROUP BY k"
+        ).fetchall()
+    finally:
+        conn.close()
+    return dict(rows)
+
+
+def test_open_connection_from_another_process_keeps_writing_to_the_quarantined_db(lab, fake):
+    """다른 프로세스의 열린 연결은 boot 의 격리·복원 뒤에도 격리본에 오류 없이 쓴다(#133).
+
+    결함 수정 테스트가 아니라 프로필 문서(``single-server-multiproc`` 「boot 밖에서 DB 를 여는
+    컨테이너」)의 근거를 고정한다. boot 가 이 동작을 막게 되면(#133 의 2단계) 이 테스트와 프로필
+    문서의 해당 절을 함께 고친다.
+    """
+    db = lab / "app.db"
+    make_db(db, 3)
+    conn = sqlite3.connect(db)
+    assert conn.execute("PRAGMA journal_mode=WAL").fetchone()[0] == "wal"
+    conn.close()
+    fake.remote_txid(5)  # 로컬 메타 없음 + 원격 TXID 5 → no_local_meta
+
+    holder = subprocess.Popen(
+        [sys.executable, "-c", HOLDER_SCRIPT, str(db)],
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+    )
+    try:
+        assert holder.stdout.readline().strip() == "ready", holder.stderr.read()
+        result = run_boot(boot_args(lab, fake, "--on-unknown", "restore"))
+        assert result.returncode == 0, result.stderr
+        assert "reason_code=no_local_meta" in result.stderr
+        assert "action=quarantine_and_restore" in result.stderr
+        out, err = holder.communicate("go\n", timeout=60)
+    finally:
+        if holder.poll() is None:
+            holder.kill()
+            holder.communicate()
+    assert holder.returncode == 0, err
+    # 옛 연결의 쓰기는 오류 없이 성공한다
+    assert json.loads(out.splitlines()[-1]) == {"old": "ok"}
+    (quarantined,) = stale_dirs(lab)
+    # 옛 연결이 쓴 행은 격리본에만 있다(옛 로컬 3행 + 1행)
+    assert values(quarantined / "app.db") == {"other": 3, "holder-old-conn": 1}
+    # 같은 프로세스의 새 연결은 운영 경로의 복원본에 쓴다(복원본 7행 + 1행)
+    assert values(db) == {"other": 7, "holder-new-conn": 1}
+
+
 # --- Django 차단 --------------------------------------------------------------------------
 
 

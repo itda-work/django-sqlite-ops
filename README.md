@@ -605,7 +605,7 @@ stderr 의 `[boot] ...` 줄만 보면 무슨 일이 있었는지 알 수 있다.
 |---|---|---|
 | (exec) | 통과. 이후 코드는 exec 된 명령의 것이다 | — |
 | `2` | 거부. 판정할 수 없다 | 아래 사유 코드별 대처 |
-| `3` | 무결성 실패(`quick_check` 가 `ok` 아님) | DB 파일을 조사한다. 판정은 `match` 라 `--on-unknown restore` 만으로는 복원되지 않는다. 복제본이 정본이면 DB 파일(과 `-wal`·`-shm`)을 다른 곳으로 옮기고 `--on-unknown restore` 로 다시 부팅한다. 남은 메타가 `stale_meta` 로 격리되고 복원된다 |
+| `3` | 무결성 실패(`quick_check` 가 `ok` 아님) | DB 파일을 조사한다. 판정은 `match` 라 `--on-unknown restore` 만으로는 복원되지 않는다. 복제본이 정본이면 DB 를 여는 다른 컨테이너·프로세스를 모두 내린 뒤([주의](#거부됐을-때-exit-2-사유-코드별-대처)) DB 파일(과 `-wal`·`-shm`)을 다른 곳으로 옮기고 `--on-unknown restore` 로 다시 부팅한다. 남은 메타가 `stale_meta` 로 격리되고 복원된다 |
 | `4` | 복원 실패 | 로그의 `restore failed:` 사유를 본다. 임시 복원이 실패했으면 로컬은 그대로이고, 남은 `<db>.restore-…/` 는 조사 뒤 지운다. 사유가 `restored txid R is behind remote txid N observed before restore` 면 복원은 됐지만 판정 때 본 복제본보다 뒤라 설치하지 않은 것이다(로컬 그대로, [문제 해결](#boot)). 격리·설치 중 I/O 실패도 4 다. 격리 도중이면 `<db>.stale-…partial/` 이 남고 다음 부팅이 이어서 끝낸다. 격리를 마친 뒤(설치 중) 실패했으면 다음 부팅이 남은 상태에 따라 다시 복원하거나(로컬이 비었을 때) `no_local_meta` 로 거부한다(아래 '복원 직후 크래시 복구') |
 | `5` | 잠금 실패 | 같은 볼륨에서 이미 돌고 있는 컨테이너·프로세스를 멈춘다 |
 | `64` | 사용법 오류 | 인자를 고친다. `--` 뒤 명령이 꼭 있어야 한다. 경로가 실제 경로가 아니면 메시지의 실제 경로로 바꾸고 Litestream 설정도 같은 경로로 맞춘다. `--meta-path ... overlaps` 면 메타를 Litestream 설정의 `meta-path` 와 같은 자기만의 디렉터리로 준다 |
@@ -647,9 +647,11 @@ DB 파일이 0바이트면 도입할 데이터가 없으므로 `--adopt-existing
 
 `--on-unknown` 은 문제를 푼 그 한 번만 쓰고 원래(`refuse`)로 돌린다. 격리된 `<db>.stale-<ts>/` 는 boot 가 지우지 않는다. 확인한 뒤 직접 지운다.
 
+**복원이 걸린 부팅 전에는 DB 를 여는 다른 컨테이너·프로세스를 먼저 내린다.** `--on-unknown restore`, 종료 코드 3 복구의 파일 이동, 볼륨을 비운 뒤의 복원이 여기 든다. boot 는 로컬 파일을 rename 으로 격리하므로, boot 밖에서 이미 열려 있던 연결은 격리본을 계속 쥐고 그 쓰기는 오류 없이 격리본에만 남는다(복제되지 않는다. 가짜 litestream·SQLite 3.53.1 로 재현함, #133). 같은 볼륨을 여는 컨테이너가 따로 있는 배포는 [`single-server-multiproc` 「boot 밖에서 DB 를 여는 컨테이너」](docs/profiles/single-server-multiproc.md#boot-밖에서-db-를-여는-컨테이너)를 본다. 옵션 없는 평소 재시작(`match`)은 파일을 옮기지 않으므로 해당하지 않는다.
+
 #### 복원 직후 크래시 복구
 
-복원한 DB 옆에는 Litestream 메타가 없다. `litestream replicate` 가 첫 변경을 기록하기 전에 컨테이너가 죽으면, 다음 부팅은 "DB 는 있는데 메타가 없다"(`no_local_meta`)로 거부된다. 이 DB 는 방금 복제본에서 받은 것이므로 한 번만 `--on-unknown restore` 로 부팅하면 격리하고 다시 복원한다([D-14](docs/DECISIONS.md)).
+복원한 DB 옆에는 Litestream 메타가 없다. `litestream replicate` 가 첫 변경을 기록하기 전에 컨테이너가 죽으면, 다음 부팅은 "DB 는 있는데 메타가 없다"(`no_local_meta`)로 거부된다. 이 DB 는 방금 복제본에서 받은 것이므로 한 번만 `--on-unknown restore` 로 부팅하면 격리하고 다시 복원한다([D-14](docs/DECISIONS.md)). 그 전에 DB 를 여는 다른 컨테이너·프로세스를 내린다([위 주의](#거부됐을-때-exit-2-사유-코드별-대처)).
 
 ```bash
 python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream.yml \
@@ -935,6 +937,7 @@ doctor 는 별도 프로세스라 앱 코드에서 `apply()` 를 직접 부른 �
 - 두 프로필 모두 **쓰는 머신은 1대**다. 두 머신이 같은 복제본에 쓰면 나중 쪽이 경고 없이 이긴다. 배포는 정지 후 기동이다.
 - 프로세스 트리는 `boot`(잠금) → exec → `litestream replicate -exec "sh -c 'migrate && exec uvicorn ...'"` 다. litestream 이 PID 1 이다.
 - 한 번만 쓰는 boot 옵션(`--init-new`·`--adopt-existing`·`--on-unknown restore`)은 이미지에 굳히지 않고 `BOOT_FLAGS` 환경 변수로 넘긴 뒤 비운다.
+- boot·`replicate` 를 돌리는 컨테이너 하나에 같은 볼륨의 DB 를 여는 다른 컨테이너(워커·MCP 서버 등)를 붙이는 형태는 `single-server-multiproc` 문서가 다룬다. 다른 컨테이너는 boot 를 돌리지 않고, boot 컨테이너가 뜬 뒤에 뜨며, **복원이 걸린 기동은 전체를 내린 뒤에 한다**([boot 밖에서 DB 를 여는 컨테이너](docs/profiles/single-server-multiproc.md#boot-밖에서-db-를-여는-컨테이너), #133).
 - 열린 파일 한도(`nofile`)의 확인·설정(Docker `--ulimit`, compose `ulimits`, systemd `LimitNOFILE=`)·계산법은 두 프로필 공통 문서 [docs/profiles/fd-limits.md](docs/profiles/fd-limits.md) 에 있다. 프로필 compose 예에는 `ulimits` 를 넣지 않았다(이유는 그 문서 §6).
 - `settings.py`·`urls.py` 조각은 테스트가 실행하고 `check --deploy` 를 통과하는지 본다. `litestream.yml` 은 실제 litestream 0.5.17 이 읽는지, `entrypoint.sh` 는 문법을 본다. Dockerfile·compose 는 회귀 랩이 문서 블록을 그대로 꺼내 빌드하고 띄워 종단 검증했다(첫 배포, `check --deploy`, `sqlite_doctor`, `docker stop` 시 exit 0·복제 400/400, 빈 볼륨 소유자 복사, 워커 2개 — [결과](docs/research/lab-2026-10-08.md)). multiproc 은 channels-nats(`[nats]` extra)를 넣어 워커 사이 전달도 랩에서 확인했다(2026-10-26, 아래). 2026-10-08 의 multiproc 검증은 랩이 nats 컨테이너를 띄우지 않은 채 돈 것이었다.
 - **multiproc 채널 전달(랩 P2, 2026-10-26 channels-nats 0.10.0, 2026-10-27 0.10.1 로 다시 확인, uvicorn 워커 2)**: 그룹·프로세스 전용 채널은 워커마다 200/200(워커 → 워커 포함), 일반 채널 큐 그룹은 합 200·중복 0. 수신 루프를 남긴 채 `docker stop` 이 exit 0·0.74초로 끝났다. 손실은 계약대로 두 곳에서만 났다: 일반 채널을 `wait_for` 로 폴링할 때 두 폴링 사이(10ms 폴링에서 16/200), 받는 쪽 mailbox 가 `capacity`(기본 100)를 넘칠 때(간격 없는 버스트 200건). 보내는 쪽에는 어느 쪽도 예외가 없다. 0.10.1 에서는 1ms·10ms 폴링 뒤에도 같은 연결이 그룹 메시지를 200/200 받는다(#88, 2026-10-27). 아래 '채널 레이어' 함정을 본다([결과](docs/research/lab-2026-10-26-multiproc-nats.md)).

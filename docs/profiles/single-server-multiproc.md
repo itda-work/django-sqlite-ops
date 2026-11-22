@@ -155,7 +155,7 @@ volumes:
   appdata:
 ```
 
-- `app` 서비스의 컨테이너는 하나만 둔다. 프로세스를 늘릴 때는 `WEB_WORKERS` 를 올리고 컨테이너 수(`--scale`)를 늘리지 않는다. 같은 볼륨을 두 컨테이너가 쓰면 두 번째 boot 가 잠금(exit 5)에서 막히고, 다른 볼륨이면 두 머신이 쓰는 것과 같다.
+- `app` 서비스의 컨테이너는 하나만 둔다. 프로세스를 늘릴 때는 `WEB_WORKERS` 를 올리고 컨테이너 수(`--scale`)를 늘리지 않는다. 같은 볼륨을 두 컨테이너가 쓰면 두 번째 boot 가 잠금(exit 5)에서 막히고, 다른 볼륨이면 두 머신이 쓰는 것과 같다. boot 를 돌리지 않고 같은 볼륨의 DB 만 여는 다른 서비스는 §4 「[boot 밖에서 DB 를 여는 컨테이너](#boot-밖에서-db-를-여는-컨테이너)」를 따른다.
 - nats-server 에 인증·TLS 를 걸면 channels-nats 의 `connect_options` 로 넘긴다. 이 패키지는 NATS 설정을 검사하지 않는다.
 - 열린 파일 한도(`ulimits`)는 [`single-server`](single-server.md#composeyaml-예) 와 같은 이유로 넣지 않았다([이유](fd-limits.md#6-프로필-compose-예에-ulimits-를-넣지-않은-이유)). 한도는 워커 프로세스마다 따로 적용되므로([getrlimit(2)](https://man7.org/linux/man-pages/man2/getrlimit.2.html)) [계산](fd-limits.md#4-얼마로-둘까--계산법)은 워커 하나가 맡는 동시 접속 수로 한다.
 
@@ -191,6 +191,22 @@ SQLite 기반 채널 레이어(channels-lite)는 **추천하지 않는다**. 폴
 - **브로커를 먼저 띄운다.** nats-server 가 없으면 HTTP 요청과 DB 는 정상이지만 채널 레이어 호출이 실패한다(channels-nats 기본 `connect_deadline` 5초 뒤 `NoServersError`, [channels-nats README](https://github.com/itda-work/channels-nats#설정)). 브로커 재시작은 DB·복제와 무관하므로 boot 를 다시 거치지 않는다.
 - **배포는 정지 후 기동.** 옛 컨테이너의 워커가 모두 내려간 뒤 새 컨테이너를 띄운다. 워커가 여럿이어도 SQLite 를 쓰는 머신은 하나다.
 
+### boot 밖에서 DB 를 여는 컨테이너
+
+웹과 워커·MCP 서버를 컨테이너로 나누고 DB 볼륨 하나를 함께 쓰는 형태다(예: boot·`replicate` 를 돌리는 `web` + 같은 볼륨의 DB 를 여는 `mcp`). 같은 호스트의 같은 로컬 볼륨이면 쓰는 머신은 여전히 1대라 SQLite 전제가 깨지지 않는다. 다만 §2 의 프로세스 트리(`boot → litestream → 앱`) 밖에 프로세스가 생기므로 다음 규칙을 지킨다.
+
+- **boot 와 `litestream replicate` 는 한 컨테이너에서만 돈다.** 다른 컨테이너는 boot 를 돌리지 않고 앱 명령만 띄운다. 다른 컨테이너에서도 boot 를 돌리면 잠금에서 exit 5 로 막힌다(§3 compose 의 `--scale` 과 같은 경우). 거꾸로 boot 를 돌리지 않는 컨테이너는 `<db>.boot.lock` 을 잡지 않으므로 아무 데도 걸리지 않는다 — boot 가 그 컨테이너를 알아차리지 못한다는 뜻이다.
+- **다른 컨테이너는 boot 컨테이너가 뜬 뒤에 띄운다.** 판정되지 않은 DB 를 열지 않기 위해서다. 복원 전에 열면 빈 DB 파일이 생긴다([DESIGN §4-1](../DESIGN.md#4-1-왜-django-관리-명령이-아닌가)) — boot 는 그 파일을 `no_local_meta` 로 거부한다. boot 컨테이너 로그에 `[boot] exec:` 가 나온 뒤가 기준이다. compose 의 `depends_on` 은 시작 순서만 정하고 준비 완료는 기다리지 않는다. 기다리려면 boot 컨테이너에 `healthcheck` 를 두고 `condition: service_healthy` 를 쓴다([Docker 문서](https://docs.docker.com/compose/how-tos/startup-order/)).
+- **복원이 걸린 기동은 DB 를 여는 모든 컨테이너를 내린 뒤에 한다.** `--on-unknown restore`(`remote_ahead`·`no_local_meta`·`stale_meta` 등의 대처), 종료 코드 3 복구에서 DB 파일을 옮기는 일, 볼륨을 비운 뒤의 복원(`fresh`)이 여기 든다. boot 는 로컬 DB·`-wal`·`-shm` 을 rename 으로 `<db>.stale-<ts>/` 에 옮기고 복원본을 제자리에 놓는데, 다른 프로세스가 이미 열어 둔 연결은 옮겨진 파일을 계속 쥔다. 그 연결로 한 쓰기는 **오류 없이 성공하고 격리본에만 남는다.** 복제되지 않고 로그도 없다. 같은 프로세스가 새로 연 연결은 운영 경로의 복원본에 쓰므로, 한 프로세스 안에서 두 연결이 서로 다른 DB 를 본다. 연결을 오래 쥐는 프로세스(`CONN_MAX_AGE=None`, 상주 워커)일수록 오래 간다.
+  - 재현함: 가짜 litestream + 실제 boot CLI + SQLite 3.53.1, macOS(`tests/test_boot_cli.py` 의 `test_open_connection_from_another_process_keeps_writing_to_the_quarantined_db`, CI 에서는 Linux 에서도 돈다, #133). 실제 Litestream 과 Docker 볼륨을 함께 쓰는 두 컨테이너에서는 **미검증**이다.
+  - compose 라면 `docker compose stop` 으로 전체를 내리고 boot 컨테이너만 `BOOT_FLAGS` 를 주어 띄운 뒤, 앱이 뜨면 다른 컨테이너를 띄운다. boot 컨테이너만 `--on-unknown restore` 로 다시 띄우면 다른 컨테이너는 그대로 돌고 있다. `depends_on` 의 `restart: true` 는 의존 서비스를 다시 시작할 뿐 복원 동안 내려가 있음을 보장하지 않으므로 이 규칙을 대신하지 않는다.
+- **옵션 없는 평소 재시작은 boot 컨테이너만 다시 띄워도 된다.** DB 가 있으면 기본 정책(`refuse`)의 조치는 진행(`match`)이나 거부뿐이라 boot 가 파일을 옮기지 않는다([DESIGN §4-3](../DESIGN.md#4-3-판정-상태-4가지) 조치 규칙, 코드상 확인). 첫 실사용처에서도 다른 컨테이너가 도는 채 boot 컨테이너만 재시작해 `match` 로 진행했고 이후 정상이었다(사용처 실측, 이 저장소에서는 재현하지 않음).
+- **같은 호스트의 같은 로컬 볼륨이어야 한다.** 다른 호스트에서 네트워크 파일시스템으로 붙이면 쓰는 머신이 둘이 되고 SQLite 잠금도 믿을 수 없다. `sqlite_doctor` 의 `[mount]` 가 네트워크 파일시스템을 `WARN` 으로 알린다.
+- **다른 컨테이너에서 부르는 진단의 뜻**(코드상 확인):
+  - 헬스 스레드는 프로세스마다 돌고, 공유 볼륨의 로컬 메타·DB 파일을 읽은 뒤 `litestream ltx` 를 직접 부른다. 같은 `settings.py` 의 `SQLITE_OPS["HEALTH"]` 를 쓰는 컨테이너에 litestream 바이너리·설정 파일·복제본 자격 증명이 없으면 원격 조회가 실패해 그 컨테이너의 헬스는 `unknown`(`remote_error`)이다. 바이너리·설정 파일이 없을 때는 `tests/test_health.py` 의 `test_view_real_lookup_failure_is_unknown_with_200` 이 본다. 자격 증명만 없을 때는 실행하지 않았다. 헬스 검사는 boot 컨테이너로 보내거나, 다른 컨테이너에도 셋을 넣는다.
+  - `sqlite_doctor --litestream-config` 의 `[litestream]` 은 `litestream databases -config` 를 부르므로 그 컨테이너에 바이너리와 설정 파일이 있어야 한다(자격 증명은 쓰지 않는다). 없으면 `error` 다(`tests/test_doctor.py` 의 `test_litestream_config_missing_is_error`·`test_litestream_binary_missing_is_error`).
+  - `[process]` 의 `nofile` 은 doctor 를 부른 그 프로세스의 한도다. 컨테이너마다 따로 확인한다([fd 한도 가이드](fd-limits.md)).
+
 ### 확인 순서
 
 1. `python manage.py check --deploy` — `sqlite_ops.*` 가 없어야 한다.
@@ -212,5 +228,6 @@ SQLite 기반 채널 레이어(channels-lite)는 **추천하지 않는다**. 폴
   - 0.10.1 에서도 일반 채널 폴링은 두 폴링 사이의 메시지를 잃는다(계약). 일반 채널은 폴링하지 말고 계속 `receive` 한다.
   - 경위는 [이관 문서](../research/handoff-marco-nats-flush-cancel.md).
 - **컨테이너를 늘려 확장하지 않는다.** 워커 수로 늘린다(§3 compose).
+- **boot 를 돌리지 않고 같은 볼륨의 DB 를 여는 컨테이너가 있으면, 복원이 걸린 기동 전에 그것부터 내린다.** 열린 연결의 쓰기는 격리본으로 가고 오류가 나지 않는다([boot 밖에서 DB 를 여는 컨테이너](#boot-밖에서-db-를-여는-컨테이너), #133).
 - **열린 파일 한도는 워커마다 따로다.** 컨테이너에 준 `nofile` 을 워커 프로세스가 각각 물려받는다. 설정·확인·계산은 [fd 한도 가이드](fd-limits.md).
 - **VFS 읽기 복제본은 예정(2단계)이다**([DESIGN §3-2](../DESIGN.md)).
