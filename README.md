@@ -606,7 +606,7 @@ stderr 의 `[boot] ...` 줄만 보면 무슨 일이 있었는지 알 수 있다.
 | (exec) | 통과. 이후 코드는 exec 된 명령의 것이다 | — |
 | `2` | 거부. 판정할 수 없다 | 아래 사유 코드별 대처 |
 | `3` | 무결성 실패(`quick_check` 가 `ok` 아님) | DB 파일을 조사한다. 판정은 `match` 라 `--on-unknown restore` 만으로는 복원되지 않는다. 복제본이 정본이면 DB 파일(과 `-wal`·`-shm`)을 다른 곳으로 옮기고 `--on-unknown restore` 로 다시 부팅한다. 남은 메타가 `stale_meta` 로 격리되고 복원된다 |
-| `4` | 복원 실패 | 로그의 `restore failed:` 사유를 본다. 임시 복원이 실패했으면 로컬은 그대로이고, 남은 `<db>.restore-…/` 는 조사 뒤 지운다. 사유가 `restored txid R is behind remote txid N observed before restore` 면 복원은 됐지만 판정 때 본 복제본보다 뒤라 설치하지 않은 것이다(로컬 그대로, [문제 해결](#boot)). 격리·설치 중 I/O 실패도 4 다. 격리 도중이면 `<db>.stale-…partial/` 이 남고 다음 부팅이 이어서 끝낸다. 격리를 마친 뒤(설치 중) 실패했으면 다음 부팅이 남은 상태에 따라 다시 복원하거나(로컬이 비었을 때) `no_local_meta` 로 거부한다(아래 '복원 직후 크래시 복구') |
+| `4` | 복원 실패 | 로그의 `restore failed:` 사유를 본다. 임시 복원이 실패했으면 로컬은 그대로이고, 남은 `<db>.restore-…/` 는 조사 뒤 지운다. **지우기 전에는 다시 복원되지 않는다**: 남아 있는 동안 복원이 필요한 부팅은 내려받지 않고 사유 `leftover restore output …` 로 exit 4 다(재시작 정책 아래 재시작마다 DB 한 벌이 쌓이는 것을 막는다, [D-30](docs/DECISIONS.md)). 일시적 실패(네트워크, 복원 도중 정지)였어도 같다. 복원이 필요 없는 부팅(`match` 등)은 영향이 없다. 사유가 `restored txid R is behind remote txid N observed before restore` 면 복원은 됐지만 판정 때 본 복제본보다 뒤라 설치하지 않은 것이다(로컬 그대로, [문제 해결](#boot)). 격리·설치 중 I/O 실패도 4 다. 격리 도중이면 `<db>.stale-…partial/` 이 남고 다음 부팅이 이어서 끝낸다. 격리를 마친 뒤(설치 중) 실패했으면 다음 부팅이 남은 상태에 따라 다시 복원하거나(로컬이 비었을 때) `no_local_meta` 로 거부한다(아래 '복원 직후 크래시 복구') |
 | `5` | 잠금 실패 | 같은 볼륨에서 이미 돌고 있는 컨테이너·프로세스를 멈춘다 |
 | `64` | 사용법 오류 | 인자를 고친다. `--` 뒤 명령이 꼭 있어야 한다. 경로가 실제 경로가 아니면 메시지의 실제 경로로 바꾸고 Litestream 설정도 같은 경로로 맞춘다. `--meta-path ... overlaps` 면 메타를 Litestream 설정의 `meta-path` 와 같은 자기만의 디렉터리로 준다 |
 | `127` | `--` 뒤 명령을 실행할 수 없음 | 명령 이름·PATH·실행 권한을 확인한다 |
@@ -649,7 +649,7 @@ DB 파일이 0바이트면 도입할 데이터가 없으므로 `--adopt-existing
 
 #### 복원 직후 크래시 복구
 
-복원한 DB 옆에는 Litestream 메타가 없다. `litestream replicate` 가 첫 변경을 기록하기 전에 컨테이너가 죽으면, 다음 부팅은 "DB 는 있는데 메타가 없다"(`no_local_meta`)로 거부된다. 이 DB 는 방금 복제본에서 받은 것이므로 한 번만 `--on-unknown restore` 로 부팅하면 격리하고 다시 복원한다([D-14](docs/DECISIONS.md)).
+복원한 DB 옆에는 Litestream 메타가 없다. `litestream replicate` 가 첫 변경을 기록하기 전에 컨테이너가 죽으면, 다음 부팅은 "DB 는 있는데 메타가 없다"(`no_local_meta`)로 거부된다. 이 DB 는 방금 복제본에서 받은 것이므로 한 번만 `--on-unknown restore` 로 부팅하면 격리하고 다시 복원한다([D-14](docs/DECISIONS.md)). 설치 직전·직후에 죽어 `<db>.restore-…` 가 남아 있으면 그 부팅은 `leftover restore output` 으로 exit 4 다. 확인해 치운 뒤 다시 부팅한다([D-30](docs/DECISIONS.md)).
 
 ```bash
 python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream.yml \
@@ -1005,6 +1005,7 @@ SQLite 공식 문서([wal.html §11](https://sqlite.org/wal.html#the_wal_reset_b
 | exit 5 | 같은 볼륨에서 boot 나 그것이 exec 한 앱이 이미 돈다(잠금은 exec 된 명령에 상속) | 앞선 컨테이너를 멈춘다. `<db>.boot.lock` 은 지우지 않는다([함정](#boot-cli)) | 코드상 확인 |
 | 옛 볼륨으로 다시 띄우자 exit 2, `remote_ahead` | 복제본이 이 볼륨보다 새롭다. 보호가 없으면 최신본이 옛 볼륨으로 덮인다 | 복제본이 정본이면 `--on-unknown restore` 로 한 번([사유 코드별 대처](#거부됐을-때-exit-2-사유-코드별-대처)) | 실측(docker D4: 150건이 55건으로 덮임), 재현함(회귀 랩 L2: boot 가 exit 2 로 막고 복제본 무변경) |
 | exit 4, `restored txid R is behind remote txid N observed before restore; not installing` | boot 가 판정 때 조회한 원격 최대 TXID(N)보다 복원본(R)이 뒤다. 조회와 복원 사이에 복제본이 뒤로 갔다(버킷 롤백·객체 삭제·덮어쓰기, 같은 경로에 쓰는 둘째 `replicate`). 같거나 앞서면 정상으로 설치한다(복원 중 새 업로드) | `hint:` 줄대로 복제본이 롤백·덮어써졌는지, 다른 머신·컨테이너가 같은 경로로 복제하는지 확인한 뒤 다시 띄운다. 로컬은 바뀌지 않았고 `<db>.restore-…/` 는 조사 뒤 지운다. 조회 전에 이미 뒤로 간 복제본은 이 검사로 잡지 못한다 | 재현함(실제 Litestream 0.5.17·0.5.18 `file://` 복제본을 restore 직전에 옛 사본으로 되돌림 → 수정 전에는 TXID 1 을 설치하고 exec, `tests/test_boot_cli.py` 의 `test_replica_rolled_back_between_lookup_and_restore_exits_4`, 2026-11-19 #122). 실제 S3 에서의 발생 빈도는 미확인 |
+| exit 4, `leftover restore output <경로>; not restoring again until it is removed`(여럿이면 `N leftover restore outputs in <디렉터리>: …`) | 앞선 부팅이 남긴 `<db>.restore-…`(실패한 복원, 또는 복원 도중·설치 직전에 죽은 부팅의 것)가 DB 옆에 있다. boot 는 그것이 있는 동안 다시 내려받지 않는다. 재시작 정책으로 같은 실패가 되풀이돼도 복원본은 한 벌만 남는다 | 먼저 남은 것의 원인을 본다(앞선 exit 4 의 사유, 복원본 내용). 확인한 뒤 옮기거나 지우고 다시 띄운다. boot 는 지우지 않는다 | 재현함(가짜 litestream 으로 같은 실패 4회 → 수정 전 4벌, 수정 뒤 1벌·`restore` 호출 1번, `tests/test_boot_cli.py` 의 `test_repeated_restore_failure_downloads_once`, 2026-11-22 #134) |
 | 복원 직후 컨테이너가 죽은 뒤 exit 2, `no_local_meta` | 복원한 DB 옆에는 Litestream 메타가 없고 `replicate` 가 첫 변경을 기록해야 생긴다 | `--on-unknown restore` 로 한 번([복원 직후 크래시 복구](#복원-직후-크래시-복구)) | 실측(restore 결과에 메타 없음. 0.5.17·0.5.18, #105), [D-14](docs/DECISIONS.md) |
 | 직접 만든 entrypoint 의 `litestream restore -if-db-not-exists` 가 복원을 건너뛴다 | 0바이트 DB 파일이 있으면 rc 0 으로 건너뛴다(`database already exists, skipping`) | boot 를 쓴다. `manage.py` 를 boot 앞에서 부르지 않는다([boot CLI](#boot-cli)) | 재현함([DESIGN §4-1](docs/DESIGN.md#4-1-왜-django-관리-명령이-아닌가). 0.5.17·0.5.18, #105) |
 

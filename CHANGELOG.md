@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **boot 가 앞선 복원 산출물이 남아 있으면 다시 내려받지 않는다.** 복원이 필요한 부팅(`restore`·`quarantine_and_restore`)은 DB 옆에 `<db>.restore-…` 가 하나라도 있으면 `litestream restore` 를 부르지 않고 로컬을 바꾸지 않은 채 exit 4(사유 `leftover restore output …`, `hint:` 한 줄)로 끝난다. 예전에는 재시작 정책(`restart: on-failure`, systemd `Restart=`) 아래에서 원인이 남은 복원 실패가 되풀이되면 재시작마다 DB 한 벌이 같은 볼륨에 쌓였다(가짜 litestream 으로 4회에 4벌, 재현함). **exit 4 뒤에는 남은 `<db>.restore-*` 를 확인해 치워야 다시 복원된다** — 일시적 실패(네트워크, 복원 도중 정지)여도 같다. boot 는 그것을 지우지 않는다. 복원이 필요 없는 부팅(`match` 등)과 판정·사유 코드는 그대로다 (D-30, #134)
+
 ## [0.1.0a5] - 2026-11-20
 
 정기 복원 검증을 boot 와 같은 기준으로 맞춘 사전 릴리스다. `sqlite_doctor --restore-test` 가 복원 직전 원격 TXID 보다 뒤인 복원본을 `error`(exit 2)로 보고 산출물을 남긴다(#128). 검증한 Litestream 판(0.5.17·0.5.18)과 지원 범위는 0.1.0a4 와 같다.

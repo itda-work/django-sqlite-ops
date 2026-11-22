@@ -285,6 +285,18 @@ class Stack:
         """로컬 Litestream 메타 디렉터리 하나만 지운다(L3)."""
         self.volume_python(volume, "import shutil; shutil.rmtree('/data/.app.sqlite3-litestream')")
 
+    def remove_restore_leftovers(self, volume: str) -> None:
+        """앞선 부팅이 남긴 ``app.sqlite3.restore-*`` 를 지운다(L6, 사람이 치우는 단계, #134)."""
+        self.volume_python(
+            volume,
+            "import os, shutil\n"
+            "for n in os.listdir('/data'):\n"
+            "    if n.startswith('app.sqlite3.restore-'):\n"
+            "        p = os.path.join('/data', n)\n"
+            "        real_dir = os.path.isdir(p) and not os.path.islink(p)\n"
+            "        shutil.rmtree(p) if real_dir else os.unlink(p)",
+        )
+
     def volume_exists(self, volume: str) -> bool:
         proc = subprocess.run(
             ["docker", "volume", "inspect", f"{self.project}_{volume}"],
