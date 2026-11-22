@@ -7,7 +7,14 @@ from pathlib import Path
 import pytest
 from _nodjango import assert_runs_without_django
 
-from django_sqlite_ops.database import PROFILES, RECOMMENDED, recommended, sqlite_database
+from django_sqlite_ops.database import (
+    COMPARISONS,
+    PROFILES,
+    RECOMMENDED,
+    meets_recommendation,
+    recommended,
+    sqlite_database,
+)
 
 ROOT = Path(__file__).resolve().parent.parent
 
@@ -160,10 +167,10 @@ def _design_default_on_rows():
     rows = {}
     for line in section.splitlines():
         cells = [c.strip() for c in line.strip().strip("|").split("|")]
-        if len(cells) == 4 and cells[3] == "켬":
+        if len(cells) == 5 and cells[4] == "켬":
             names = re.findall(r"`([^`]+)`", cells[0])
             assert len(names) == 1, line
-            rows[names[0]] = cells[1].strip("`")
+            rows[names[0]] = (cells[1].strip("`"), cells[2])
     return rows
 
 
@@ -174,12 +181,54 @@ def test_defaults_match_design_table(profile):
     rec = recommended(profile)
     code = {"transaction_mode": rec["transaction_mode"], **rec["pragmas"]}
     assert set(rows) == set(code)
-    for name, doc_value in rows.items():
+    for name, (doc_value, _rule) in rows.items():
         value = code[name]
         if isinstance(value, int):
             assert doc_value == f"{value}ms", (name, doc_value)
         else:
             assert doc_value == value, (name, doc_value)
+
+
+# DESIGN §6-0 표의 「비교」 칸 표기
+_RULE_WORDS = {"equal": "일치", "at_least": "이상"}
+
+
+def test_comparison_rules_match_design_table():
+    # 비교 규칙(COMPARISONS)은 권장값 표의 모든 항목에 하나씩 있고, 문서 표의 「비교」 칸과 같다
+    rows = _design_default_on_rows()
+    for profile in PROFILES:
+        rec = recommended(profile)
+        assert set(COMPARISONS) == {"transaction_mode", *rec["pragmas"]}
+    assert {name: rule for name, (_value, rule) in rows.items()} == {
+        name: _RULE_WORDS[rule] for name, rule in COMPARISONS.items()
+    }
+
+
+@pytest.mark.parametrize(
+    ("key", "actual", "want", "result"),
+    [
+        ("journal_mode", "WAL", "WAL", True),
+        ("journal_mode", "DELETE", "WAL", False),
+        ("journal_mode", None, "WAL", False),
+        ("transaction_mode", None, "IMMEDIATE", False),
+        ("busy_timeout", 5000, 5000, True),
+        ("busy_timeout", 20000, 5000, True),
+        ("busy_timeout", 4999, 5000, False),
+        ("busy_timeout", 0, 5000, False),
+        ("busy_timeout", None, 5000, None),
+        ("busy_timeout", "20000", 5000, None),
+        ("busy_timeout", True, 5000, None),
+        ("synchronous", "NORMAL", "NORMAL", True),
+        ("synchronous", "FULL", "NORMAL", True),
+        ("synchronous", "EXTRA", "NORMAL", True),
+        ("synchronous", "OFF", "NORMAL", False),
+        ("synchronous", 7, "NORMAL", None),
+        ("synchronous", "BOGUS", "NORMAL", None),
+        ("synchronous", None, "NORMAL", None),
+    ],
+)
+def test_meets_recommendation(key, actual, want, result):
+    assert meets_recommendation(key, actual, want) is result
 
 
 DJANGO_CONNECTION_SCRIPT = """

@@ -6,6 +6,10 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **`sqlite_doctor` 가 권장값보다 강한 `busy_timeout`·`synchronous` 를 받아들인다.** `busy_timeout` 은 권장값(5000) 이상, `synchronous` 는 `NORMAL` 이상(`FULL`·`EXTRA`)이면 `warn` 이 아니라 `ok` 이고, `message` 에 `above the recommended minimum; accepted` 를 적는다. 예전에는 README 가 안내한 `pragmas={"busy_timeout": 20000}` 과 Django 기본 `synchronous=FULL` 도 `warn`·exit 1 이었고 doctor 에는 경고를 끄는 수단이 없었다. 비교 규칙은 DESIGN §6-0 표의 「비교」 칸과 `database.py` 의 `COMPARISONS` 한 곳이다. `journal_mode`·`transaction_mode` 는 그대로 일치해야 하고, 더 약한 값(`busy_timeout` 이 5000 미만, `synchronous=OFF`)과 비교할 수 없는 값은 그대로 `warn` 이다. `--json` 의 `expected` 는 권장값 그대로이고 스키마 `version` 도 1 이다. 사람용 출력은 이 두 항목을 `(expected ≥ 5000)`·`(expected ≥ NORMAL)` 로 보인다. **운영 영향: 이 두 항목 때문에 exit 1 이던 설정이 exit 0 이 된다** (D-29, #132)
+
 ## [0.1.0a5] - 2026-11-20
 
 정기 복원 검증을 boot 와 같은 기준으로 맞춘 사전 릴리스다. `sqlite_doctor --restore-test` 가 복원 직전 원격 TXID 보다 뒤인 복원본을 `error`(exit 2)로 보고 산출물을 남긴다(#128). 검증한 Litestream 판(0.5.17·0.5.18)과 지원 범위는 0.1.0a4 와 같다.
