@@ -265,6 +265,7 @@ volumes:
 
 - 서비스의 컨테이너는 하나만 둔다(`docker compose up --scale app=2` 를 하지 않는다).
 - `restart: on-failure` 면 boot 가 거부(exit 2)할 때도 계속 재시작하며 같은 거부를 되풀이한다. 거부는 사람이 판단할 일이므로 로그의 `[boot] decision:` 줄을 보고 아래 절차를 따른다.
+- 복원 실패(exit 4)가 재시작마다 되풀이돼도 내려받기는 한 번뿐이다. 남은 `/data/app.sqlite3.restore-…` 가 있는 동안 boot 는 `leftover restore output` 으로 exit 4 를 되풀이하고, 확인해 치워야 다시 복원된다([README 종료 코드](../../README.md#종료-코드), D-30).
 - 열린 파일 한도(`ulimits`)는 넣지 않았다. 권장 설정에서는 Docker 기본 한도로 충분했고, 올릴 값은 서비스의 동시 접속 수로 정해지기 때문이다([이유](fd-limits.md#6-프로필-compose-예에-ulimits-를-넣지-않은-이유)). 웹소켓 등 동시 연결이 많으면 [fd 한도 가이드](fd-limits.md#4-얼마로-둘까--계산법)로 값을 계산해 `app` 서비스에 `ulimits` 를 더한다.
 
 ## 4. 운영 절차

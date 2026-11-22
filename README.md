@@ -253,10 +253,12 @@ assert db["OPTIONS"]["check_same_thread"] is False
 
 둘 다 잠금을 기다리는 시간이지만 단위가 다르다. `options` 의 `timeout` 은 초, PRAGMA `busy_timeout` 은 밀리초다. Django 는 연결을 연 뒤에 `init_command` 를 실행하므로 `busy_timeout` 이 이긴다. 그래서 `options={"timeout": 20}` 만 주면 대기 시간은 여전히 5000ms 다.
 
+대기 시간을 늘리는 방법은 둘이다. 아래 첫째처럼 `busy_timeout` 을 덮는 쪽을 권한다 — 값이 `init_command` 한 곳에 남아 다른 설정과 섞이지 않는다. 둘째 형태도 실제 대기 시간은 같다(20000ms). [`sqlite_doctor`](#sqlite_doctor) 는 `busy_timeout` 이 권장값(5000) **이상**이면 받아들이므로 두 형태 모두 경고 없이 exit 0 이다. 5000 보다 짧게 줄이면 `warn` 이다.
+
 ```python
 from django_sqlite_ops.database import sqlite_database
 
-# 대기 시간을 20초로: busy_timeout 을 덮는다 (권장)
+# 대기 시간을 20초로: busy_timeout 을 덮는다 (이 방법을 권한다)
 db = sqlite_database("/srv/app/app.sqlite3", pragmas={"busy_timeout": 20000})
 
 # timeout 을 쓰고 싶다면 busy_timeout 을 함께 뺀다
@@ -395,13 +397,13 @@ python manage.py sqlite_doctor --json          # 모니터링·스크립트용
 
 무엇을 보나:
 
-- **database** — 별칭마다 Django 가 실제로 여는 경로(`OPTIONS["database"]` 가 있으면 `NAME` 대신 그것. 연결하지 않고 Django 의 연결 매개변수에서 읽는다)를 기준으로 역할(쓰기·읽기 전용·메모리·VFS), 파일 크기, `-wal` 크기(연결 전), 실제 `transaction_mode`·`journal_mode`·`synchronous`·`busy_timeout`·`foreign_keys`·SQLite 버전. [권장값](#기본값)과 다르면 `warn`. SQLite 버전이 [WAL-reset 버그](#sqlite-wal-reset-버그)의 영향 범위이면 `sqlite_version` 줄에 그 사실을 메시지로 적는다. **보고만 하므로 수준은 `ok` 이고 종료 코드를 바꾸지 않는다.** 읽기 전용 별칭은 쓰기 권고(`transaction_mode`·`journal_mode`·`synchronous`)를 비교하지 않는다. 메모리 DB 는 "메모리 DB" 로만 적는다. Litestream VFS 별칭과 역할을 판정할 수 없는 별칭(W004, 로컬이 아닌 URI authority 포함)은 연결하지 않고 `unknown`. 연결 실패는 `error`.
+- **database** — 별칭마다 Django 가 실제로 여는 경로(`OPTIONS["database"]` 가 있으면 `NAME` 대신 그것. 연결하지 않고 Django 의 연결 매개변수에서 읽는다)를 기준으로 역할(쓰기·읽기 전용·메모리·VFS), 파일 크기, `-wal` 크기(연결 전), 실제 `transaction_mode`·`journal_mode`·`synchronous`·`busy_timeout`·`foreign_keys`·SQLite 버전. [권장값](#기본값)에 어긋나면 `warn`. `transaction_mode`·`journal_mode` 는 권장값과 같아야 하고, `busy_timeout` 은 권장값(5000) 이상, `synchronous` 는 `NORMAL` 이상(`FULL`·`EXTRA`)이면 맞다 — 더 오래 기다리고 더 강하게 동기화하는 쪽은 권장값의 목적에 어긋나지 않는다. 그런 값은 `ok` 이고 `above the recommended minimum; accepted` 라고 적는다. 사람용 출력의 `(expected ≥ 5000)` 은 '이 값 이상'이라는 뜻이다(`--json` 의 `expected` 는 권장값 `5000` 그대로다). 더 약한 값(`busy_timeout` 이 5000 미만, `synchronous=OFF`)과 비교할 수 없는 값은 `warn` 이다. SQLite 버전이 [WAL-reset 버그](#sqlite-wal-reset-버그)의 영향 범위이면 `sqlite_version` 줄에 그 사실을 메시지로 적는다. **보고만 하므로 수준은 `ok` 이고 종료 코드를 바꾸지 않는다.** 읽기 전용 별칭은 쓰기 권고(`transaction_mode`·`journal_mode`·`synchronous`)를 비교하지 않는다. 메모리 DB 는 "메모리 DB" 로만 적는다. Litestream VFS 별칭과 역할을 판정할 수 없는 별칭(W004, 로컬이 아닌 URI authority 포함)은 연결하지 않고 `unknown`. 연결 실패는 `error`.
 - **mount** — 위의 실제 경로로 DB 파일(없으면 존재하는 상위 디렉터리)의 파일시스템 종류. NFS·SMB/CIFS·AFP·sshfs 같은 네트워크 파일시스템이면 `warn` 이다. SQLite 의 파일 잠금을 믿을 수 없고 WAL 이 동작하지 않는다([SQLite 문서](https://www.sqlite.org/useovernet.html)). 로컬로 확인되지 않은 종류(알 수 없는 FUSE 등)는 `unknown`.
 - **litestream** — `litestream databases -config PATH -json` 으로 설정의 DB 목록을 읽어 실제 경로로 대조한다. 쓰기 별칭이 설정에 없으면 `warn`(복제되지 않음). 단 channels-lite 전용 채널 DB(앱 DB 와 다른 파일)는 복제에서 빼는 것이 규칙이라 이 경고를 내지 않는다. 설정 경로가 실제 경로가 아니면(부모에 링크) `warn` — boot 가 거부하는 구성이다([경로 규칙](#경로-규칙)). 상대 경로·`dir:` 항목은 Litestream 의 작업 디렉터리 기준으로 풀려 대조할 수 없으므로 `warn`. 설정에만 있는 DB 는 `ok`(정보). 설정 파일 없음·깨진 YAML·바이너리 없음은 `error`.
 - **channels** — `CHANNEL_LAYERS` 를 읽기만 한다(`channels` 를 import 하지 않는다. 예외는 아래 `patch` 항목). 백엔드별 의미론을 한 줄로 요약한다. `InMemoryChannelLayer` 는 프로필이 `single-server-multiproc` 이면 `warn`. channels-lite 는 채널 DB 가 앱 DB 와 같은 파일이면 `warn`, Litestream 설정의 복제 대상이면 `warn`. 모르는 백엔드(`channels_redis` pub/sub 포함)는 `unknown`. `AIOSQLiteChannelLayer` 를 쓰거나 `PATCH_CHANNELS_LITE_AIO` 가 켜져 있으면 [중복 배달 패치](#channels-lite-패치) 상태를 `patch` 항목으로 보여 준다. 이때만 channels-lite 를 import 한다(DB 는 열지 않는다).
 - **process** — 명령을 실행한 프로세스의 열린 파일 한도(`RLIMIT_NOFILE`)를 `nofile_soft`·`nofile_hard` 로 보여 준다(무한대는 `unlimited`). **보고만 하고 판정하지 않으므로 늘 `ok` 이고 종료 코드를 바꾸지 않는다.** 필요한 값은 동시 접속 수에 달려 있어 근거 있는 경고 기준이 없기 때문이다. 표준 라이브러리 `resource` 가 없는 플랫폼(Windows)에서는 `nofile` 한 줄에 `unavailable` 로 적는다. 컨테이너에서는 `docker compose exec app python manage.py sqlite_doctor` 로 앱과 같은 한도를 본다(재현함: `exec` 프로세스도 컨테이너의 한도를 받는다). 설정법·계산법은 [fd 한도 가이드](docs/profiles/fd-limits.md).
 
-출력 예:
+출력 예(`pragmas={"busy_timeout": 20000}` 으로 대기 시간을 늘린 설정, Litestream 설정을 준 경우):
 
 ```text
 [settings]
@@ -413,8 +415,8 @@ python manage.py sqlite_doctor --json          # 모니터링·스크립트용
   OK      default  wal               -  — no -wal file
   OK      default  transaction_mode  IMMEDIATE (expected IMMEDIATE)
   OK      default  journal_mode      WAL (expected WAL)
-  WARN    default  synchronous       FULL (expected NORMAL)  — differs from the recommended value (DESIGN §6-0)
-  OK      default  busy_timeout      5000 (expected 5000)
+  OK      default  synchronous       NORMAL (expected ≥ NORMAL)
+  OK      default  busy_timeout      20000 (expected ≥ 5000)  — above the recommended minimum; accepted (DESIGN §6-0)
   OK      default  foreign_keys      1
   OK      default  sqlite_version    3.53.1
 
@@ -432,7 +434,7 @@ python manage.py sqlite_doctor --json          # 모니터링·스크립트용
   OK      -  nofile_soft  1024  — RLIMIT_NOFILE of this process; reported, not judged (docs/profiles/fd-limits.md)
   OK      -  nofile_hard  524288  — RLIMIT_NOFILE of this process; reported, not judged (docs/profiles/fd-limits.md)
 
-summary: 1 warning(s), 0 error(s), 0 unknown -> exit 1
+summary: 0 warning(s), 0 error(s), 0 unknown -> exit 0
 ```
 
 | 종료 코드 | 뜻 |
@@ -606,7 +608,7 @@ stderr 의 `[boot] ...` 줄만 보면 무슨 일이 있었는지 알 수 있다.
 | (exec) | 통과. 이후 코드는 exec 된 명령의 것이다 | — |
 | `2` | 거부. 판정할 수 없다 | 아래 사유 코드별 대처 |
 | `3` | 무결성 실패(`quick_check` 가 `ok` 아님) | DB 파일을 조사한다. 판정은 `match` 라 `--on-unknown restore` 만으로는 복원되지 않는다. 복제본이 정본이면 DB 를 여는 다른 컨테이너·프로세스를 모두 내린 뒤([주의](#거부됐을-때-exit-2-사유-코드별-대처)) DB 파일(과 `-wal`·`-shm`)을 다른 곳으로 옮기고 `--on-unknown restore` 로 다시 부팅한다. 남은 메타가 `stale_meta` 로 격리되고 복원된다 |
-| `4` | 복원 실패 | 로그의 `restore failed:` 사유를 본다. 임시 복원이 실패했으면 로컬은 그대로이고, 남은 `<db>.restore-…/` 는 조사 뒤 지운다. 사유가 `restored txid R is behind remote txid N observed before restore` 면 복원은 됐지만 판정 때 본 복제본보다 뒤라 설치하지 않은 것이다(로컬 그대로, [문제 해결](#boot)). 격리·설치 중 I/O 실패도 4 다. 격리 도중이면 `<db>.stale-…partial/` 이 남고 다음 부팅이 이어서 끝낸다(이 부팅도 [주의](#거부됐을-때-exit-2-사유-코드별-대처) 대상이다). 격리를 마친 뒤(설치 중) 실패했으면 다음 부팅이 남은 상태에 따라 다시 복원하거나(로컬이 비었을 때) `no_local_meta` 로 거부한다(아래 '복원 직후 크래시 복구') |
+| `4` | 복원 실패 | 로그의 `restore failed:` 사유를 본다. 임시 복원이 실패했으면 로컬은 그대로이고, 남은 `<db>.restore-…/` 는 조사 뒤 지운다. **지우기 전에는 다시 복원되지 않는다**: 남아 있는 동안 복원이 필요한 부팅은 내려받지 않고 사유 `leftover restore output …` 로 exit 4 다(재시작 정책 아래 재시작마다 DB 한 벌이 쌓이는 것을 막는다, [D-30](docs/DECISIONS.md)). 일시적 실패(네트워크, 복원 도중 정지)였어도 같다. 복원이 필요 없는 부팅(`match` 등)은 영향이 없다. 사유가 `restored txid R is behind remote txid N observed before restore` 면 복원은 됐지만 판정 때 본 복제본보다 뒤라 설치하지 않은 것이다(로컬 그대로, [문제 해결](#boot)). 격리·설치 중 I/O 실패도 4 다. 격리 도중이면 `<db>.stale-…partial/` 이 남고 다음 부팅이 이어서 끝낸다(이 부팅도 [주의](#거부됐을-때-exit-2-사유-코드별-대처) 대상이다). 격리를 마친 뒤(설치 중) 실패했으면 다음 부팅이 남은 상태에 따라 다시 복원하거나(로컬이 비었을 때) `no_local_meta` 로 거부한다(아래 '복원 직후 크래시 복구') |
 | `5` | 잠금 실패 | 같은 볼륨에서 이미 돌고 있는 컨테이너·프로세스를 멈춘다 |
 | `64` | 사용법 오류 | 인자를 고친다. `--` 뒤 명령이 꼭 있어야 한다. 경로가 실제 경로가 아니면 메시지의 실제 경로로 바꾸고 Litestream 설정도 같은 경로로 맞춘다. `--meta-path ... overlaps` 면 메타를 Litestream 설정의 `meta-path` 와 같은 자기만의 디렉터리로 준다 |
 | `127` | `--` 뒤 명령을 실행할 수 없음 | 명령 이름·PATH·실행 권한을 확인한다 |
@@ -651,7 +653,7 @@ DB 파일이 0바이트면 도입할 데이터가 없으므로 `--adopt-existing
 
 #### 복원 직후 크래시 복구
 
-복원한 DB 옆에는 Litestream 메타가 없다. `litestream replicate` 가 첫 변경을 기록하기 전에 컨테이너가 죽으면, 다음 부팅은 "DB 는 있는데 메타가 없다"(`no_local_meta`)로 거부된다. 이 DB 는 방금 복제본에서 받은 것이므로 한 번만 `--on-unknown restore` 로 부팅하면 격리하고 다시 복원한다([D-14](docs/DECISIONS.md)). 그 전에 DB 를 여는 다른 컨테이너·프로세스를 내린다([위 주의](#거부됐을-때-exit-2-사유-코드별-대처)).
+복원한 DB 옆에는 Litestream 메타가 없다. `litestream replicate` 가 첫 변경을 기록하기 전에 컨테이너가 죽으면, 다음 부팅은 "DB 는 있는데 메타가 없다"(`no_local_meta`)로 거부된다. 이 DB 는 방금 복제본에서 받은 것이므로 한 번만 `--on-unknown restore` 로 부팅하면 격리하고 다시 복원한다([D-14](docs/DECISIONS.md)). 설치 직전·직후에 죽어 `<db>.restore-…` 가 남아 있으면 그 부팅은 `leftover restore output` 으로 exit 4 다. 확인해 치운 뒤 다시 부팅한다([D-30](docs/DECISIONS.md)). 그 전에 DB 를 여는 다른 컨테이너·프로세스를 내린다([위 주의](#거부됐을-때-exit-2-사유-코드별-대처)).
 
 ```bash
 python -m django_sqlite_ops.boot --db /data/app.sqlite3 --config /etc/litestream.yml \
@@ -1008,6 +1010,7 @@ SQLite 공식 문서([wal.html §11](https://sqlite.org/wal.html#the_wal_reset_b
 | exit 5 | 같은 볼륨에서 boot 나 그것이 exec 한 앱이 이미 돈다(잠금은 exec 된 명령에 상속) | 앞선 컨테이너를 멈춘다. `<db>.boot.lock` 은 지우지 않는다([함정](#boot-cli)) | 코드상 확인 |
 | 옛 볼륨으로 다시 띄우자 exit 2, `remote_ahead` | 복제본이 이 볼륨보다 새롭다. 보호가 없으면 최신본이 옛 볼륨으로 덮인다 | 복제본이 정본이면 `--on-unknown restore` 로 한 번([사유 코드별 대처](#거부됐을-때-exit-2-사유-코드별-대처)) | 실측(docker D4: 150건이 55건으로 덮임), 재현함(회귀 랩 L2: boot 가 exit 2 로 막고 복제본 무변경) |
 | exit 4, `restored txid R is behind remote txid N observed before restore; not installing` | boot 가 판정 때 조회한 원격 최대 TXID(N)보다 복원본(R)이 뒤다. 조회와 복원 사이에 복제본이 뒤로 갔다(버킷 롤백·객체 삭제·덮어쓰기, 같은 경로에 쓰는 둘째 `replicate`). 같거나 앞서면 정상으로 설치한다(복원 중 새 업로드) | `hint:` 줄대로 복제본이 롤백·덮어써졌는지, 다른 머신·컨테이너가 같은 경로로 복제하는지 확인한 뒤 다시 띄운다. 로컬은 바뀌지 않았고 `<db>.restore-…/` 는 조사 뒤 지운다. 조회 전에 이미 뒤로 간 복제본은 이 검사로 잡지 못한다 | 재현함(실제 Litestream 0.5.17·0.5.18 `file://` 복제본을 restore 직전에 옛 사본으로 되돌림 → 수정 전에는 TXID 1 을 설치하고 exec, `tests/test_boot_cli.py` 의 `test_replica_rolled_back_between_lookup_and_restore_exits_4`, 2026-11-19 #122). 실제 S3 에서의 발생 빈도는 미확인 |
+| exit 4, `leftover restore output <경로>; not restoring again until it is removed`(여럿이면 `N leftover restore outputs in <디렉터리>: …`) | 앞선 부팅이 남긴 `<db>.restore-…`(실패한 복원, 또는 복원 도중·설치 직전에 죽은 부팅의 것)가 DB 옆에 있다. 이름은 대소문자·유니코드 정규형을 무시하고 비교하므로 `APP.DB.restore-…` 도 `--db …/app.db` 의 산출물로 본다. boot 는 그것이 있는 동안 다시 내려받지 않는다. 재시작 정책으로 같은 실패가 되풀이돼도 복원본은 한 벌만 남는다 | 먼저 남은 것의 원인을 본다(앞선 exit 4 의 사유, 복원본 내용). 확인한 뒤 옮기거나 지우고 다시 띄운다. boot 는 지우지 않는다 | 재현함(가짜 litestream 으로 같은 실패 4회 → 수정 전 4벌, 수정 뒤 1벌·`restore` 호출 1번, `tests/test_boot_cli.py` 의 `test_repeated_restore_failure_downloads_once`, 2026-11-22 #134) |
 | 복원 직후 컨테이너가 죽은 뒤 exit 2, `no_local_meta` | 복원한 DB 옆에는 Litestream 메타가 없고 `replicate` 가 첫 변경을 기록해야 생긴다 | `--on-unknown restore` 로 한 번([복원 직후 크래시 복구](#복원-직후-크래시-복구)) | 실측(restore 결과에 메타 없음. 0.5.17·0.5.18, #105), [D-14](docs/DECISIONS.md) |
 | 직접 만든 entrypoint 의 `litestream restore -if-db-not-exists` 가 복원을 건너뛴다 | 0바이트 DB 파일이 있으면 rc 0 으로 건너뛴다(`database already exists, skipping`) | boot 를 쓴다. `manage.py` 를 boot 앞에서 부르지 않는다([boot CLI](#boot-cli)) | 재현함([DESIGN §4-1](docs/DESIGN.md#4-1-왜-django-관리-명령이-아닌가). 0.5.17·0.5.18, #105) |
 

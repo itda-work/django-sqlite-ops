@@ -527,6 +527,15 @@ def test_L6_kill_during_restore(stack, run_id, rec):
         renamed_before_kill = len(_rename_lines(stack.logs("labapp")))
         killed = stack.inspect_volume(v)
         partials = [e for e in killed["entries"] if e.endswith(".partial") and "/" not in e]
+        leftovers = [e for e in killed["entries"] if ".restore-" in e and "/" not in e]
+        refused = None
+        if leftovers:
+            # 임시 복원 디렉터리가 남으면(설치 rename 전후) 재실행은 내려받지 않고 exit 4 다.
+            # 사람이 확인하고 치운 뒤 다시 띄우는 절차를 그대로 밟는다(#134, D-30).
+            res = stack.run_boot(env=env(v, prefix, flags))
+            refused = {"rc": res.rc, "boot_lines": boot_lines(res.text)}
+            assert res.rc == 4 and "leftover restore output" in res.text, refused
+            stack.remove_restore_leftovers(v)
 
         # 재실행(훅 없이). 남은 상태에 따라 재개·fresh 복원·D-14 재격리 중 하나로 끝나야 한다.
         port = stack.up_app(env=env(v, prefix, flags))
@@ -541,6 +550,8 @@ def test_L6_kill_during_restore(stack, run_id, rec):
             "after": renames[k - 1].split(": ", 1)[1].replace("/data/", ""),
             "renames_before_kill": renamed_before_kill,
             "partials_after_kill": partials,
+            "restore_leftovers_after_kill": leftovers,
+            "leftover_refusal": refused,
             "rerun_decision": decision(logs),
             "rerun_rows": rows,
             "stale_dirs": stale_dirs(final),
