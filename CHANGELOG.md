@@ -9,6 +9,7 @@
 ### Changed
 
 - **`sqlite_doctor` 가 권장값보다 강한 `busy_timeout`·`synchronous` 를 받아들인다.** `busy_timeout` 은 권장값(5000) 이상, `synchronous` 는 `NORMAL` 이상(`FULL`·`EXTRA`)이면 `warn` 이 아니라 `ok` 이고, `message` 에 `above the recommended minimum; accepted` 를 적는다. 예전에는 README 가 안내한 `pragmas={"busy_timeout": 20000}` 과 Django 기본 `synchronous=FULL` 도 `warn`·exit 1 이었고 doctor 에는 경고를 끄는 수단이 없었다. 비교 규칙은 DESIGN §6-0 표의 「비교」 칸과 `database.py` 의 `COMPARISONS` 한 곳이다. `journal_mode`·`transaction_mode` 는 그대로 일치해야 하고, 더 약한 값(`busy_timeout` 이 5000 미만, `synchronous=OFF`)과 비교할 수 없는 값은 그대로 `warn` 이다. `--json` 의 `expected` 는 권장값 그대로이고 스키마 `version` 도 1 이다. 사람용 출력은 이 두 항목을 `(expected ≥ 5000)`·`(expected ≥ NORMAL)` 로 보인다. **운영 영향: 이 두 항목 때문에 exit 1 이던 설정이 exit 0 이 된다** (D-29, #132)
+- **boot 가 앞선 복원 산출물이 남아 있으면 다시 내려받지 않는다.** 복원이 필요한 부팅(`restore`·`quarantine_and_restore`)은 DB 옆에 `<db>.restore-…` 가 하나라도 있으면 `litestream restore` 를 부르지 않고 로컬을 바꾸지 않은 채 exit 4(사유 `leftover restore output …`, `hint:` 한 줄)로 끝난다. 예전에는 재시작 정책(`restart: on-failure`, systemd `Restart=`) 아래에서 원인이 남은 복원 실패가 되풀이되면 재시작마다 DB 한 벌이 같은 볼륨에 쌓였다(가짜 litestream 으로 4회에 4벌, 재현함). **exit 4 뒤에는 남은 `<db>.restore-*` 를 확인해 치워야 다시 복원된다** — 일시적 실패(네트워크, 복원 도중 정지)여도 같다. boot 는 그것을 지우지 않는다. 복원이 필요 없는 부팅(`match` 등)과 판정·사유 코드는 그대로다 (D-30, #134)
 
 ## [0.1.0a5] - 2026-11-20
 

@@ -689,10 +689,46 @@ def local_db_exists(db: Path) -> bool:
 # --- 5. 임시 복원·설치 -----------------------------------------------------------------------
 
 
+_LEFTOVER_SHOWN = 3
+
+_LEFTOVER_HINT = (
+    "a previous restore left this for inspection and boot does not download again while it is "
+    "there (a restart policy would otherwise add one db copy per restart); check why the earlier "
+    "boot exited 4 (or was killed), move or remove it yourself, then rerun (D-30)"
+)
+
+
+def check_no_restore_leftovers(db: Path) -> None:
+    """DB 디렉터리에 ``<db>.restore-*`` 가 하나라도 있으면 exit 4. 복원 전에 부른다(#134, D-30).
+
+    무엇이든(디렉터리·파일·링크) 남아 있으면 거부한다. boot 는 그것을 지우지 않는다.
+    이름은 모든 플랫폼에서 ``_fold()``(canonical caseless matching)로 접어 비교한다. 대소문자·
+    정규형이 다른 ``--db`` 철자로 다시 띄워도 같은 볼륨의 앞선 산출물을 찾고, 대소문자 구분
+    볼륨에서 접으면 같아지는 남의 이름도 판정할 수 없으므로 거부한다(D-19 와 같은 비교, #134).
+    """
+    prefix = _fold(db.name + _RESTORE_INFIX)
+    try:
+        found = sorted(n for n in os.listdir(db.parent) if _fold(n).startswith(prefix))
+    except OSError as exc:
+        raise _Exit(EXIT_RESTORE, f"cannot list {db.parent}: {exc}") from None
+    if not found:
+        return
+    if len(found) == 1:
+        what = f"leftover restore output {db.parent / found[0]}"
+    else:
+        shown = ", ".join(found[:_LEFTOVER_SHOWN])
+        more = f", and {len(found) - _LEFTOVER_SHOWN} more" if len(found) > _LEFTOVER_SHOWN else ""
+        what = f"{len(found)} leftover restore outputs in {db.parent}: {shown}{more}"
+    log(f"hint: {_LEFTOVER_HINT}")
+    raise _Exit(EXIT_RESTORE, f"{what}; not restoring again until it is removed")
+
+
 def restore_to_temp(db: Path, args: argparse.Namespace) -> tuple[Path, int]:
     """DB 와 같은 디렉터리의 새 ``<db>.restore-<ts>-<rand>/`` 로 복원한다. 실패하면 exit 4.
 
-    실패한 임시 디렉터리는 조사용으로 남긴다. 다음 부팅은 이 디렉터리를 판정에 쓰지 않는다.
+    실패한 임시 디렉터리는 조사용으로 남긴다. 다음 부팅은 이 디렉터리를 판정에 쓰지 않지만,
+    남아 있는 동안 복원 조치는 내려받기 전에 거부한다(``check_no_restore_leftovers``, D-30).
+    성공하면 ``install()`` 이 이 디렉터리를 지운다.
     """
     tmpdir = db.with_name(f"{db.name}{_RESTORE_INFIX}{_timestamp()}-{secrets.token_hex(4)}")
     try:
@@ -1075,6 +1111,8 @@ def _act(args: argparse.Namespace, plan: _Plan) -> None:
     if plan.action in (Action.RESTORE, Action.QUARANTINE_AND_RESTORE):
         # 복원·검증을 먼저 끝낸다. 실패하면 로컬은 그대로다(L7).
         check_quarantinable(db, meta)
+        # 앞선 복원 산출물이 있으면 내려받지 않는다. 재시작마다 한 벌씩 쌓이는 것을 막는다(D-30).
+        check_no_restore_leftovers(db)
         restored, restored_txid = restore_to_temp(db, args)
         check_restored_txid(restored, restored_txid, plan.remote_txid)
         stale = quarantine(db, meta)

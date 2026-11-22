@@ -2128,6 +2128,161 @@ def test_restore_at_or_ahead_of_observed_remote_installs(lab, fake, no_exec, loc
     assert fake.calls() == ["version", "ltx", "version", "restore", "version"]
 
 
+# --- 앞선 복원 산출물이 남아 있으면 다시 내려받지 않는다 (#134, D-30) ---
+
+
+def hint_lines(err: str) -> list[str]:
+    return [ln for ln in err.splitlines() if ln.startswith("[boot] hint:")]
+
+
+@pytest.mark.parametrize("failure", ["restore_failed", "behind"])
+def test_repeated_restore_failure_downloads_once(lab, fake, no_exec, capsys, failure):
+    """재시작 정책 아래 같은 복원 실패를 되풀이해도 ``<db>.restore-*`` 는 하나뿐이다."""
+    fake.remote_txid(0x20)
+    if failure == "restore_failed":
+        fake.fail_restore()
+    else:
+        fake.restore_txid(0x1F)
+    assert main_inproc(boot_args(lab, fake), no_exec) == cli.EXIT_RESTORE
+    capsys.readouterr()
+    (left,) = restore_dirs(lab)
+    for _ in range(3):
+        assert main_inproc(boot_args(lab, fake), no_exec) == cli.EXIT_RESTORE
+        err = capsys.readouterr().err
+        assert restore_dirs(lab) == [left]
+        assert str(left) in err
+        assert "leftover restore output" in err
+        (hint,) = hint_lines(err)
+        assert "remove" in hint
+    assert fake.calls().count("restore") == 1
+    assert not (lab / "app.db").exists()
+    assert not no_exec[0]
+
+
+def test_leftover_refusal_on_quarantine_path_leaves_local_untouched(lab, fake, no_exec, capsys):
+    local_volume(lab)
+    left = lab / "app.db.restore-20261122T000000.000001Z-abcd1234"
+    left.mkdir()
+    (left / "app.db").write_bytes(b"old restore")
+    fake.remote_txid(0x20)
+    before = snapshot(lab)
+    assert main_inproc(boot_args(lab, fake, "--on-unknown", "restore"), no_exec) == 4
+    err = capsys.readouterr().err
+    assert "action=quarantine_and_restore" in err
+    assert str(left) in err
+    assert snapshot(lab, skip=("app.db.boot.lock",)) == before
+    assert not stale_dirs(lab)
+    assert "restore" not in fake.calls()
+    assert not no_exec[0]
+
+
+def test_removing_the_leftover_lets_the_next_boot_restore(lab, fake, no_exec):
+    fake.remote_txid(0x20)
+    fake.fail_restore()
+    assert main_inproc(boot_args(lab, fake), no_exec) == cli.EXIT_RESTORE
+    (left,) = restore_dirs(lab)
+    (fake.dir / "restore.fail").unlink()
+    assert main_inproc(boot_args(lab, fake), no_exec) == cli.EXIT_RESTORE
+    shutil.rmtree(left)
+    assert main_inproc(boot_args(lab, fake), no_exec) == "exec"
+    assert count_rows(lab / "app.db") == 7
+    assert not restore_dirs(lab)
+    assert fake.calls().count("restore") == 2
+
+
+def test_many_leftovers_are_counted_on_one_line(lab, fake, no_exec, capsys):
+    for i in range(7):
+        (lab / f"app.db.restore-{i:02d}-{'x' * 40}").mkdir()
+    assert main_inproc(boot_args(lab, fake), no_exec) == cli.EXIT_RESTORE
+    err = capsys.readouterr().err
+    (line,) = [ln for ln in err.splitlines() if ln.startswith("[boot] exit 4:")]
+    assert "7 leftover restore outputs" in line
+    assert "app.db.restore-00-" in line
+    assert len(line) < 500
+    assert len(hint_lines(err)) == 1
+
+
+def test_leftover_does_not_affect_match_or_refuse(lab, fake, no_exec, capsys):
+    """복원이 아닌 부팅은 남은 산출물을 보지 않는다."""
+    left = lab / "app.db.restore-x"
+    left.mkdir()
+    fake.remote_txid(None)
+    assert main_inproc(boot_args(lab, fake), no_exec) == cli.EXIT_REFUSE
+    assert "no_replica_no_local" in capsys.readouterr().err
+    make_db(lab / "app.db", 4)
+    write_meta(lab / "app.db")
+    fake.remote_txid(0x19)
+    assert main_inproc(boot_args(lab, fake), no_exec) == "exec"
+    assert state(lab)["state"] == "match"
+    assert left.is_dir()
+
+
+@pytest.mark.parametrize("kind", ["file", "broken_link"])
+def test_leftover_that_is_not_a_directory_also_refuses(lab, fake, no_exec, capsys, kind):
+    left = lab / "app.db.restore-y"
+    if kind == "file":
+        left.write_bytes(b"?")
+    else:
+        left.symlink_to(lab / "missing")
+    assert main_inproc(boot_args(lab, fake), no_exec) == cli.EXIT_RESTORE
+    assert str(left) in capsys.readouterr().err
+    assert os.path.lexists(left)
+    assert "restore" not in fake.calls()
+
+
+def test_leftovers_of_another_db_are_ignored(lab, fake, no_exec):
+    (lab / "other.sqlite3.restore-20261122T000000.000001Z-abcd1234").mkdir()
+    (lab / "app.db2.restore-z").mkdir()
+    (lab / "app.db.restorex").mkdir()
+    assert main_inproc(boot_args(lab, fake), no_exec) == "exec"
+    assert count_rows(lab / "app.db") == 7
+
+
+def db_args(lab: Path, fake: Fake, name: str, *extra: str) -> list[str]:
+    args = boot_args(lab, fake, *extra)
+    args[args.index("--db") + 1] = str(lab / name)
+    return args
+
+
+@pytest.mark.parametrize(
+    ("db_name", "leftover"),
+    [
+        ("app.db", "APP.DB.restore-x"),
+        ("app.db", "App.Db.restore-20261122T000000.000001Z-abcd1234"),
+        # 완성형(NFC) DB 이름과 조합형(NFD) 산출물 이름
+        (
+            unicodedata.normalize("NFC", "café.db"),
+            unicodedata.normalize("NFD", "café.db") + ".restore-x",
+        ),
+    ],
+    ids=["upper", "mixed", "nfd"],
+)
+def test_folded_alias_of_leftover_also_refuses(lab, fake, no_exec, capsys, db_name, leftover):
+    """``_fold()`` 로 접어 같은 이름이면 같은 산출물로 보고 거부한다(D-19, #134 리뷰 1)."""
+    (lab / leftover).mkdir()
+    assert main_inproc(db_args(lab, fake, db_name), no_exec) == cli.EXIT_RESTORE
+    err = capsys.readouterr().err
+    assert "leftover restore output" in err
+    assert "restore" not in fake.calls()
+    assert not (lab / db_name).exists()
+
+
+def test_case_alias_retry_finds_the_earlier_leftover(ci_lab, fake, no_exec, capsys):
+    """대소문자 무시 볼륨: ``--db APP.DB`` 로 실패한 뒤 ``--db app.db`` 로 띄워도 한 벌뿐이다."""
+    lab = ci_lab
+    fake.remote_txid(0x20)
+    fake.fail_restore()
+    assert main_inproc(db_args(lab, fake, "APP.DB"), no_exec) == cli.EXIT_RESTORE
+    capsys.readouterr()
+    (left,) = [p for p in lab.iterdir() if ".restore-" in p.name]
+    assert left.name.startswith("APP.DB.restore-")
+    assert main_inproc(db_args(lab, fake, "app.db"), no_exec) == cli.EXIT_RESTORE
+    err = capsys.readouterr().err
+    assert "leftover restore output" in err and left.name in err
+    assert [p for p in lab.iterdir() if ".restore-" in p.name] == [left]
+    assert fake.calls().count("restore") == 1
+
+
 def test_integrity_failure_exits_3(lab, fake, no_exec):
     (lab / "app.db").write_bytes(b"garbage" * 1000)
     write_meta(lab / "app.db")
@@ -2755,6 +2910,19 @@ def test_l6_kill_during_quarantine_then_rerun_completes(real, kill_at):
     assert read_marker(data) is None
 
     rerun = run_boot(args)
+    leftovers = restore_dirs(data)
+    if kill_at == -1:
+        assert not leftovers
+    if leftovers:
+        # 설치 rename 전에 죽으면 임시 복원 디렉터리가 남는다. 재부팅은 내려받지 않고 exit 4 다.
+        # 사람이 확인하고 치우면 다음 부팅이 이어서 끝낸다(#134, D-30).
+        assert rerun.returncode == cli.EXIT_RESTORE, rerun.stderr
+        assert "leftover restore output" in rerun.stderr
+        assert read_marker(data) is None
+        assert restore_dirs(data) == leftovers
+        for p in leftovers:
+            shutil.rmtree(p)
+        rerun = run_boot(args)
     assert rerun.returncode == 0, rerun.stderr
     assert read_marker(data) is not None
     assert count_rows(db) == 20
@@ -2771,6 +2939,35 @@ def test_l6_kill_during_quarantine_then_rerun_completes(real, kill_at):
     assert count_rows(old_homes[0] / "app.db") == 10
     for d in stale_dirs(data):
         assert set(os.listdir(d)) <= {"manifest.json", *VOLUME_NAMES}
+
+
+# 가짜 litestream 으로 같은 kill 지점을 본다(실제 바이너리 없이도 도는 쪽, #134).
+# local_volume 의 rename: manifest, app.db, -wal, -shm, -journal, 메타, partial→final, 설치, 상태.
+FAKE_INSTALL_RENAME = 8
+
+
+@pytest.mark.parametrize("kill_at", [*range(1, FAKE_INSTALL_RENAME + 2), -1])
+def test_kill_before_install_leaves_restore_dir_and_rerun_refuses(lab, fake, kill_at):
+    local_volume(lab)
+    fake.remote_txid(0x20)
+    log = lab.parent / "renames.log"
+    args = boot_args(lab, fake, "--on-unknown", "restore")
+    killed = run_killed(args, kill_at, log)
+    assert killed.returncode in (98, 99), killed.stderr
+    before_install = 0 < kill_at <= FAKE_INSTALL_RENAME
+    assert bool(restore_dirs(lab)) == before_install
+    rerun = run_boot(args)
+    if before_install:
+        assert rerun.returncode == cli.EXIT_RESTORE, rerun.stderr
+        assert "leftover restore output" in rerun.stderr
+        assert fake.calls().count("restore") == 1
+        (left,) = restore_dirs(lab)
+        shutil.rmtree(left)
+        rerun = run_boot(args)
+    assert rerun.returncode == 0, rerun.stderr
+    assert count_rows(lab / "app.db") == 7
+    assert not restore_dirs(lab)
+    assert not [p for p in lab.iterdir() if p.name.endswith(".partial")]
 
 
 def test_l7_corrupt_replica_restore_fails_local_unchanged(real):
